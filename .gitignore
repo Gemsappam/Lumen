@@ -216,3 +216,21 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# secrets
+.env
+
+# business data: db, master xlsx, invoices, drafts, backups
+data/
+
+# python junk
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# os/editor
+.DS_Store
+.idea/
+.vscode/
