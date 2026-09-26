@@ -1,0 +1,8 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+aiogram>=3.13
+sqlmodel>=0.0.22
+anthropic>=0.40
+openpyxl>=3.1
+python-dotenv>=1.0
+python-multipart>=0.0.9
