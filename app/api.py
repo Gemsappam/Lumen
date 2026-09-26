@@ -25,17 +25,24 @@ BOT = None  # set by main.py so export can send the file into the chat
 def user_id(x_init_data: str = Header(default="")) -> int:
     if DEV_NO_AUTH:
         return next(iter(ALLOWED_IDS), 0)
+    if not x_init_data:
+        print("[lumen] auth: пустой initData", flush=True)
+        raise HTTPException(401, "Нет данных входа от Telegram. Открой приложение кнопкой «📒 Открыть учёт» "
+                                 "под сообщением /start или кнопкой «Учёт» у поля ввода — не старой кнопкой вместо клавиатуры и не в браузере.")
     pairs = dict(parse_qsl(x_init_data, keep_blank_values=True))
     h = pairs.pop("hash", "")
     check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
-    secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
-    if not h or not hmac.compare_digest(hmac.new(secret, check.encode(), hashlib.sha256).hexdigest(), h):
-        raise HTTPException(401, "bad initData")
+    secret = hmac.new(b"WebAppData", BOT_TOKEN.strip().encode(), hashlib.sha256).digest()
+    calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+    if not h or not hmac.compare_digest(calc, h):
+        print(f"[lumen] auth: подпись не совпала. поля={sorted(pairs)} токен=...{BOT_TOKEN.strip()[-4:]}", flush=True)
+        raise HTTPException(401, f"Подпись Telegram не совпала: BOT_TOKEN на сервере (…{BOT_TOKEN.strip()[-4:]}) "
+                                 "не от этого бота. Проверь BOT_TOKEN в .env и в переменных Bothost.")
     if time.time() - int(pairs.get("auth_date", 0)) > 7 * 86400:
-        raise HTTPException(401, "initData expired")
+        raise HTTPException(401, "Вход устарел — закрой и открой приложение заново")
     uid = json.loads(pairs.get("user", "{}")).get("id")
     if uid not in ALLOWED_IDS:
-        raise HTTPException(403, "not an operator")
+        raise HTTPException(403, f"Твой ID {uid} не в ALLOWED_IDS — добавь его в .env и перезапусти")
     return uid
 
 
