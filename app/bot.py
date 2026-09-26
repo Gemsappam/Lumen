@@ -3,7 +3,8 @@ from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
-from aiogram.types import (KeyboardButton, Message, ReplyKeyboardMarkup, WebAppInfo)
+from aiogram.types import (InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonWebApp, Message,
+                           ReplyKeyboardRemove, WebAppInfo)
 from sqlmodel import select
 
 from . import ai
@@ -15,17 +16,28 @@ bot = Bot(BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
 ops = F.from_user.id.in_(ALLOWED_IDS)
 
-KB = ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[[
-    KeyboardButton(text="📒 Учёт", web_app=WebAppInfo(url=WEBAPP_URL))]])
+# Only INLINE buttons and the menu button pass initData (login) to the Mini App.
+# Reply-keyboard buttons open it without initData -> "bad initData".
+KB = InlineKeyboardMarkup(inline_keyboard=[[
+    InlineKeyboardButton(text="📒 Открыть учёт", web_app=WebAppInfo(url=WEBAPP_URL))]])
+
+
+async def setup_menu_button():
+    """Blue button next to the message field opens the Mini App."""
+    if bot and WEBAPP_URL:
+        await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="Учёт", web_app=WebAppInfo(url=WEBAPP_URL)))
 
 
 @dp.message(CommandStart(), ops)
 async def start(m: Message):
+    kb = KB if WEBAPP_URL.startswith("https://") else None
+    await m.answer("Обновил кнопки 👇", reply_markup=ReplyKeyboardRemove())   # remove the old reply keyboard
     await m.answer("Учёт поставок Люмен.\n\n"
-                   "• Открывай «📒 Учёт» — пополнения, инвойсы, логистика, выгрузка в Excel.\n"
+                   "• Кнопка ниже или «Учёт» слева от поля ввода — пополнения, инвойсы, логистика, выгрузка в Excel.\n"
                    "• Кидай сюда PDF/фото инвойса или счёта за фрахт — распознаю и положу в черновики.\n"
-                   "• Кинь .xlsx — он станет мастер-файлом учёта (новые листы пишутся в него).",
-                   reply_markup=KB)
+                   "• Кинь .xlsx — он станет мастер-файлом учёта (новые листы пишутся в него)."
+                   + ("" if kb else "\n\n⚠️ WEBAPP_URL не https — кнопка приложения отключена."),
+                   reply_markup=kb)
 
 
 @dp.message(ops, F.document.file_name.lower().endswith(".xlsx"))
@@ -52,7 +64,7 @@ async def _parse_and_reply(m: Message, data: bytes, mime: str):
            f"Строк: {len(out.get('lines', []))}, стеблей: {stems:g}, итог: ${out.get('invoice_total_usd') or '?'}")
     if out.get("warnings"):
         txt += "\n⚠️ " + "\n⚠️ ".join(out["warnings"])
-    txt += f"\n\nЧерновик #{did} — открой «📒 Учёт» → Черновики, проверь и впиши реально оплаченные $/₽."
+    txt += f"\n\nЧерновик #{did} — открой «Учёт» → Черновики, проверь и впиши реально оплаченные $/₽."
     await note.edit_text(txt)
 
 
@@ -70,9 +82,9 @@ async def photo(m: Message):
 
 @dp.message(~ops)
 async def stranger(m: Message):
-    await m.answer("Нет доступа.")
+    await m.answer(f"Нет доступа. Твой ID: {m.from_user.id} — добавь его в ALLOWED_IDS в .env и перезапусти.")
 
 
 @dp.message(ops)
 async def other(m: Message):
-    await m.answer("Жду PDF/фото инвойса или .xlsx мастер-файла. Всё остальное — в «📒 Учёт».", reply_markup=KB)
+    await m.answer("Жду PDF/фото инвойса или .xlsx мастер-файла. Всё остальное — в «Учёт».")
