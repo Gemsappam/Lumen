@@ -8,7 +8,6 @@ from fastapi.staticfiles import StaticFiles
 from sqlmodel import select
 
 from . import api
-from .config import PORT
 from .models import Farm, init_db, session
 
 SEED = {
@@ -18,6 +17,10 @@ SEED = {
                 "Allegro Farms", "Dayka", "Guaisa (Sunrite)", "Meral Flowers", "Monterosas", "Rosaprima", "Rosas Del Vento"],
     "Колумбия": ["Кондор (Гортензия)", "American Flowers", "Plazoleta", "Tessa", "La Conejera", "Serrezuela Flowers"],
 }
+
+# Bothost's proxy sends traffic to whatever port is set in the panel.
+# We listen on all the usual ones so any of them works.
+PORTS = [8000, 3000, 8080, 5000]
 
 
 def seed():
@@ -34,7 +37,8 @@ def seed():
 
 @asynccontextmanager
 async def lifespan(app):
-    init_db(); seed()
+    init_db()
+    seed()
     from .bot import bot, dp
     task = None
     if bot:
@@ -47,7 +51,24 @@ async def lifespan(app):
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(api.router)
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
 app.mount("/", StaticFiles(directory=Path(__file__).parent.parent / "webapp", html=True), name="webapp")
 
+
+async def serve_all():
+    servers = [uvicorn.Server(uvicorn.Config(
+        app, host="0.0.0.0", port=p,
+        lifespan="on" if i == 0 else "off",   # DB init + bot start only once
+        log_level="info")) for i, p in enumerate(PORTS)]
+    print("Слушаю порты:", PORTS, flush=True)
+    await asyncio.gather(*(s.serve() for s in servers))
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    asyncio.run(serve_all())
