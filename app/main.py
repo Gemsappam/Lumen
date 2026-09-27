@@ -59,20 +59,29 @@ def _port_free(p: int) -> bool:
 
 @asynccontextmanager
 async def lifespan(app):
+    from .bot import bot, dp, setup_menu_button
+    from . import backup
+
+    # 1) container may be fresh after a rebuild -> pull data back from the Telegram channel
+    try:
+        print(f"[lumen] restore: {await backup.restore_if_empty(bot)}", flush=True)
+    except Exception as e:
+        print(f"[lumen] restore failed: {e}", flush=True)
+
     init_db()
     seed()
+
     tasks = []
     opened = []
     main = _main_port()
     for p in EXTRA_PORTS:
-        if p != main and _port_free(p):   # the port the main server already holds is skipped
+        if p != main and _port_free(p):
             srv = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=p, lifespan="off", log_level="info"))
             srv.install_signal_handlers = lambda: None
             tasks.append(asyncio.create_task(srv.serve()))
             opened.append(p)
     print(f"[lumen] основной порт {main}, доп. порты: {opened}", flush=True)
 
-    from .bot import bot, dp, setup_menu_button
     if bot:
         api.BOT = bot
         try:
@@ -80,6 +89,7 @@ async def lifespan(app):
         except Exception as e:
             print(f"[lumen] menu button: {e}", flush=True)
         tasks.append(asyncio.create_task(dp.start_polling(bot, handle_signals=False)))
+        tasks.append(asyncio.create_task(backup.backup_loop(bot)))
     yield
     for t in tasks:
         t.cancel()
@@ -87,6 +97,15 @@ async def lifespan(app):
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(api.router)
+
+
+@app.middleware("http")
+async def _changes_trigger_backup(request, call_next):
+    resp = await call_next(request)
+    if request.method != "GET" and request.url.path.startswith("/api") and resp.status_code < 400:
+        from .backup import mark_dirty
+        mark_dirty()
+    return resp
 
 
 @app.get("/health")

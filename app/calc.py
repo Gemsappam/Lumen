@@ -12,11 +12,12 @@ Rules (reverse-engineered from учет.xlsx, then made consistent):
    RUB_paid and USD_paid are entered by the operator and are taken as-is.
 4. Logistics: each (AWB, leg) cost is spread over ALL farm invoices on that AWB
    (across any top-up), by farm kg if every farm has kg, else by stems.
-   Inside an invoice: by line kg if all lines have it, else by boxes, else by stems.
+   Inside an invoice: by line kg if all lines have it, else equally per stem (as in the old sheet).
    Per stem = share of leg RUB / stems.
 5. Full cost per stem = flower + air leg + msk leg.
 """
 from __future__ import annotations
+import json
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -102,7 +103,7 @@ def compute(topup_id, topups, invoices, lines, logistics) -> Result:
     for inv in invoices:
         inv_by_awb[norm_awb(inv.awb)].append(inv)
 
-    groups = defaultdict(lambda: {"usd": 0.0, "rub": 0.0, "ids": [], "own": True, "basis": "auto", "provider": ""})
+    groups = defaultdict(lambda: {"usd": 0.0, "rub": 0.0, "ids": [], "own": True, "basis": "auto", "provider": "", "kg_total": 0.0})
     for lg in logistics:
         key = (norm_awb(lg.awb), lg.leg)
         g = groups[key]
@@ -117,6 +118,11 @@ def compute(topup_id, topups, invoices, lines, logistics) -> Result:
         g["own"] &= (lg.topup_id == topup_id and lg.rub is None)
         g["basis"] = lg.basis if lg.basis != "auto" else g["basis"]
         g["provider"] = g["provider"] or lg.provider
+        try:
+            bd = json.loads(getattr(lg, "farm_kg_json", "") or "{}")
+        except ValueError:
+            bd = {}
+        g["kg_total"] = max(g["kg_total"], sum(float(v) for v in bd.values() if v))
         if lg.topup_id == topup_id:
             res.usd_spent += lg.usd or 0
             res.rub_spent += rub
@@ -134,9 +140,14 @@ def compute(topup_id, topups, invoices, lines, logistics) -> Result:
             if g["basis"] != "stems" and len(invs) > 1:
                 res.warnings.append(f"AWB {awb}: не у всех плантаций указан вес — логистика разбита по стеблям")
         tot = sum(w) or 1
+        if attr == "weight_kg" and g["kg_total"] > tot + 0.01:
+            # forwarder bill covers farms not entered yet: they keep their share, we don't dump it on the others
+            res.warnings.append(f"AWB {awb}: внесено {tot:g} из {g['kg_total']:g} кг по разбивке {g['provider'] or 'перевозчика'} — "
+                                f"остальные плантации ещё без инвойсов")
+            tot = g["kg_total"]
         for inv, wi in zip(invs, w):
             ls = lines_by_inv[inv.id]
-            la, lw = _pick_basis(ls, ["weight_kg", "boxes"])
+            la, lw = _pick_basis(ls, ["weight_kg"])   # like the old sheet: equal per stem inside a farm
             if la is None:
                 lw = [l.stems for l in ls]
             lt = sum(lw) or 1

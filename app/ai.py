@@ -7,11 +7,55 @@ The AI never writes to the DB by itself: it fills a draft, the operator confirms
 """
 import base64
 import json
+import re
 from anthropic import AsyncAnthropic
 
-from .config import ANTHROPIC_API_KEY, PARSE_MODEL, AUDIT_MODEL
+from .config import AI_PROVIDER, ANTHROPIC_API_KEY, AUDIT_MODEL, OPENROUTER_API_KEY, PARSE_MODEL, WEBAPP_URL
 
-client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+# Same Claude models either way. OpenRouter speaks Anthropic's Messages API at /api/v1/messages,
+# so the official SDK works with just a different base_url + Bearer key.
+if AI_PROVIDER == "openrouter":
+    client = AsyncAnthropic(base_url="https://openrouter.ai/api", auth_token=OPENROUTER_API_KEY,
+                            api_key=None,
+                            default_headers={"HTTP-Referer": WEBAPP_URL or "https://t.me", "X-Title": "Lumen Uchet"}) \
+        if OPENROUTER_API_KEY else None
+else:
+    client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+
+
+def model_id(name: str) -> str:
+    """claude-opus-5-5 -> anthropic/claude-opus-5.5 on OpenRouter; unchanged for Anthropic direct."""
+    if AI_PROVIDER != "openrouter" or "/" in name:
+        return name
+    name = re.sub(r"-\d{8}$", "", name)                 # drop date suffix (haiku-4-5-20251001)
+    name = re.sub(r"-(\d+)-(\d+)$", r"-\1.\2", name)   # 5-5 -> 5.5
+    return f"anthropic/{name}"
+
+
+async def _structured(model: str, system: str, content, tool: dict, max_tokens: int) -> dict:
+    """Get the tool's JSON back WITHOUT forced tool_choice (Opus 5.5 / Fable reject forcing).
+    tool_choice=auto + explicit instruction, check, retry once, last resort: JSON from text."""
+    last = ""
+    for attempt in range(2):
+        msg = await client.messages.create(
+            model=model_id(model), max_tokens=max_tokens,
+            system=system + f"\n\nОтветь ОДНИМ вызовом инструмента {tool['name']} — без текста вокруг.",
+            tools=[tool], tool_choice={"type": "auto"},
+            messages=[{"role": "user", "content": content}],
+        )
+        for b in msg.content:                      # response may start with a thinking block
+            if getattr(b, "type", "") == "tool_use" and b.name == tool["name"]:
+                return b.input
+        last = "".join(getattr(b, "text", "") for b in msg.content if getattr(b, "type", "") == "text")
+        m = re.search(r"\{.*\}", last, re.S)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except ValueError:
+                pass
+        if getattr(msg, "stop_reason", "") == "max_tokens":
+            max_tokens *= 2
+    raise RuntimeError(f"Модель не вернула данные. Ответ: {last[:300]}")
 
 DOMAIN = """Ты — бухгалтер-логист оптовой компании по импорту срезанных цветов (Люмен).
 Цветы приходят с плантаций Кении, Эквадора и Колумбии авиа (AWB) в Москву, дальше доставка.
@@ -85,20 +129,16 @@ def _block(data: bytes, mime: str):
 
 async def parse_document(data: bytes, mime: str, farms: list[dict], catalog: list[str]) -> dict:
     if not client:
-        raise RuntimeError("ANTHROPIC_API_KEY не задан")
+        raise RuntimeError(f"Нет ключа для AI_PROVIDER={AI_PROVIDER} (ANTHROPIC_API_KEY / OPENROUTER_API_KEY)")
     ctx = ("Известные плантации (name / country / aliases / notes):\n"
            + "\n".join(f"- {f['name']} / {f['country']} / {f['aliases']} / {f['notes']}" for f in farms)
            + "\n\nНоменклатура, которую мы уже использовали (приводи названия к этому виду, если это то же самое):\n"
            + "\n".join(catalog[:400]))
-    msg = await client.messages.create(
-        model=PARSE_MODEL, max_tokens=8000,
-        system=DOMAIN + "\n\n" + ctx,
-        tools=[PARSE_TOOL], tool_choice={"type": "tool", "name": "submit_document"},
-        messages=[{"role": "user", "content": [
-            _block(data, mime),
-            {"type": "text", "text": "Распознай документ полностью, все строки. Проверь арифметику строк и итог."}]}],
-    )
-    out = next(b.input for b in msg.content if b.type == "tool_use")
+    out = await _structured(
+        PARSE_MODEL, DOMAIN + "\n\n" + ctx,
+        [_block(data, mime),
+         {"type": "text", "text": "Распознай документ полностью, все строки. Проверь арифметику строк и итог."}],
+        PARSE_TOOL, 16000)
     # arithmetic check on our side too — never trust one pass
     s = sum((l.get("stems") or 0) * (l.get("price_usd") or 0) for l in out.get("lines", []))
     sub = out.get("subtotal_usd")
@@ -107,12 +147,7 @@ async def parse_document(data: bytes, mime: str, farms: list[dict], catalog: lis
     return out
 
 
-async def audit_topup(snapshot: dict, history: dict) -> dict:
-    if not client:
-        raise RuntimeError("ANTHROPIC_API_KEY не задан")
-    msg = await client.messages.create(
-        model=AUDIT_MODEL, max_tokens=6000,
-        system=DOMAIN + """
+AUDIT_RULES = """
 
 Ты проверяешь готовый расчёт пополнения перед тем, как он уйдёт в учёт. Ищи реальные проблемы:
 дубли строк и инвойсов (один инвойс внесён дважды, одинаковые строки внутри инвойса), AWB без логистики
@@ -120,10 +155,14 @@ async def audit_topup(snapshot: dict, history: dict) -> dict:
 курс сильно отличается от соседних пополнений, себестоимость стебля выбивается из истории этой
 плантации/сорта, сумма оплаченного $ больше пополнения, странные цены (0, отрицательные, опечатки ×10).
 НЕ считай проблемой разницу между оплаченным и суммой строк — это налог и сборы, так и должно быть.
-Суммы $ и ₽ оплаты внесены оператором и верны — не предлагай их менять. Конкретно: где, что, как исправить. Без воды.""",
-        tools=[AUDIT_TOOL], tool_choice={"type": "tool", "name": "submit_audit"},
-        messages=[{"role": "user", "content":
-                   "ПОПОЛНЕНИЕ:\n" + json.dumps(snapshot, ensure_ascii=False)
-                   + "\n\nИСТОРИЯ (курсы и типичная себестоимость):\n" + json.dumps(history, ensure_ascii=False)}],
-    )
-    return next(b.input for b in msg.content if b.type == "tool_use")
+Суммы $ и ₽ оплаты внесены оператором и верны — не предлагай их менять.
+Конкретно: где, что, как исправить. Без воды."""
+
+
+async def audit_topup(snapshot: dict, history: dict) -> dict:
+    if not client:
+        raise RuntimeError(f"Нет ключа для AI_PROVIDER={AI_PROVIDER} (ANTHROPIC_API_KEY / OPENROUTER_API_KEY)")
+    return await _structured(AUDIT_MODEL, DOMAIN + AUDIT_RULES,
+                             "ПОПОЛНЕНИЕ:\n" + json.dumps(snapshot, ensure_ascii=False)
+                             + "\n\nИСТОРИЯ (курсы и типичная себестоимость):\n" + json.dumps(history, ensure_ascii=False),
+                             AUDIT_TOOL, 32000)

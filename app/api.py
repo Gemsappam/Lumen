@@ -1,4 +1,5 @@
 import hashlib
+import re
 import hmac
 import json
 import shutil
@@ -113,15 +114,53 @@ def _all(s):
             s.exec(select(Line)).all(), s.exec(select(Logistics)).all())
 
 
+def _norm_name(x: str) -> str:
+    return re.sub(r"[^a-zа-я0-9]", "", (x or "").lower())
+
+
+def _farm_keys(s, farm: str) -> set:
+    """All spellings of a farm: its name + aliases from the directory."""
+    keys = {_norm_name(farm)}
+    for f in s.exec(select(Farm)).all():
+        names = [f.name] + [a for a in f.aliases.split(",") if a.strip()]
+        if _norm_name(farm) in {_norm_name(n) for n in names}:
+            keys |= {_norm_name(n) for n in names}
+    return keys
+
+
+def _kg_for(s, farm: str, farm_kg: dict):
+    keys = _farm_keys(s, farm)
+    for k, v in farm_kg.items():
+        nk = _norm_name(k)
+        if nk in keys or any(nk.startswith(x) or x.startswith(nk) for x in keys if len(x) >= 4 and len(nk) >= 4):
+            return v
+    return None
+
+
 def _apply_farm_kg(s, awb, farm_kg):
+    """Forwarder breakdown -> weight_kg of every farm invoice already on this AWB."""
     if not farm_kg:
         return
     key = norm_awb(awb)
-    low = {k.strip().lower(): v for k, v in farm_kg.items()}
     for inv in s.exec(select(Invoice)).all():
-        if norm_awb(inv.awb) == key and inv.farm.strip().lower() in low:
-            inv.weight_kg = low[inv.farm.strip().lower()]
-            s.add(inv)
+        if norm_awb(inv.awb) == key:
+            v = _kg_for(s, inv.farm, farm_kg)
+            if v:
+                inv.weight_kg = v
+                s.add(inv)
+
+
+def _fill_weight_from_logistics(s, inv):
+    """Invoice added AFTER the Expolanka bill: take its kg from the stored breakdown."""
+    if inv.weight_kg or not inv.awb:
+        return
+    for lg in s.exec(select(Logistics)).all():
+        if norm_awb(lg.awb) == norm_awb(inv.awb):
+            v = _kg_for(s, inv.farm, json.loads(lg.farm_kg_json or "{}"))
+            if v:
+                inv.weight_kg = v
+                s.add(inv)
+                return
 
 
 def snapshot(s, topup_id):
@@ -212,6 +251,7 @@ def save_invoice(body: InvoiceIn, inv_id: int | None = None, uid: int = Depends(
         s.add(inv); s.commit(); s.refresh(inv)
         for l in body.lines:
             s.add(Line(invoice_id=inv.id, **l.model_dump()))
+        _fill_weight_from_logistics(s, inv)
         s.commit()
         return snapshot(s, inv.topup_id)
 
@@ -236,6 +276,8 @@ def save_logistics(body: LogisticsIn, log_id: int | None = None, view_topup: int
         if log_id:
             for k, v in data.items():
                 setattr(lg, k, v)
+        if body.farm_kg:
+            lg.farm_kg_json = json.dumps({**json.loads(lg.farm_kg_json or "{}"), **body.farm_kg}, ensure_ascii=False)
         s.add(lg)
         _apply_farm_kg(s, body.awb, body.farm_kg)
         s.commit()
@@ -312,6 +354,11 @@ async def export(tid: int, uid: int = Depends(user_id)):
     if BOT:
         await BOT.send_document(uid, FSInputFile(MASTER_XLSX, filename="учет.xlsx"),
                                 caption=f"Готово: лист «{name}» обновлён")
+        from .backup import backup_now
+        try:
+            await backup_now(BOT, f"выгрузка «{name}»")
+        except Exception as e:
+            print(f"[lumen] backup after export failed: {e}", flush=True)
     return {"ok": True, "sheet": name}
 
 

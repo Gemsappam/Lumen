@@ -74,6 +74,7 @@ class Logistics(SQLModel, table=True):
     paid_date: str = ""
     note: str = ""
     source_file: Optional[str] = None
+    farm_kg_json: str = "{}"               # forwarder breakdown {"Zeeflora": 250, ...}, applied to invoices on save
 
 
 engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
@@ -81,6 +82,12 @@ engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
 
 def init_db():
     SQLModel.metadata.create_all(engine)
+    # add columns introduced after the first deploy (SQLite doesn't do it by itself)
+    from sqlalchemy import inspect, text
+    cols = {c["name"] for c in inspect(engine).get_columns("logistics")}
+    if "farm_kg_json" not in cols:
+        with engine.begin() as c:
+            c.execute(text("ALTER TABLE logistics ADD COLUMN farm_kg_json VARCHAR DEFAULT '{}'"))
 
 
 def session() -> Session:

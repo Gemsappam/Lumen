@@ -288,7 +288,7 @@ async invoice({t, inv, draft}){
 // ======================= LOGISTICS =======================
 async logistics({t, lg, draft}){
   lg = lg || {topup_id:t.id,awb:'',leg:'air',provider:'',invoice_no:'',usd:null,rub:null,basis:'auto',paid_date:t.date,note:''};
-  let farmKg = {};
+  let farmKg = lg.farm_kg_json ? JSON.parse(lg.farm_kg_json) : {};
   if(draft){ const fr=draft.freight||{}; Object.assign(lg,{awb:draft.awb||'',provider:fr.provider||draft.farm||'',leg:fr.leg||'air',usd:fr.total_usd??draft.invoice_total_usd,rub:fr.total_rub,invoice_no:draft.invoice_no||'',source_file:draft.source_file});
     (fr.per_farm_kg||[]).forEach(x=>farmKg[x.farm]=x.kg); }
   $app.innerHTML=`<h1>${lg.id?'Логистика':'Новая логистика'}</h1>
@@ -318,6 +318,7 @@ async logistics({t, lg, draft}){
   document.getElementById('save').onclick=async()=>{
     const body={awb:f.awb.value.trim(),leg:f.leg.value,provider:f.provider.value.trim(),invoice_no:f.invoice_no.value.trim(),usd:numOrNull(f.usd.value),rub:numOrNull(f.rub.value),
       topup_id:f.topup.value?+f.topup.value:null,basis:f.basis.value,paid_date:f.paid_date.value,note:lg.note||'',source_file:lg.source_file||null,farm_kg:{}};
+    Object.assign(body.farm_kg, farmKg);   // full forwarder breakdown, also for farms not entered yet
     kg.querySelectorAll('[data-farm]').forEach(i=>{const v=numOrNull(i.value);if(v)body.farm_kg[i.dataset.farm]=v});
     if(!body.awb) return toast('Нужен AWB');
     if(!body.usd&&!body.rub) return toast('Нужна сумма в $ или ₽');

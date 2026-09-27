@@ -2,7 +2,7 @@ import shutil
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonWebApp, Message,
                            ReplyKeyboardRemove, WebAppInfo)
 from sqlmodel import select
@@ -45,6 +45,8 @@ async def master(m: Message):
     if MASTER_XLSX.exists():
         shutil.copy(MASTER_XLSX, DATA_DIR / f"учет_backup_{datetime.now():%Y%m%d_%H%M}.xlsx")
     await bot.download(m.document, destination=MASTER_XLSX)
+    from .backup import mark_dirty
+    mark_dirty()
     await m.answer("Мастер-файл обновлён ✅ (старый сохранён в бэкап)")
 
 
@@ -78,6 +80,22 @@ async def doc(m: Message):
 async def photo(m: Message):
     f = await bot.download(m.photo[-1])
     await _parse_and_reply(m, f.read(), "image/jpeg")
+
+
+@dp.channel_post(F.text == "/id")
+async def channel_id(m: Message):
+    """Post /id in the backup channel -> bot replies with the channel id for BACKUP_CHAT_ID."""
+    await m.answer(f"BACKUP_CHAT_ID={m.chat.id}")
+
+
+@dp.message(ops, Command("backup"))
+async def manual_backup(m: Message):
+    from .backup import BACKUP_CHAT_ID, backup_now
+    if not BACKUP_CHAT_ID:
+        await m.answer("BACKUP_CHAT_ID не задан в .env")
+        return
+    await backup_now(bot, "вручную")
+    await m.answer("💾 Бэкап отправлен в канал и закреплён")
 
 
 @dp.message(~ops)
