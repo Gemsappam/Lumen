@@ -88,7 +88,8 @@ async def lifespan(app):
             await setup_menu_button()
         except Exception as e:
             print(f"[lumen] menu button: {e}", flush=True)
-        tasks.append(asyncio.create_task(dp.start_polling(bot, handle_signals=False)))
+        tasks.append(asyncio.create_task(dp.start_polling(bot, handle_signals=False,
+                                                           allowed_updates=dp.resolve_used_update_types())))
         tasks.append(asyncio.create_task(backup.backup_loop(bot)))
     yield
     for t in tasks:
