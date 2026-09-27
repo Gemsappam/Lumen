@@ -136,7 +136,16 @@ def _block(data: bytes, mime: str):
     return {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}}
 
 
-async def parse_document(data: bytes, mime: str, farms: list[dict], catalog: list[str]) -> dict:
+MAWB_RE = re.compile(r"(?<!\d)(\d{3})[\s\-]?(\d{4})\s?(\d{4})(?!\d)")
+
+
+def find_mawb(text: str | None) -> str | None:
+    """'065-40538245', '065 4053 8245', '06540538245' -> '065-40538245'"""
+    m = MAWB_RE.search(text or "")
+    return f"{m.group(1)}-{m.group(2)}{m.group(3)}" if m else None
+
+
+async def parse_document(data: bytes, mime: str, farms: list[dict], catalog: list[str], note: str = "") -> dict:
     if not client:
         raise RuntimeError(f"Нет ключа для AI_PROVIDER={AI_PROVIDER} (ANTHROPIC_API_KEY / OPENROUTER_API_KEY)")
     ctx = ("Известные плантации (name / country / aliases / notes):\n"
@@ -146,8 +155,15 @@ async def parse_document(data: bytes, mime: str, farms: list[dict], catalog: lis
     out = await _structured(
         PARSE_MODEL, DOMAIN + "\n\n" + ctx,
         [_block(data, mime),
-         {"type": "text", "text": "Распознай документ полностью, все строки. Проверь арифметику строк и итог."}],
+         {"type": "text", "text": "Распознай документ полностью, все строки. Проверь арифметику строк и итог."
+                                  + (f"\n\nПодпись оператора к документу (она важнее документа — если там MAWB, "
+                                     f"плантация или дата, бери оттуда): {note}" if note.strip() else "")}],
         PARSE_TOOL, 16000)
+    # the operator's caption wins for MAWB — no need to trust the model with a number typed right there
+    cap = find_mawb(note)
+    if cap:
+        out["awb"] = cap
+        out["warnings"] = [w for w in out.get("warnings", []) if "MAWB" not in w and "awb" not in w.lower()]
     # arithmetic check on our side too — never trust one pass
     s = sum((l.get("stems") or 0) * (l.get("price_usd") or 0) for l in out.get("lines", []))
     sub = out.get("subtotal_usd")
