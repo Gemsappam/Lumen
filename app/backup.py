@@ -44,6 +44,8 @@ def _make_zip() -> bytes:
             snap.unlink()
         if MASTER_XLSX.exists():
             z.write(MASTER_XLSX, "учет.xlsx")
+        if (DATA_DIR / "settings.json").exists():
+            z.write(DATA_DIR / "settings.json", "settings.json")
         for p in (DATA_DIR / "drafts").glob("*.json"):
             z.write(p, f"drafts/{p.name}")
     return buf.getvalue()

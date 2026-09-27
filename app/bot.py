@@ -5,12 +5,13 @@ from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import (InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonWebApp, Message,
+from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonWebApp, Message,
                            ReplyKeyboardRemove, WebAppInfo)
 from sqlmodel import select
 
 from . import ai
-from .api import DRAFTS, save_draft, store_breakdown
+from .api import (DRAFTS, active_topup, book_document, fill_mawb, money_from_text, save_draft,
+                  set_active_topup, store_breakdown, topup_from_text)
 from .config import ALLOWED_IDS, BOT_TOKEN, DATA_DIR, MASTER_XLSX, WEBAPP_URL
 from .models import Farm, Line, session
 
@@ -37,7 +38,10 @@ async def start(m: Message):
     await m.answer("Обновил кнопки 👇", reply_markup=ReplyKeyboardRemove())   # remove the old reply keyboard
     await m.answer("Учёт поставок Люмен.\n\n"
                    "• Кнопка ниже или «Учёт» слева от поля ввода — пополнения, инвойсы, логистика, выгрузка в Excel.\n"
-                   "• Кидай сюда PDF/фото инвойса или счёта за фрахт — распознаю и положу в черновики.\n"
+                   "• Кидай PDF/фото инвойса или счёта за фрахт. С суммами в подписи («1198$ 105472₽») — внесу сразу,"
+                   " без подписи — спрошу суммы.\n"
+                   "• Документы идут в активное пополнение (последнее). Сменить: /pop, разово — дата в подписи.\n"
+                   "• Разбивку кг кидай с MAWB в подписи.\n"
                    "• Кинь .xlsx — он станет мастер-файлом учёта (новые листы пишутся в него)."
                    + ("" if kb else "\n\n⚠️ WEBAPP_URL не https — кнопка приложения отключена."),
                    reply_markup=kb)
@@ -78,19 +82,64 @@ async def _parse_and_reply(m: Message, data: bytes, mime: str):
         await note.edit_text(head + "\n\nНапиши MAWB следующим сообщением — сохраню разбивку.")
         return
 
+    t = topup_from_text(m.caption or "") or active_topup()
+    if not t:
+        did = save_draft(out)
+        await note.edit_text("Сначала создай пополнение в «Учёт» — документ лежит в черновиках.")
+        return
+    out["topup_id"] = t.id
+    if out.get("doc_type") == "farm_invoice":
+        fill_mawb(out, t.id)
+    usd, rub = money_from_text(m.caption or "")
+    if out.get("doc_type") == "freight_invoice" and usd is None:
+        usd = (out.get("freight") or {}).get("total_usd")          # $ of a freight bill is on the bill itself
+    await _book_or_draft(m, note, out, t, usd, rub)
+
+
+async def _book_or_draft(m: Message, note, out: dict, t, usd, rub):
+    """Both sums known -> straight into the top-up. Otherwise a draft waiting for '1198$ 105472₽'."""
+    warn = ("\n⚠️ " + "\n⚠️ ".join(out["warnings"])) if out.get("warnings") else ""
+    head = _doc_head(out)
+    if usd and rub:
+        snap, kind = book_document(out, t.id, usd, rub, m.from_user.id)
+        if snap:
+            await note.edit_text(head + warn + "\n\n" + _booked_text(snap, out, kind, t))
+            return
+        warn += f"\n⚠️ Не внёс сразу: {kind}"
     did = save_draft(out)
     LAST_DRAFT[m.from_user.id] = (did, time.time())
+    need = "₽" if usd else "$ и ₽"
+    await note.edit_text(head + warn + f"\n\n→ пополнение {t.date}. Ответь суммой оплаты ({need}), например "
+                         f"`{usd or 1198:g}$ 105472₽` — внесу сразу. Или «Учёт» → Черновики.", parse_mode="Markdown")
+
+
+def _doc_head(out: dict) -> str:
     if out.get("doc_type") == "freight_invoice":
         fr = out.get("freight") or {}
-        money = " · ".join(x for x in (f"${fr['total_usd']:g}" if fr.get("total_usd") else "",
-                                       f"{fr['total_rub']:,.0f} ₽".replace(",", " ") if fr.get("total_rub") else "") if x)
-        txt = f"✈️ Фрахт · {fr.get('provider') or out.get('farm') or '?'} · MAWB {out.get('awb') or '?'}\n{money or 'сумма не найдена'}"
+        return f"✈️ Фрахт · {fr.get('provider') or out.get('farm') or '?'} · MAWB {out.get('awb') or '?'}" + (
+            f" · ${fr['total_usd']:g}" if fr.get("total_usd") else "")
+    stems = sum(l.get("stems") or 0 for l in out.get("lines", []))
+    return (f"📄 {out.get('farm') or '?'} · MAWB {out.get('awb') or '?'}\n"
+            f"Строк: {len(out.get('lines', []))}, стеблей: {stems:g}, итог: ${out.get('invoice_total_usd') or '?'}"
+            + (f"\n🔗 {out['mawb_note']}" if out.get("mawb_note") else ""))
+
+
+def _booked_text(snap: dict, out: dict, kind: str, t) -> str:
+    fmt = lambda x: f"{x:,.0f}".replace(",", " ")
+    if kind == "freight":
+        lg = max((l for l in snap["logistics"] if l["topup_id"] == t.id), key=lambda l: l["id"])
+        txt = (f"✅ Фрахт внесён в пополнение {t.date}: ${lg['usd'] or 0:g} / {fmt(lg['rub'] or 0)} ₽"
+               + (f" · разбивка {lg['kg_total']:g} кг ✓" if lg.get("kg_total") else " · разбивки кг ещё нет"))
     else:
-        stems = sum(l.get("stems") or 0 for l in out.get("lines", []))
-        txt = (f"📄 {out.get('farm') or '?'} · MAWB {out.get('awb') or '?'}\n"
-               f"Строк: {len(out.get('lines', []))}, стеблей: {stems:g}, итог: ${out.get('invoice_total_usd') or '?'}")
-    txt += warn + "\n\nЧерновик — «Учёт» → Черновики, выбери пополнение и впиши оплату $/₽."
-    await note.edit_text(txt)
+        inv = max(snap["invoices"], key=lambda i: i["id"])
+        st = sum(l["stems"] for l in inv["lines"]) or 1
+        flower = sum(l["price_rub"] * l["stems"] for l in inv["lines"]) / st
+        logi = sum((l["air_rub"] + l["msk_rub"]) * l["stems"] for l in inv["lines"]) / st
+        txt = (f"✅ Внесено в пополнение {t.date}: ${inv['usd_paid']:g} / {fmt(inv['rub_paid'])} ₽\n"
+               f"Себестоимость в среднем {flower + logi:.2f} ₽/стебель (цветок {flower:.2f} + логистика {logi:.2f})")
+    rel = [w for w in snap["warnings"] if (out.get("farm") or "~").lower()[:5] in w.lower()
+           or (out.get("awb") or "~").replace("-", "")[:6] in w.replace("-", "")]
+    return txt + ("\n⚠️ " + "\n⚠️ ".join(rel) if rel else "") + f"\nОстаток пополнения ${snap['usd_left']:g}"
 
 
 def _applied_text(w: dict) -> str:
@@ -144,6 +193,60 @@ async def manual_backup(m: Message):
 @dp.message(~ops)
 async def stranger(m: Message):
     await m.answer(f"Нет доступа. Твой ID: {m.from_user.id} — добавь его в ALLOWED_IDS в .env и перезапусти.")
+
+
+@dp.message(ops, F.text.func(lambda t: any(money_from_text(t)) and not ai.find_mawb(t)))
+async def money_followup(m: Message):
+    """'1198$ 105472₽' right after a document -> books the last draft."""
+    did, ts = LAST_DRAFT.get(m.from_user.id, (None, 0))
+    path = DRAFTS / f"{did}.json" if did else None
+    if not path or not path.exists() or time.time() - ts > 30 * 60:
+        await m.answer("Не к чему привязать суммы: сначала пришли документ (суммы можно прямо в подписи).")
+        return
+    d = json.loads(path.read_text())
+    usd, rub = money_from_text(m.text)
+    if d.get("doc_type") == "freight_invoice" and usd is None:
+        usd = (d.get("freight") or {}).get("total_usd")
+    if not (usd and rub):
+        await m.answer("Нужны обе суммы: $ и ₽, например `1198$ 105472₽`", parse_mode="Markdown")
+        return
+    with session() as s:
+        from .models import TopUp
+        t = s.get(TopUp, d.get("topup_id") or 0)
+    t = t or active_topup()
+    snap, kind = book_document(d, t.id, usd, rub, m.from_user.id)
+    if not snap:
+        await m.answer(f"Не внёс: {kind}. Открой черновик в «Учёт».")
+        return
+    path.unlink()
+    await m.answer(_booked_text(snap, d, kind, t))
+
+
+@dp.message(ops, Command("pop"))
+async def choose_topup(m: Message):
+    """Pick the top-up that chat documents go to."""
+    from .models import TopUp
+    act = active_topup()
+    with session() as s:
+        tops = s.exec(select(TopUp).order_by(TopUp.id.desc()).limit(8)).all()
+    if not tops:
+        await m.answer("Пополнений пока нет — создай в «Учёт».")
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text=("✅ " if act and t.id == act.id else "") + f"{t.date} · ${t.usd:g}", callback_data=f"pop:{t.id}")] for t in tops])
+    await m.answer("Куда вносить документы из чата:", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("pop:"), F.from_user.id.in_(ALLOWED_IDS))
+async def set_topup(c: CallbackQuery):
+    from .models import TopUp
+    tid = int(c.data.split(":")[1])
+    set_active_topup(tid)
+    with session() as s:
+        t = s.get(TopUp, tid)
+    await c.message.edit_text(f"Документы из чата теперь идут в пополнение {t.date} ✅\n"
+                              f"Разово другое — напиши дату в подписи: «23.09 1198$ 105472₽»")
+    await c.answer()
 
 
 @dp.message(ops, F.text.func(lambda t: bool(ai.find_mawb(t))))

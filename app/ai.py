@@ -76,6 +76,10 @@ DOMAIN = """Ты — бухгалтер-логист оптовой компан
 - Коробки: FB=1, HB=0.5, QB=0.25, EB=0.125. Stems = bunches × stems per bunch. Длина (40cm/50cm/60cm)
   — часть номенклатуры, пиши её в название: "Rose Madam Red 40cm".
 - Гортензии (Кондор, American Flowers): часто одна цена на всё, названия = цвета.
+- Строки вроде "Documentation Fees", упаковка, коробки внутри таблицы — это НЕ цветы: в lines их не пиши,
+  их сумму положи в fees_usd.
+- Инвойсы кенийских плантаций обычно без MAWB (только агент Expolanka) — это нормально, не пиши warning про MAWB,
+  оставь awb=null: система сама подставит MAWB по разбивке Expolanka.
 - В инвойсах бывает VAT/tax (Кения 16%), doc fees, упаковка. Это нормально и в себестоимость стебля
   НЕ идёт: цена строки — это цена стебля. Subtotal = сумма строк, total = с налогами/сборами.
 - Суммы оплаты в $ и ₽ вносит оператор, они всегда верные. Не спорь с ними и не пересчитывай.
@@ -99,7 +103,8 @@ PARSE_TOOL = {
             "per_farm_kg": {"type": "array", "description": "kg per farm on this MAWB (kg_breakdown or any doc that has it)",
                             "items": {"type": "object", "properties": {
                                 "farm": {"type": "string"}, "kg": {"type": "number"}, "boxes": {"type": ["number", "null"]}}}},
-            "subtotal_usd": {"type": ["number", "null"], "description": "sum of lines before tax/fees"},
+            "subtotal_usd": {"type": ["number", "null"], "description": "subtotal exactly as printed"},
+            "fees_usd": {"type": ["number", "null"], "description": "non-flower rows inside the table: documentation fees, boxes, packing, etc."},
             "invoice_total_usd": {"type": ["number", "null"], "description": "balance due incl. tax/fees"},
             "total_weight_kg": {"type": ["number", "null"]},
             "lines": {"type": "array", "items": {"type": "object", "properties": {
@@ -170,8 +175,10 @@ async def parse_document(data: bytes, mime: str, farms: list[dict], catalog: lis
     # arithmetic check on our side too — never trust one pass
     s = sum((l.get("stems") or 0) * (l.get("price_usd") or 0) for l in out.get("lines", []))
     sub = out.get("subtotal_usd")
-    if sub and s and abs(s - sub) > 0.5:   # only an OCR check: lines must add up to the subtotal
-        out.setdefault("warnings", []).append(f"Строки дают ${s:.2f}, а subtotal ${sub:.2f} — строка прочитана неверно?")
+    fees = out.get("fees_usd") or 0
+    if sub and s and abs(s + fees - sub) > 0.5:   # OCR check: flower lines + fees must add up to the subtotal
+        out.setdefault("warnings", []).append(
+            f"Строки цветов ${s:.2f}" + (f" + сборы ${fees:.2f}" if fees else "") + f" ≠ subtotal ${sub:.2f} — строка прочитана неверно?")
     return out
 
 

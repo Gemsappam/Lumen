@@ -121,7 +121,7 @@ async home(){
       <span class="pill">разобрать</span></div>`).join('')}</div>`:''}
     <h2>Пополнения</h2>
     <div class="group">${tops.length?tops.map(t=>`
-      <div class="row" data-top="${t.id}"><div class="grow"><div class="t">${esc(t.date)}</div>
+      <div class="row" data-top="${t.id}"><div class="grow"><div class="t">${esc(t.date)}${t.active?' <span class="pill">сюда идут документы</span>':''}</div>
       <div class="s num">${fmt(t.rub)} ₽ → $${fmt(t.usd)} · курс ${fmt(t.rate,4)}</div></div>
       <div class="v"><div class="num">$${fmt(t.usd_left,2)}</div><div class="s">остаток</div></div></div>`).join('')
       :'<div class="empty">Пополнений пока нет. Начни с первого.</div>'}</div>
@@ -129,6 +129,8 @@ async home(){
   $app.querySelectorAll('[data-top]').forEach(e=>e.onclick=()=>go('topup',{id:+e.dataset.top}));
   $app.querySelectorAll('[data-draft]').forEach(e=>e.onclick=()=>{const d=drafts.find(x=>x.id===e.dataset.draft);
     if(d.doc_type==='kg_breakdown'){d._draftId=d.id;return go('weights',{t:null,draft:d})}   // weights don't belong to a top-up
+    const tt=d.topup_id&&tops.find(x=>x.id===d.topup_id);
+    if(tt){d._draftId=d.id;return go(d.doc_type==='farm_invoice'?'invoice':'logistics',{t:tt,draft:d})}
     go('draft',{d,tops})});
   document.getElementById('new').onclick=()=>go('topupForm',{});
   document.getElementById('farms').onclick=()=>go('farms');
@@ -189,12 +191,13 @@ async topup({id, snap}){
     <div class="v">${l.usd?'$'+fmt(l.usd,2):''}${l.rub?'<div class="s">'+fmt(l.rub)+' ₽</div>':''}</div></div>`).join('')
     :'<div class="empty">Фрахт ещё не внесён — себестоимость пока без логистики.</div>'}</div>
   <div class="actions"><button id="addLog">Добавить логистику</button></div>
-  <div class="actions"><button id="edit">Изменить пополнение</button></div>`;
+  <div class="actions"><button id="edit">Изменить пополнение</button>${t.active?'':'<button id="act">Документы из чата — сюда</button>'}</div>`;
   $app.querySelectorAll('[data-inv]').forEach(e=>e.onclick=()=>go('invoice',{t,inv:d.invoices.find(i=>i.id==e.dataset.inv)}));
   $app.querySelectorAll('[data-log]').forEach(e=>e.onclick=()=>go('logistics',{t,lg:d.logistics.find(l=>l.id==e.dataset.log)}));
   document.getElementById('addInv').onclick=()=>go('invoice',{t});
   document.getElementById('addLog').onclick=()=>go('logistics',{t});
   document.getElementById('edit').onclick=()=>go('topupForm',{t});
+  document.getElementById('act')?.addEventListener('click',async()=>{await api(`/topups/${t.id}/activate`,{method:'POST'});toast('Теперь документы из чата идут в '+t.date);render('topup',{id:t.id})});
 
   document.getElementById('xls').onclick=async e=>{e.target.disabled=true;try{const r=await api(`/topups/${t.id}/export`,{method:'POST'});toast(`Лист «${r.sheet}» отправлен в чат`)}catch(x){toast(x.message)}e.target.disabled=false};
   document.getElementById('audit').onclick=async e=>{
@@ -433,7 +436,8 @@ async farm({f}){
 function applyParsed(inv, r){
   Object.assign(inv,{farm:r.farm||inv.farm,country:r.country||inv.country,invoice_no:r.invoice_no||inv.invoice_no,
     invoice_date:r.invoice_date||inv.invoice_date,awb:r.awb||inv.awb,invoice_total_usd:r.invoice_total_usd??inv.invoice_total_usd,
-    source_file:r.source_file,_warnings:r.warnings||[]});
+    weight_kg:r.weight_kg??inv.weight_kg,
+    source_file:r.source_file,_warnings:[...(r.mawb_note?[r.mawb_note]:[]),...(r.warnings||[])]});
   if(r.lines?.length) inv.lines=r.lines.map(l=>({name:l.name,boxes:l.boxes,stems:l.stems,weight_kg:l.weight_kg,price_usd:l.price_usd}));
   if(!inv.usd_paid && r.invoice_total_usd) inv._warnings.push('Суммы оплаты $ и ₽ впиши сам — из инвойса не подставляю.');
 }

@@ -137,6 +137,120 @@ def _kg_for(s, farm: str, farm_kg: dict):
     return None
 
 
+# ---------- active top-up (where documents from the chat go) -------------------------------
+SETTINGS = DATA_DIR / "settings.json"
+
+
+def _settings() -> dict:
+    try:
+        return json.loads(SETTINGS.read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def set_active_topup(tid: int):
+    SETTINGS.write_text(json.dumps({**_settings(), "active_topup": tid}))
+    from .backup import mark_dirty
+    mark_dirty()
+
+
+def active_topup():
+    """The chosen top-up, else the newest one."""
+    with session() as s:
+        t = s.get(TopUp, _settings().get("active_topup") or 0)
+        return t or s.exec(select(TopUp).order_by(TopUp.id.desc())).first()
+
+
+NUM = r"\d{1,3}(?:[ \u00a0]\d{3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?"
+USD_RE = re.compile(rf"\$\s*({NUM})|(?<![\d.,])({NUM})\s*(?:\$|usd\b|долл)", re.I)
+RUB_RE = re.compile(rf"(?<![\d.,])({NUM})\s*(?:₽|р\b|р\.|руб|rub\b)", re.I)
+
+
+def _num(x: str) -> float:
+    return float(x.replace(" ", "").replace("\u00a0", "").replace(",", "."))
+
+
+def money_from_text(text: str):
+    """'1198$ 105 472₽' -> (1198.0, 105472.0). Either may be None."""
+    text = text or ""
+    u, r = USD_RE.search(text), RUB_RE.search(text)
+    usd = _num(u.group(1) or u.group(2)) if u else None
+    rub = _num(r.group(1)) if r else None
+    return usd, rub
+
+
+def topup_from_text(text: str):
+    """A date like 23.09 in the caption picks that top-up."""
+    text = RUB_RE.sub(" ", USD_RE.sub(" ", text or ""))
+    with session() as s:
+        tops = s.exec(select(TopUp).order_by(TopUp.id.desc())).all()
+        for m in re.finditer(r"(?<![\d.])(\d{1,2})\.(\d{2})(?:\.(\d{2,4}))?(?![\d])", text):
+            d, mth = int(m.group(1)), int(m.group(2))
+            if 1 <= d <= 31 and 1 <= mth <= 12:
+                for t in tops:
+                    if t.date.startswith(f"{d:02d}.{mth:02d}"):
+                        return t
+    return None
+
+
+def book_document(out: dict, topup_id: int, usd, rub, uid: int):
+    """Farm invoice / freight bill + paid $ and ₽ -> straight into the books, no Mini App.
+    Returns (snapshot, what) or (None, reason)."""
+    from datetime import date
+    today = date.today().strftime("%d.%m.%Y")
+    if out.get("doc_type") == "farm_invoice":
+        lines = [LineIn(name=l["name"], boxes=l.get("boxes"), stems=l.get("stems") or 0,
+                        weight_kg=l.get("weight_kg"), price_usd=l.get("price_usd") or 0)
+                 for l in out.get("lines", []) if l.get("name") and l.get("stems")]
+        if not lines or not out.get("farm"):
+            return None, "не распознаны строки или плантация"
+        with session() as s:
+            f = s.exec(select(Farm)).all()
+            country = out.get("country") or next((x.country for x in f if x.name.lower() == out["farm"].lower()), "")
+        body = InvoiceIn(topup_id=topup_id, country=country, invoice_no=out.get("invoice_no") or "",
+                         invoice_date=out.get("invoice_date") or "", awb=out.get("awb") or "", farm=out["farm"],
+                         weight_kg=out.get("weight_kg"), invoice_total_usd=out.get("invoice_total_usd"),
+                         usd_paid=usd, rub_paid_override=rub, paid_date=today,
+                         note=out.get("mawb_note") or "", source_file=out.get("source_file"), lines=lines)
+        return save_invoice(body, None, uid), "invoice"
+    if out.get("doc_type") == "freight_invoice":
+        fr = out.get("freight") or {}
+        body = LogisticsIn(topup_id=topup_id, awb=out.get("awb") or "", leg=fr.get("leg") or "air",
+                           provider=fr.get("provider") or out.get("farm") or "", invoice_no=out.get("invoice_no") or "",
+                           usd=usd, rub=rub, paid_date=today, source_file=out.get("source_file"),
+                           farm_kg={x["farm"]: x["kg"] for x in fr.get("per_farm_kg") or [] if x.get("kg")})
+        if not body.awb:
+            return None, "нет MAWB"
+        return save_logistics(body, None, topup_id, uid), "freight"
+    return None, "этот тип документа сразу не вносится"
+
+
+def infer_mawb(farm: str, topup_id: int | None = None):
+    """Farm invoices from Kenya carry no MAWB. The Expolanka breakdown does: find the MAWB whose
+    breakdown lists this farm and that doesn't have this farm's invoice yet. Newest first.
+    Returns (mawb, kg, n_candidates) or (None, None, 0)."""
+    from sqlalchemy import text
+    if not farm:
+        return None, None, 0
+    with session() as s:
+        rows = s.exec(text("SELECT awb, farm_kg_json FROM awbweights ORDER BY rowid DESC")).all()
+        taken = {(norm_awb(i.awb), _norm_name(i.farm)) for i in s.exec(select(Invoice)).all()}
+        keys = _farm_keys(s, farm)
+        cands = []
+        for awb, js in rows:
+            kg = _kg_for(s, farm, json.loads(js or "{}"))
+            if kg and not any((awb, k) in taken for k in keys):
+                cands.append((awb, kg))
+        if topup_id and len(cands) > 1:
+            # MAWBs whose freight is paid from this top-up go first
+            paid_here = {norm_awb(l.awb) for l in s.exec(select(Logistics)).all() if l.topup_id == topup_id}
+            cands.sort(key=lambda c: c[0] not in paid_here)
+    if not cands:
+        return None, None, 0
+    a, kg = cands[0]
+    return f"{a[:3]}-{a[3:]}", kg, len(cands)
+
+
 def _apply_farm_kg(s, awb, farm_kg):
     """Forwarder breakdown -> weight_kg of every farm invoice already on this AWB."""
     if not farm_kg:
@@ -211,7 +325,8 @@ def snapshot(s, topup_id):
     kg = _awb_kg(s)
     out_log = [{**lg.model_dump(), "kg_total": kg.get(norm_awb(lg.awb), 0)}
                for lg in logs if lg.topup_id == topup_id or norm_awb(lg.awb) in related]
-    return {"topup": {**t.model_dump(), "rate": rate_of(t)}, "invoices": out_inv, "logistics": out_log,
+    act = _settings().get("active_topup")
+    return {"topup": {**t.model_dump(), "rate": rate_of(t), "active": t.id == act}, "invoices": out_inv, "logistics": out_log,
             "usd_spent": round(res.usd_spent, 2), "rub_spent": round(res.rub_spent),
             "usd_left": round(t.usd - res.usd_spent, 2), "warnings": res.warnings}
 
@@ -233,12 +348,14 @@ def history(s):
 # ---------- routes -------------------------------------------------------------------
 @router.get("/topups")
 def list_topups(uid: int = Depends(user_id)):
+    active = active_topup()
     with session() as s:
         tops, invs, lines, logs = _all(s)
         out = []
         for t in sorted(tops, key=lambda x: x.id, reverse=True):
             spent = sum(i.usd_paid for i in invs if i.topup_id == t.id) + sum(l.usd or 0 for l in logs if l.topup_id == t.id)
             out.append({**t.model_dump(), "rate": rate_of(t), "usd_left": round(t.usd - spent, 2),
+                        "active": bool(active) and t.id == active.id,
                         "n_invoices": sum(1 for i in invs if i.topup_id == t.id)})
         return out
 
@@ -248,7 +365,14 @@ def create_topup(body: TopUpIn, uid: int = Depends(user_id)):
     with session() as s:
         t = TopUp(**body.model_dump())
         s.add(t); s.commit(); s.refresh(t)
-        return t
+    set_active_topup(t.id)            # a new top-up becomes the one chat documents go to
+    return t
+
+
+@router.post("/topups/{tid}/activate")
+def activate_topup(tid: int, uid: int = Depends(user_id)):
+    set_active_topup(tid)
+    return {"ok": True}
 
 
 @router.put("/topups/{tid}")
@@ -269,6 +393,8 @@ def get_topup(tid: int, uid: int = Depends(user_id)):
 
 @router.post("/invoices")
 def save_invoice(body: InvoiceIn, inv_id: int | None = None, uid: int = Depends(user_id)):
+    if not body.awb.strip():
+        body.awb = infer_mawb(body.farm)[0] or ""      # typed by hand without MAWB -> take it from the breakdown
     with session() as s:
         data = body.model_dump(exclude={"lines"})
         inv = s.get(Invoice, inv_id) if inv_id else Invoice(**data)
@@ -405,6 +531,7 @@ async def parse(file: UploadFile = File(...), uid: int = Depends(user_id)):
         catalog = sorted({l.name for l in s.exec(select(Line)).all()})
     out = await ai.parse_document(data, mime, fs, catalog)
     out["source_file"] = name
+    fill_mawb(out)
     return out
 
 
@@ -441,6 +568,21 @@ async def export(tid: int, uid: int = Depends(user_id)):
 # ---------- drafts: invoices sent straight into the bot chat, waiting for the operator ----
 DRAFTS = DATA_DIR / "drafts"
 DRAFTS.mkdir(exist_ok=True)
+
+
+def fill_mawb(out: dict, topup_id: int | None = None):
+    """Parsed farm invoice without MAWB -> take it from the forwarder breakdown that lists this farm."""
+    if out.get("doc_type") != "farm_invoice" or out.get("awb"):
+        return
+    awb, kg, n = infer_mawb(out.get("farm") or "", topup_id)
+    if not awb:
+        out.setdefault("warnings", []).append(
+            "MAWB в инвойсе нет, и разбивки с этой плантацией пока нет — кинь разбивку Expolanka, MAWB подставится сам")
+        return
+    out["awb"], out["weight_kg"] = awb, kg
+    out["warnings"] = [w for w in out.get("warnings", []) if "MAWB" not in w and "awb" not in w.lower()]
+    out["mawb_note"] = f"MAWB взят из разбивки: {out.get('farm')} {kg:g} кг" + (
+        f" (подходящих MAWB {n}, взят последний — проверь)" if n > 1 else "")
 
 
 def _draft_key(d: dict):
