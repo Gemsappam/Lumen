@@ -10,7 +10,7 @@ from aiogram.types import (InlineKeyboardButton, InlineKeyboardMarkup, MenuButto
 from sqlmodel import select
 
 from . import ai
-from .api import DRAFTS, save_draft
+from .api import DRAFTS, save_draft, store_breakdown
 from .config import ALLOWED_IDS, BOT_TOKEN, DATA_DIR, MASTER_XLSX, WEBAPP_URL
 from .models import Farm, Line, session
 
@@ -63,28 +63,45 @@ async def _parse_and_reply(m: Message, data: bytes, mime: str):
     except Exception as e:
         await note.edit_text(f"Не смог прочитать: {e}")
         return
-    did = save_draft(out)
-    LAST_DRAFT[m.from_user.id] = (did, time.time())
-    stems = sum(l.get("stems") or 0 for l in out.get("lines", []))
+    warn = ("\n⚠️ " + "\n⚠️ ".join(out["warnings"])) if out.get("warnings") else ""
+
     if out.get("doc_type") == "kg_breakdown":
         kg = out.get("per_farm_kg") or []
-        txt = (f"⚖️ Разбивка кг · MAWB {out.get('awb') or '?'}\n"
-               + "\n".join(f"• {x.get('farm')}: {x.get('kg')} кг" for x in kg)
-               + f"\nИтого {sum(x.get('kg') or 0 for x in kg):g} кг")
-        if out.get("warnings"):
-            txt += "\n⚠️ " + "\n⚠️ ".join(out["warnings"])
+        head = (f"⚖️ Разбивка кг · MAWB {out.get('awb') or '?'}\n"
+                + "\n".join(f"• {x.get('farm')}: {x.get('kg'):g} кг" for x in kg)
+                + f"\nИтого {sum(x.get('kg') or 0 for x in kg):g} кг" + warn)
+        if out.get("awb"):
+            await note.edit_text(head + "\n\n" + _applied_text(store_breakdown(out["awb"], kg, out.get("source_file"))))
+            return
         did = save_draft(out)
         LAST_DRAFT[m.from_user.id] = (did, time.time())
-        if not out.get("awb"):
-            txt += "\n\nНапиши MAWB следующим сообщением — допишу в черновик."
-        await note.edit_text(txt + f"\n\nЧерновик #{did} — «Учёт» → Черновики.")
+        await note.edit_text(head + "\n\nНапиши MAWB следующим сообщением — сохраню разбивку.")
         return
-    txt = (f"📄 {out.get('doc_type')} · {out.get('farm') or '?'} · MAWB {out.get('awb') or '?'}\n"
-           f"Строк: {len(out.get('lines', []))}, стеблей: {stems:g}, итог: ${out.get('invoice_total_usd') or '?'}")
-    if out.get("warnings"):
-        txt += "\n⚠️ " + "\n⚠️ ".join(out["warnings"])
-    txt += f"\n\nЧерновик #{did} — открой «Учёт» → Черновики, проверь и впиши реально оплаченные $/₽."
+
+    did = save_draft(out)
+    LAST_DRAFT[m.from_user.id] = (did, time.time())
+    if out.get("doc_type") == "freight_invoice":
+        fr = out.get("freight") or {}
+        money = " · ".join(x for x in (f"${fr['total_usd']:g}" if fr.get("total_usd") else "",
+                                       f"{fr['total_rub']:,.0f} ₽".replace(",", " ") if fr.get("total_rub") else "") if x)
+        txt = f"✈️ Фрахт · {fr.get('provider') or out.get('farm') or '?'} · MAWB {out.get('awb') or '?'}\n{money or 'сумма не найдена'}"
+    else:
+        stems = sum(l.get("stems") or 0 for l in out.get("lines", []))
+        txt = (f"📄 {out.get('farm') or '?'} · MAWB {out.get('awb') or '?'}\n"
+               f"Строк: {len(out.get('lines', []))}, стеблей: {stems:g}, итог: ${out.get('invoice_total_usd') or '?'}")
+    txt += warn + "\n\nЧерновик — «Учёт» → Черновики, выбери пополнение и впиши оплату $/₽."
     await note.edit_text(txt)
+
+
+def _applied_text(w: dict) -> str:
+    on = {i["farm"] for i in w["invoices"] if i.get("weight_kg")}
+    missing = [f for f in w["farm_kg"] if not any(f.lower()[:4] == x.lower()[:4] for x in on)]
+    txt = "✅ Разбивка сохранена"
+    if on:
+        txt += f", вес проставлен: {', '.join(sorted(on))}"
+    if missing:
+        txt += f"\nЕщё без инвойсов: {', '.join(missing)} — вес встанет сам, когда их внесёшь"
+    return txt
 
 
 @dp.message(ops, F.document.mime_type.in_({"application/pdf", "image/jpeg", "image/png"}))
@@ -138,6 +155,11 @@ async def mawb_followup(m: Message):
         await m.answer("Не к чему привязать этот MAWB: сначала пришли документ (можно MAWB прямо в подписи к нему).")
         return
     d = json.loads(path.read_text())
+    if d.get("doc_type") == "kg_breakdown":
+        w = store_breakdown(ai.find_mawb(m.text), d.get("per_farm_kg"), d.get("source_file"))
+        path.unlink()
+        await m.answer(f"MAWB {ai.find_mawb(m.text)}\n" + _applied_text(w))
+        return
     old, d["awb"] = d.get("awb"), ai.find_mawb(m.text)
     d["warnings"] = [w for w in d.get("warnings", []) if "MAWB" not in w and "awb" not in w.lower()]
     path.write_text(json.dumps(d, ensure_ascii=False))

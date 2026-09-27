@@ -158,14 +158,16 @@ def _awb_kg(s) -> dict:
     return out
 
 
-def _store_weights(s, awb, farm_kg, source_file=None):
-    """Save/merge a per-farm kg breakdown for a MAWB and push it onto the farm invoices."""
+def _store_weights(s, awb, farm_kg, source_file=None, replace=False):
+    """Save a per-farm kg breakdown for a MAWB and push it onto the farm invoices.
+    replace=True: a full breakdown document replaces the old one; False: merge (manual edits)."""
     farm_kg = {k: float(v) for k, v in (farm_kg or {}).items() if v not in (None, "", 0)}
     if not awb or not farm_kg:
         return
     key = norm_awb(awb)
     row = s.get(AwbWeights, key) or AwbWeights(awb=key)
-    row.farm_kg_json = json.dumps({**json.loads(row.farm_kg_json or "{}"), **farm_kg}, ensure_ascii=False)
+    base = {} if replace else json.loads(row.farm_kg_json or "{}")
+    row.farm_kg_json = json.dumps({**base, **farm_kg}, ensure_ascii=False)
     if source_file:
         row.source_file = source_file
     s.add(row)
@@ -328,7 +330,31 @@ class WeightsIn(BaseModel):
     source_file: str | None = None
 
 
+def weights_now(awb: str) -> dict:
+    with session() as s:
+        row = s.get(AwbWeights, norm_awb(awb))
+        k = norm_awb(awb)
+        invs = [{"id": i.id, "farm": i.farm, "weight_kg": i.weight_kg, "topup_id": i.topup_id}
+                for i in s.exec(select(Invoice)).all() if norm_awb(i.awb) == k]
+        return {"awb": awb, "farm_kg": json.loads(row.farm_kg_json) if row else {}, "invoices": invs}
+
+
+def store_breakdown(awb: str, per_farm_kg: list, source_file=None) -> dict:
+    """Used by the bot: a breakdown with a MAWB is applied straight away, no draft needed."""
+    farm_kg = {x["farm"]: x["kg"] for x in per_farm_kg or [] if x.get("farm") and x.get("kg")}
+    with session() as s:
+        _store_weights(s, awb, farm_kg, source_file, replace=True)
+        s.commit()
+    from .backup import mark_dirty
+    mark_dirty()
+    return weights_now(awb)
+
+
 @router.get("/weights/{awb}")
+def _get_weights_alias(awb: str, uid: int = Depends(user_id)):
+    return weights_now(awb)
+
+
 def get_weights(awb: str, uid: int = Depends(user_id)):
     """Breakdown for a MAWB + the farm invoices already on it."""
     with session() as s:
@@ -415,7 +441,20 @@ DRAFTS = DATA_DIR / "drafts"
 DRAFTS.mkdir(exist_ok=True)
 
 
+def _draft_key(d: dict):
+    return (d.get("doc_type"), norm_awb(d.get("awb") or ""), (d.get("farm") or "").lower(), d.get("invoice_no") or "")
+
+
 def save_draft(parsed: dict) -> str:
+    """Same document sent twice -> replaces the old draft instead of piling up."""
+    key = _draft_key(parsed)
+    if key[1] or key[3]:
+        for p in DRAFTS.glob("*.json"):
+            try:
+                if _draft_key(json.loads(p.read_text())) == key:
+                    p.unlink()
+            except ValueError:
+                pass
     did = uuid.uuid4().hex[:8]
     (DRAFTS / f"{did}.json").write_text(json.dumps(parsed, ensure_ascii=False))
     from .backup import mark_dirty

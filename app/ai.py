@@ -80,7 +80,9 @@ DOMAIN = """Ты — бухгалтер-логист оптовой компан
   НЕ идёт: цена строки — это цена стебля. Subtotal = сумма строк, total = с налогами/сборами.
 - Суммы оплаты в $ и ₽ вносит оператор, они всегда верные. Не спорь с ними и не пересчитывай.
 - Номера AWB бывают в форматах "065-4053 8245", "06540538245" — это одно и то же.
-- Не выдумывай. Если поле не читается — null и warning."""
+- Не выдумывай. Если поле не читается — null и warning.
+- warnings — только реальные проблемы (не читается, не сходится, чего-то не хватает).
+  Не пиши, что всё сошлось или что итог посчитан как сумма строк — это шум."""
 
 PARSE_TOOL = {
     "name": "submit_document",
@@ -159,10 +161,11 @@ async def parse_document(data: bytes, mime: str, farms: list[dict], catalog: lis
                                   + (f"\n\nПодпись оператора к документу (она важнее документа — если там MAWB, "
                                      f"плантация или дата, бери оттуда): {note}" if note.strip() else "")}],
         PARSE_TOOL, 16000)
-    # the operator's caption wins for MAWB — no need to trust the model with a number typed right there
-    cap = find_mawb(note)
+    # MAWB hygiene: caption wins; otherwise keep only the MAWB part of whatever the model wrote
+    # (it sometimes returns "065-40538245 / HAWB 22326268706")
+    cap = find_mawb(note) or find_mawb(out.get("awb") or "")
+    out["awb"] = cap
     if cap:
-        out["awb"] = cap
         out["warnings"] = [w for w in out.get("warnings", []) if "MAWB" not in w and "awb" not in w.lower()]
     # arithmetic check on our side too — never trust one pass
     s = sum((l.get("stems") or 0) * (l.get("price_usd") or 0) for l in out.get("lines", []))

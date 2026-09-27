@@ -116,8 +116,8 @@ async home(){
     <h1>Учёт поставок</h1>
     <p class="sub">Пополнение → инвойсы плантаций → логистика → Excel</p>
     ${drafts.length?`<h2>Черновики из чата</h2><div class="group">${drafts.map(d=>`
-      <div class="row" data-draft="${d.id}"><div class="grow"><div class="t">${esc(d.farm||d.freight?.provider||'Документ')}</div>
-      <div class="s">${d.doc_type==='farm_invoice'?'инвойс':d.doc_type==='kg_breakdown'?'разбивка кг':'логистика'} · MAWB ${esc(d.awb||'?')} · ${d.lines?.length||0} строк</div></div>
+      <div class="row" data-draft="${d.id}"><div class="grow"><div class="t">${esc(d.doc_type==='kg_breakdown'?'Разбивка кг':d.doc_type==='freight_invoice'?'Фрахт · '+(d.freight?.provider||d.farm||''):(d.farm||'Документ'))}</div>
+      <div class="s">MAWB ${esc(d.awb||'?')} · ${d.doc_type==='kg_breakdown'?fmt((d.per_farm_kg||[]).reduce((a,x)=>a+(x.kg||0),0))+' кг':d.doc_type==='freight_invoice'?(d.freight?.total_usd?'$'+fmt(d.freight.total_usd,2):d.freight?.total_rub?fmt(d.freight.total_rub)+' ₽':'сумма?'):fmt((d.lines||[]).reduce((a,l)=>a+(l.stems||0),0))+' стеблей · $'+fmt(d.invoice_total_usd,2)}</div></div>
       <span class="pill">разобрать</span></div>`).join('')}</div>`:''}
     <h2>Пополнения</h2>
     <div class="group">${tops.length?tops.map(t=>`
@@ -127,7 +127,9 @@ async home(){
       :'<div class="empty">Пополнений пока нет. Начни с первого.</div>'}</div>
     <div class="actions"><button class="primary" id="new">Новое пополнение</button><button id="farms">Плантации</button></div>`;
   $app.querySelectorAll('[data-top]').forEach(e=>e.onclick=()=>go('topup',{id:+e.dataset.top}));
-  $app.querySelectorAll('[data-draft]').forEach(e=>e.onclick=()=>go('draft',{d:drafts.find(x=>x.id===e.dataset.draft),tops}));
+  $app.querySelectorAll('[data-draft]').forEach(e=>e.onclick=()=>{const d=drafts.find(x=>x.id===e.dataset.draft);
+    if(d.doc_type==='kg_breakdown'){d._draftId=d.id;return go('weights',{t:null,draft:d})}   // weights don't belong to a top-up
+    go('draft',{d,tops})});
   document.getElementById('new').onclick=()=>go('topupForm',{});
   document.getElementById('farms').onclick=()=>go('farms');
 },
@@ -379,7 +381,8 @@ async weights({t, awb, draft}){
     if(!Object.keys(body.farm_kg).length) return toast('Впиши кг хотя бы для одной плантации');
     await api('/weights',{method:'POST',body});
     if(draft?._draftId) await api('/drafts/'+draft._draftId,{method:'DELETE'});
-    toast('Разбивка сохранена'); stack.pop(); stack[stack.length-1]?.[0]==='topup'?render('topup',{id:t.id}):go('topup',{id:t.id});
+    toast('Разбивка сохранена'); stack.pop(); if(!t) return render('home',{});
+    stack[stack.length-1]?.[0]==='topup'?render('topup',{id:t.id}):go('topup',{id:t.id});
   };
 },
 
