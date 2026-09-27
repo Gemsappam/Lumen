@@ -58,14 +58,20 @@ async def _structured(model: str, system: str, content, tool: dict, max_tokens: 
     raise RuntimeError(f"Модель не вернула данные. Ответ: {last[:300]}")
 
 DOMAIN = """Ты — бухгалтер-логист оптовой компании по импорту срезанных цветов (Люмен).
-Цветы приходят с плантаций Кении, Эквадора и Колумбии авиа (AWB) в Москву, дальше доставка.
+Цветы приходят с плантаций Кении, Эквадора и Колумбии авиа.
 Оплата плантациям идёт в $ через платёжного агента: мы делаем «пополнение» в рублях,
 агент зачисляет $, курс пополнения = ₽/$. Всё, что оплачено из пополнения, пересчитывается по его курсу.
 
 Нюансы, которые ты обязан учитывать:
-- Кения: несколько плантаций летят одним AWB через консолидатора (Expolanka). Консолидатор
-  выставляет отдельный инвойс за фрахт в $ и даёт разбивку кг по плантациям. Это НЕ цветы, это логистика (leg=air).
-- Колумбия/Эквадор: логистика часто отдельным счётом карго-агента, иногда в ₽.
+- Логистика у нас от двух перевозчиков:
+  • Expolanka — Кения → Амстердам. Несколько кенийских плантаций летят одним MAWB, Expolanka выставляет
+    счёт за фрахт в $. В её счёте НЕТ разбивки кг по плантациям — разбивка приходит отдельным документом.
+  • Floratrack (Флоратрак) — всё остальное: Эквадор, Колумбия и прочие.
+  Счёт перевозчика — это НЕ цветы, это логистика (doc_type=freight_invoice, leg=air).
+- MAWB vs HAWB: нас интересует ТОЛЬКО MAWB (master, обычно формат 3 цифры-8 цифр, напр. 065-4053 8245).
+  HAWB (house) игнорируй полностью. В поле awb пиши только MAWB. Если в документе только HAWB — awb=null и warning.
+- Документ, где только вес/коробки по плантациям на один MAWB (манифест, weight list, разбивка) —
+  doc_type=kg_breakdown: заполни awb и per_farm_kg, lines оставь пустым.
 - Расходы на московской стороне (таможня, склад, доставка) — leg=msk.
 - Коробки: FB=1, HB=0.5, QB=0.25, EB=0.125. Stems = bunches × stems per bunch. Длина (40cm/50cm/60cm)
   — часть номенклатуры, пиши её в название: "Rose Madam Red 40cm".
@@ -82,12 +88,15 @@ PARSE_TOOL = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "doc_type": {"type": "string", "enum": ["farm_invoice", "freight_invoice", "awb", "other"]},
+            "doc_type": {"type": "string", "enum": ["farm_invoice", "freight_invoice", "kg_breakdown", "awb", "other"]},
             "farm": {"type": ["string", "null"], "description": "canonical farm name from the known list if it matches"},
             "country": {"type": ["string", "null"], "enum": ["Кения", "Эквадор", "Колумбия", None]},
             "invoice_no": {"type": ["string", "null"]},
             "invoice_date": {"type": ["string", "null"], "description": "DD.MM.YYYY"},
-            "awb": {"type": ["string", "null"]},
+            "awb": {"type": ["string", "null"], "description": "MAWB only, never HAWB"},
+            "per_farm_kg": {"type": "array", "description": "kg per farm on this MAWB (kg_breakdown or any doc that has it)",
+                            "items": {"type": "object", "properties": {
+                                "farm": {"type": "string"}, "kg": {"type": "number"}, "boxes": {"type": ["number", "null"]}}}},
             "subtotal_usd": {"type": ["number", "null"], "description": "sum of lines before tax/fees"},
             "invoice_total_usd": {"type": ["number", "null"], "description": "balance due incl. tax/fees"},
             "total_weight_kg": {"type": ["number", "null"]},

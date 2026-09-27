@@ -11,7 +11,7 @@ from openpyxl.utils import get_column_letter as CL
 
 from .calc import compute, norm_awb, rate_of
 
-HEAD = ["Страна", "Код клиента", "Номер / Дата инвойса", "Номер AWB", "Плантация", "Номенклатура",
+HEAD = ["Страна", "Код клиента", "Номер / Дата инвойса", "MAWB", "Плантация", "Номенклатура",
         "Кол-во коробок", "Кол-во стеблей", "Вес (кг)", "Цена за цветок ($)", "Цена за цветок (Р)",
         "Логистика авиа ($/стебель)", "Логистика авиа (Р/стебель)", "Логистика МСК (Р/стебель)",
         "Общая себестоимость стебля (Р)", "Сумма в $ (оплачено)", "Сумма в Р (оплачено)",
@@ -70,14 +70,14 @@ def _topups_row(wb, topup):
     return row
 
 
-def build(path, topup, topups, invoices, lines, logistics, out_path=None):
+def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg=None):
     try:
         wb = load_workbook(path)
     except Exception:
         wb = Workbook()
         wb.remove(wb.active)
 
-    res = compute(topup.id, topups, invoices, lines, logistics)
+    res = compute(topup.id, topups, invoices, lines, logistics, awb_kg)
     trow = _topups_row(wb, topup)
     name = _sheet_name(wb, topup)
     if name in wb.sheetnames:

@@ -117,7 +117,7 @@ async home(){
     <p class="sub">Пополнение → инвойсы плантаций → логистика → Excel</p>
     ${drafts.length?`<h2>Черновики из чата</h2><div class="group">${drafts.map(d=>`
       <div class="row" data-draft="${d.id}"><div class="grow"><div class="t">${esc(d.farm||d.freight?.provider||'Документ')}</div>
-      <div class="s">${d.doc_type==='farm_invoice'?'инвойс':'логистика'} · AWB ${esc(d.awb||'?')} · ${d.lines?.length||0} строк</div></div>
+      <div class="s">${d.doc_type==='farm_invoice'?'инвойс':d.doc_type==='kg_breakdown'?'разбивка кг':'логистика'} · MAWB ${esc(d.awb||'?')} · ${d.lines?.length||0} строк</div></div>
       <span class="pill">разобрать</span></div>`).join('')}</div>`:''}
     <h2>Пополнения</h2>
     <div class="group">${tops.length?tops.map(t=>`
@@ -160,7 +160,7 @@ async topupForm({t}){
 // ======================= TOP-UP DETAIL =======================
 async topup({id, snap}){
   const d = snap || await api('/topups/'+id); const t=d.topup;
-  const byAwb={}; d.invoices.forEach(i=>(byAwb[i.awb||'без AWB']??=[]).push(i));
+  const byAwb={}; d.invoices.forEach(i=>(byAwb[i.awb||'без MAWB']??=[]).push(i));
   $app.innerHTML=`
   <h1>Пополнение ${esc(t.date)}</h1>
   <div class="flow num">
@@ -176,22 +176,24 @@ async topup({id, snap}){
   <div class="group">${d.invoices.length?Object.entries(byAwb).map(([awb,invs])=>invs.map(i=>{
       const st=i.lines.reduce((a,l)=>a+l.stems,0), cost=i.lines.reduce((a,l)=>a+l.total_rub*l.stems,0);
       return `<div class="row" data-inv="${i.id}"><div class="grow"><div class="t">${esc(i.farm)}</div>
-      <div class="s">${esc(i.country)} · AWB ${esc(awb)} · ${fmt(st)} ст.${i.weight_kg?' · '+fmt(i.weight_kg,1)+' кг':''}</div></div>
+      <div class="s">${esc(i.country)} · MAWB ${esc(awb)} · ${fmt(st)} ст.${i.weight_kg?' · '+fmt(i.weight_kg,1)+' кг':''}</div></div>
       <div class="v"><div>$${fmt(i.usd_paid,2)}</div><div class="s">${st?fmt(cost/st,2)+' ₽/ст':''}</div></div></div>`}).join('')).join('')
     :'<div class="empty">Добавь первый инвойс — загрузи PDF или фото, AI заполнит строки.</div>'}</div>
   <div class="actions"><button id="addInv">Добавить инвойс</button></div>
-  <h2>Логистика по AWB этого пополнения</h2>
+  <h2>Логистика по MAWB этого пополнения</h2>
   <div class="group">${d.logistics.length?d.logistics.map(l=>`
     <div class="row" data-log="${l.id}"><div class="grow"><div class="t">${esc(l.provider||'Фрахт')} · ${l.leg==='air'?'авиа':'МСК'}</div>
-    <div class="s">AWB ${esc(l.awb)}${l.topup_id!==t.id?' · оплачено не из этого пополнения':''}</div></div>
+    <div class="s">MAWB ${esc(l.awb)}${l.topup_id!==t.id?' · оплачено не из этого пополнения':''}</div></div>
     <div class="v">${l.usd?'$'+fmt(l.usd,2):''}${l.rub?'<div class="s">'+fmt(l.rub)+' ₽</div>':''}</div></div>`).join('')
     :'<div class="empty">Фрахт ещё не внесён — себестоимость пока без логистики.</div>'}</div>
-  <div class="actions"><button id="addLog">Добавить логистику</button><button id="edit">Изменить пополнение</button></div>`;
+  <div class="actions"><button id="addLog">Добавить логистику</button><button id="addKg">Разбивка кг по MAWB</button></div>
+  <div class="actions"><button id="edit">Изменить пополнение</button></div>`;
   $app.querySelectorAll('[data-inv]').forEach(e=>e.onclick=()=>go('invoice',{t,inv:d.invoices.find(i=>i.id==e.dataset.inv)}));
   $app.querySelectorAll('[data-log]').forEach(e=>e.onclick=()=>go('logistics',{t,lg:d.logistics.find(l=>l.id==e.dataset.log)}));
   document.getElementById('addInv').onclick=()=>go('invoice',{t});
   document.getElementById('addLog').onclick=()=>go('logistics',{t});
   document.getElementById('edit').onclick=()=>go('topupForm',{t});
+  document.getElementById('addKg').onclick=()=>go('weights',{t,awb:(d.invoices.find(i=>i.awb)||{}).awb||''});
   document.getElementById('xls').onclick=async e=>{e.target.disabled=true;try{const r=await api(`/topups/${t.id}/export`,{method:'POST'});toast(`Лист «${r.sheet}» отправлен в чат`)}catch(x){toast(x.message)}e.target.disabled=false};
   document.getElementById('audit').onclick=async e=>{
     e.target.disabled=true; e.target.textContent='Проверяю…';
@@ -218,8 +220,8 @@ async invoice({t, inv, draft}){
     <div class="field"><label>Страна</label><select name="country">${['','Кения','Эквадор','Колумбия'].map(c=>`<option ${c===inv.country?'selected':''}>${c}</option>`).join('')}</select></div></div>
     <div class="two"><div class="field"><label>Номер инвойса</label><input name="invoice_no" value="${esc(inv.invoice_no)}"></div>
     <div class="field"><label>Дата инвойса</label><input name="invoice_date" value="${esc(inv.invoice_date)}"></div></div>
-    <div class="two"><div class="field"><label>AWB</label><input name="awb" value="${esc(inv.awb)}"></div>
-    <div class="field"><label>Вес плантации в AWB, кг</label><input name="weight_kg" inputmode="decimal" value="${inv.weight_kg??''}"></div></div>
+    <div class="two"><div class="field"><label>MAWB</label><input name="awb" value="${esc(inv.awb)}"></div>
+    <div class="field"><label>Вес плантации в MAWB, кг</label><input name="weight_kg" inputmode="decimal" value="${inv.weight_kg??''}"></div></div>
     <div class="field"><label>Код клиента</label><input name="client_code" value="${esc(inv.client_code)}"></div>
   </form>
   <h2>Номенклатура</h2>
@@ -290,13 +292,13 @@ async logistics({t, lg, draft}){
   lg = lg || {topup_id:t.id,awb:'',leg:'air',provider:'',invoice_no:'',usd:null,rub:null,basis:'auto',paid_date:t.date,note:''};
   let farmKg = lg.farm_kg_json ? JSON.parse(lg.farm_kg_json) : {};
   if(draft){ const fr=draft.freight||{}; Object.assign(lg,{awb:draft.awb||'',provider:fr.provider||draft.farm||'',leg:fr.leg||'air',usd:fr.total_usd??draft.invoice_total_usd,rub:fr.total_rub,invoice_no:draft.invoice_no||'',source_file:draft.source_file});
-    (fr.per_farm_kg||[]).forEach(x=>farmKg[x.farm]=x.kg); }
+    [...(fr.per_farm_kg||[]),...(draft.per_farm_kg||[])].forEach(x=>farmKg[x.farm]=x.kg); }
   $app.innerHTML=`<h1>${lg.id?'Логистика':'Новая логистика'}</h1>
-  <p class="sub">Счёт за фрахт по одному AWB. Делится на все плантации этого AWB по весу, внутри плантации — по весу/коробкам/стеблям.</p>
+  <p class="sub">Счёт за фрахт по одному MAWB. Делится на все плантации этого MAWB по весу, внутри плантации — по весу/коробкам/стеблям.</p>
   <form id="f" class="group">
-    <div class="two"><div class="field"><label>AWB</label><input name="awb" value="${esc(lg.awb)}"></div>
+    <div class="two"><div class="field"><label>MAWB</label><input name="awb" value="${esc(lg.awb)}"></div>
     <div class="field"><label>Плечо</label><select name="leg"><option value="air" ${lg.leg==='air'?'selected':''}>авиа до Москвы</option><option value="msk" ${lg.leg==='msk'?'selected':''}>МСК (таможня, склад, доставка)</option></select></div></div>
-    <div class="two"><div class="field"><label>Перевозчик</label><input name="provider" value="${esc(lg.provider)}" placeholder="Expolanka"></div>
+    <div class="two"><div class="field"><label>Перевозчик</label><input name="provider" list="fwd" value="${esc(lg.provider)}" placeholder="Expolanka / Floratrack"><datalist id="fwd"><option value="Expolanka"><option value="Floratrack"></datalist></div>
     <div class="field"><label>Номер счёта</label><input name="invoice_no" value="${esc(lg.invoice_no||'')}"></div></div>
     <div class="two"><div class="field"><label>Сумма, $</label><input name="usd" inputmode="decimal" value="${lg.usd??''}"></div>
     <div class="field"><label>Сумма, ₽</label><input name="rub" inputmode="decimal" value="${lg.rub??''}"></div></div>
@@ -304,8 +306,9 @@ async logistics({t, lg, draft}){
     <div class="field"><label>Как делить между плантациями</label><select name="basis">${[['auto','По весу, если он есть у всех'],['kg','По весу'],['stems','По стеблям']].map(([v,n])=>`<option value="${v}" ${lg.basis===v?'selected':''}>${n}</option>`).join('')}</select></div>
     <div class="field"><label>Дата оплаты</label><input name="paid_date" value="${esc(lg.paid_date||'')}"></div>
   </form>
-  <h2>Вес по плантациям в этом AWB</h2>
-  <div class="group" id="kg"><div class="empty">Впиши AWB — подтяну плантации.</div></div>
+  <h2>Вес по плантациям в этом MAWB</h2>
+  <p class="hint">Можно оставить пустым — разбивку загрузишь потом отдельно через «Разбивка кг по MAWB».</p>
+  <div class="group" id="kg"><div class="empty">Впиши MAWB — подтяну плантации.</div></div>
   <div class="actions">${lg.id?'<button id="del" class="x">Удалить</button>':''}<button class="primary" id="save">Сохранить</button></div>`;
   const f=document.getElementById('f'), kg=document.getElementById('kg');
   let invs=[];
@@ -313,14 +316,14 @@ async logistics({t, lg, draft}){
     kg.innerHTML = invs.length ? invs.map(i=>{const v=farmKg[i.farm]??Object.entries(farmKg).find(([k])=>k.toLowerCase()===i.farm.toLowerCase())?.[1]??i.weight_kg??'';
       return `<div class="field"><label>${esc(i.farm)}${i.topup_id!==t.id?' (другое пополнение)':''}</label><input data-farm="${esc(i.farm)}" inputmode="decimal" value="${v}"></div>`}).join('')
       + (Object.keys(farmKg).length?`<div class="hint" style="padding:8px 14px">В счёте консолидатора: ${Object.entries(farmKg).map(([k,v])=>esc(k)+' '+v+' кг').join(', ')}</div>`:'')
-      : '<div class="empty">Инвойсов плантаций с этим AWB пока нет. Логистику можно сохранить — разделится, когда они появятся.</div>'};
+      : '<div class="empty">Инвойсов плантаций с этим MAWB пока нет. Логистику можно сохранить — разделится, когда они появятся.</div>'};
   f.awb.onchange=loadAwb; loadAwb();
   document.getElementById('save').onclick=async()=>{
     const body={awb:f.awb.value.trim(),leg:f.leg.value,provider:f.provider.value.trim(),invoice_no:f.invoice_no.value.trim(),usd:numOrNull(f.usd.value),rub:numOrNull(f.rub.value),
       topup_id:f.topup.value?+f.topup.value:null,basis:f.basis.value,paid_date:f.paid_date.value,note:lg.note||'',source_file:lg.source_file||null,farm_kg:{}};
     Object.assign(body.farm_kg, farmKg);   // full forwarder breakdown, also for farms not entered yet
     kg.querySelectorAll('[data-farm]').forEach(i=>{const v=numOrNull(i.value);if(v)body.farm_kg[i.dataset.farm]=v});
-    if(!body.awb) return toast('Нужен AWB');
+    if(!body.awb) return toast('Нужен MAWB');
     if(!body.usd&&!body.rub) return toast('Нужна сумма в $ или ₽');
     if(!body.rub) return toast('Впиши сумму в ₽');
     const snap=await api(`/logistics?view_topup=${t.id}`+(lg.id?'&log_id='+lg.id:''),{method:'POST',body});
@@ -331,15 +334,64 @@ async logistics({t, lg, draft}){
     const snap=await api(`/logistics/${lg.id}?view_topup=${t.id}`,{method:'DELETE'}); stack.pop(); render('topup',{id:t.id,snap}) };
 },
 
+// ======================= KG BREAKDOWN PER MAWB =======================
+async weights({t, awb, draft}){
+  let kg = {}, srcFile = null, warns = [];
+  if(draft){ awb = draft.awb||''; srcFile = draft.source_file; warns = draft.warnings||[];
+    [...(draft.per_farm_kg||[]),...(draft.freight?.per_farm_kg||[])].forEach(x=>kg[x.farm]=x.kg); }
+  $app.innerHTML=`<h1>Разбивка кг</h1>
+  <p class="sub">Сколько кг каждой плантации в MAWB. По ней делится фрахт перевозчика. HAWB не нужен.</p>
+  <div class="drop" id="drop">Загрузить разбивку (PDF / фото) — AI заполнит</div><input type="file" id="file" accept="application/pdf,image/*" hidden>
+  <div id="w"></div>
+  <form id="f" class="group" style="margin-top:12px"><div class="field"><label>MAWB</label><input name="awb" value="${esc(awb||'')}" placeholder="065-4053 8245"></div></form>
+  <h2>Плантации</h2><div class="group" id="list"><div class="empty">Впиши MAWB.</div></div>
+  <div class="actions"><button class="ghost" id="addRow">+ плантация, которой ещё нет</button></div>
+  <div class="hint num" id="tot" style="margin:0 16px"></div>
+  <div class="actions"><button class="primary" id="save">Сохранить разбивку</button></div>`;
+  const f=document.getElementById('f'), list=document.getElementById('list');
+  const showW=()=>document.getElementById('w').innerHTML=warns.length?`<div class="warn">${warns.map(w=>`<div>${esc(w)}</div>`).join('')}</div>`:'';
+  const total=()=>{let x=0;list.querySelectorAll('input[data-farm]').forEach(i=>x+=numOrNull(i.value)||0);document.getElementById('tot').textContent=x?`Итого ${fmt(x,1)} кг`:''};
+  const draw=async()=>{
+    const a=f.awb.value.trim(); if(!a) return;
+    const r=await api('/weights/'+encodeURIComponent(a));
+    const merged={...r.farm_kg,...kg};
+    const farms=[...new Set([...r.invoices.map(i=>i.farm),...Object.keys(merged)])];
+    const val=fm=>{const k=Object.keys(merged).find(k=>k.toLowerCase()===fm.toLowerCase());return k!=null?merged[k]:(r.invoices.find(i=>i.farm===fm)?.weight_kg??'')};
+    list.innerHTML=farms.length?farms.map(fm=>`<div class="field"><label>${esc(fm)}${r.invoices.some(i=>i.farm.toLowerCase()===fm.toLowerCase())?'':' · инвойса ещё нет'}</label>
+      <input data-farm="${esc(fm)}" inputmode="decimal" value="${val(fm)}"></div>`).join(''):'<div class="empty">На этом MAWB пока ничего. Добавь плантации вручную или загрузи документ.</div>';
+    total();
+  };
+  list.oninput=total; f.awb.onchange=draw; draw(); showW();
+  document.getElementById('addRow').onclick=()=>{const n=prompt('Название плантации');if(!n)return;
+    if(list.querySelector('.empty'))list.innerHTML='';
+    list.insertAdjacentHTML('beforeend',`<div class="field"><label>${esc(n)} · инвойса ещё нет</label><input data-farm="${esc(n)}" inputmode="decimal"></div>`)};
+  const drop=document.getElementById('drop'), file=document.getElementById('file');
+  drop.onclick=()=>file.click();
+  file.onchange=async()=>{ if(!file.files[0])return; drop.classList.add('busy'); drop.textContent='Читаю…';
+    try{const fd=new FormData();fd.append('file',file.files[0]);const r=await api('/parse',{method:'POST',body:fd});
+      [...(r.per_farm_kg||[]),...(r.freight?.per_farm_kg||[])].forEach(x=>kg[x.farm]=x.kg);
+      if(r.awb&&!f.awb.value.trim()) f.awb.value=r.awb; srcFile=r.source_file; warns=r.warnings||[]; showW(); await draw();}
+    catch(x){toast(x.message)} drop.classList.remove('busy'); drop.textContent='Загрузить разбивку (PDF / фото) — AI заполнит'};
+  document.getElementById('save').onclick=async()=>{
+    const body={awb:f.awb.value.trim(),farm_kg:{},source_file:srcFile};
+    list.querySelectorAll('input[data-farm]').forEach(i=>{const v=numOrNull(i.value);if(v)body.farm_kg[i.dataset.farm]=v});
+    if(!body.awb) return toast('Нужен MAWB');
+    if(!Object.keys(body.farm_kg).length) return toast('Впиши кг хотя бы для одной плантации');
+    await api('/weights',{method:'POST',body});
+    if(draft?._draftId) await api('/drafts/'+draft._draftId,{method:'DELETE'});
+    toast('Разбивка сохранена'); stack.pop(); stack[stack.length-1]?.[0]==='topup'?render('topup',{id:t.id}):go('topup',{id:t.id});
+  };
+},
+
 // ======================= DRAFT -> pick top-up =======================
 async draft({d,tops}){
   $app.innerHTML=`<h1>${esc(d.farm||d.freight?.provider||'Черновик')}</h1>
-  <p class="sub">${d.doc_type==='farm_invoice'?'Инвойс плантации':'Счёт за логистику'} · AWB ${esc(d.awb||'?')}. Из какого пополнения оплачен?</p>
+  <p class="sub">${d.doc_type==='farm_invoice'?'Инвойс плантации':d.doc_type==='kg_breakdown'?'Разбивка кг по плантациям':'Счёт за логистику'} · MAWB ${esc(d.awb||'?')}. Из какого пополнения оплачен?</p>
   ${d.warnings?.length?`<div class="warn">${d.warnings.map(w=>`<div>${esc(w)}</div>`).join('')}</div>`:''}
   <div class="group" style="margin-top:12px">${tops.map(t=>`<div class="row" data-t="${t.id}"><div class="grow"><div class="t">${esc(t.date)}</div><div class="s num">остаток $${fmt(t.usd_left,2)}</div></div></div>`).join('')||'<div class="empty">Сначала создай пополнение.</div>'}</div>
   <div class="actions"><button class="x" id="drop">Выбросить черновик</button></div>`;
   $app.querySelectorAll('[data-t]').forEach(e=>e.onclick=()=>{const t=tops.find(x=>x.id==e.dataset.t); d._draftId=d.id;
-    stack.pop(); go(d.doc_type==='farm_invoice'?'invoice':'logistics',{t,draft:d})});
+    stack.pop(); go(d.doc_type==='farm_invoice'?'invoice':d.doc_type==='kg_breakdown'?'weights':'logistics',{t,draft:d})});
   document.getElementById('drop').onclick=async()=>{await api('/drafts/'+d.id,{method:'DELETE'});back()};
 },
 
@@ -347,7 +399,7 @@ async draft({d,tops}){
 async farms(){
   FARMS=await api('/farms');
   $app.innerHTML=`<h1>Плантации</h1><p class="sub">Заметки отсюда AI читает при каждом распознавании — пиши сюда нюансы: «цены за бунч по 10», «логистика отдельным счётом в ₽».</p>
-  ${['Кения','Эквадор','Колумбия'].map(c=>`<h2>${c}</h2><div class="group">${FARMS.filter(f=>f.country===c).map(f=>`
+  ${[['Перевозчики',f=>f.is_forwarder],...['Кения','Эквадор','Колумбия'].map(c=>[c,f=>f.country===c&&!f.is_forwarder])].map(([c,flt])=>`<h2>${c}</h2><div class="group">${FARMS.filter(flt).map(f=>`
     <div class="row" data-f="${f.id}"><div class="grow"><div class="t">${esc(f.name)}${f.is_forwarder?' <span class="pill">логистика</span>':''}</div><div class="s">${esc(f.notes||f.aliases)}</div></div></div>`).join('')}</div>`).join('')}
   <div class="actions"><button class="primary" id="add">Добавить плантацию</button></div>`;
   $app.querySelectorAll('[data-f]').forEach(e=>e.onclick=()=>go('farm',{f:FARMS.find(x=>x.id==e.dataset.f)}));

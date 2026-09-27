@@ -27,15 +27,32 @@ SEED = {
 EXTRA_PORTS = [8000, 3000, 8080, 5000]
 
 
-def seed():
+FORWARDERS = {
+    "Expolanka": ("Кения", "EXPOLANKA,Expolanka Freight",
+                  "Кения → Амстердам. Один MAWB на несколько плантаций, счёт за фрахт в $ БЕЗ разбивки по кг — "
+                  "разбивка кг по плантациям приходит отдельным документом"),
+    "Floratrack": ("Эквадор", "FLORATRACK,Флоратрак,Floratrak",
+                   "Логистика всего, кроме Кении: Эквадор, Колумбия и остальные"),
+}
+
+
+def upsert_forwarders():
     with session() as s:
-        if s.exec(select(Farm)).first():
+        for name, (country, aliases, notes) in FORWARDERS.items():
+            f = s.exec(select(Farm).where(Farm.name == name)).first() or Farm(name=name, country=country)
+            f.is_forwarder, f.aliases, f.notes = True, aliases, notes
+            s.add(f)
+        s.commit()
+
+
+def seed():
+    upsert_forwarders()
+    with session() as s:
+        if s.exec(select(Farm).where(Farm.is_forwarder == False)).first():  # noqa: E712
             return
         for country, names in SEED.items():
             for n in names:
                 s.add(Farm(name=n, country=country, aliases=n.upper()))
-        s.add(Farm(name="Expolanka", country="Кения", is_forwarder=True, aliases="EXPOLANKA",
-                   notes="Консолидатор Кении: один AWB на несколько плантаций, счёт за фрахт в $ + разбивка кг по плантациям"))
         s.commit()
 
 

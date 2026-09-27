@@ -62,7 +62,16 @@ async def _parse_and_reply(m: Message, data: bytes, mime: str):
         return
     did = save_draft(out)
     stems = sum(l.get("stems") or 0 for l in out.get("lines", []))
-    txt = (f"📄 {out.get('doc_type')} · {out.get('farm') or '?'} · AWB {out.get('awb') or '?'}\n"
+    if out.get("doc_type") == "kg_breakdown":
+        kg = out.get("per_farm_kg") or []
+        txt = (f"⚖️ Разбивка кг · MAWB {out.get('awb') or '?'}\n"
+               + "\n".join(f"• {x.get('farm')}: {x.get('kg')} кг" for x in kg)
+               + f"\nИтого {sum(x.get('kg') or 0 for x in kg):g} кг")
+        if out.get("warnings"):
+            txt += "\n⚠️ " + "\n⚠️ ".join(out["warnings"])
+        await note.edit_text(txt + f"\n\nЧерновик #{save_draft(out)} — «Учёт» → Черновики.")
+        return
+    txt = (f"📄 {out.get('doc_type')} · {out.get('farm') or '?'} · MAWB {out.get('awb') or '?'}\n"
            f"Строк: {len(out.get('lines', []))}, стеблей: {stems:g}, итог: ${out.get('invoice_total_usd') or '?'}")
     if out.get("warnings"):
         txt += "\n⚠️ " + "\n⚠️ ".join(out["warnings"])

@@ -16,7 +16,7 @@ from sqlmodel import select
 from . import ai, excel
 from .calc import compute, norm_awb, rate_of
 from .config import ALLOWED_IDS, BOT_TOKEN, DATA_DIR, DEV_NO_AUTH, MASTER_XLSX
-from .models import Farm, Invoice, Line, Logistics, TopUp, session
+from .models import AwbWeights, Farm, Invoice, Line, Logistics, TopUp, session
 
 router = APIRouter(prefix="/api")
 BOT = None  # set by main.py so export can send the file into the chat
@@ -150,17 +150,42 @@ def _apply_farm_kg(s, awb, farm_kg):
                 s.add(inv)
 
 
+def _awb_kg(s) -> dict:
+    """{MAWB: total kg of its breakdown} for the calc engine."""
+    out = {}
+    for w in s.exec(select(AwbWeights)).all():
+        out[w.awb] = sum(float(v) for v in json.loads(w.farm_kg_json or "{}").values() if v)
+    return out
+
+
+def _store_weights(s, awb, farm_kg, source_file=None):
+    """Save/merge a per-farm kg breakdown for a MAWB and push it onto the farm invoices."""
+    farm_kg = {k: float(v) for k, v in (farm_kg or {}).items() if v not in (None, "", 0)}
+    if not awb or not farm_kg:
+        return
+    key = norm_awb(awb)
+    row = s.get(AwbWeights, key) or AwbWeights(awb=key)
+    row.farm_kg_json = json.dumps({**json.loads(row.farm_kg_json or "{}"), **farm_kg}, ensure_ascii=False)
+    if source_file:
+        row.source_file = source_file
+    s.add(row)
+    _apply_farm_kg(s, awb, farm_kg)
+
+
 def _fill_weight_from_logistics(s, inv):
     """Invoice added AFTER the Expolanka bill: take its kg from the stored breakdown."""
     if inv.weight_kg or not inv.awb:
         return
-    for lg in s.exec(select(Logistics)).all():
-        if norm_awb(lg.awb) == norm_awb(inv.awb):
-            v = _kg_for(s, inv.farm, json.loads(lg.farm_kg_json or "{}"))
-            if v:
-                inv.weight_kg = v
-                s.add(inv)
-                return
+    row = s.get(AwbWeights, norm_awb(inv.awb))
+    sources = [json.loads(row.farm_kg_json or "{}")] if row else []
+    sources += [json.loads(lg.farm_kg_json or "{}") for lg in s.exec(select(Logistics)).all()
+                if norm_awb(lg.awb) == norm_awb(inv.awb)]          # older data kept on the freight record
+    for bd in sources:
+        v = _kg_for(s, inv.farm, bd)
+        if v:
+            inv.weight_kg = v
+            s.add(inv)
+            return
 
 
 def snapshot(s, topup_id):
@@ -168,7 +193,7 @@ def snapshot(s, topup_id):
     t = next((x for x in tops if x.id == topup_id), None)
     if not t:
         raise HTTPException(404)
-    res = compute(topup_id, tops, invs, lines, logs)
+    res = compute(topup_id, tops, invs, lines, logs, _awb_kg(s))
     lines_by = defaultdict(list)
     for l in lines:
         lines_by[l.invoice_id].append(l)
@@ -192,7 +217,7 @@ def history(s):
     rates = [{"date": t.date, "rate": round(rate_of(t), 4)} for t in tops]
     per = defaultdict(list)
     for t in tops:
-        res = compute(t.id, tops, invs, lines, logs)
+        res = compute(t.id, tops, invs, lines, logs, _awb_kg(s))
         inv_by = {i.id: i for i in invs if i.topup_id == t.id}
         for l in lines:
             if l.invoice_id in inv_by:
@@ -276,10 +301,8 @@ def save_logistics(body: LogisticsIn, log_id: int | None = None, view_topup: int
         if log_id:
             for k, v in data.items():
                 setattr(lg, k, v)
-        if body.farm_kg:
-            lg.farm_kg_json = json.dumps({**json.loads(lg.farm_kg_json or "{}"), **body.farm_kg}, ensure_ascii=False)
         s.add(lg)
-        _apply_farm_kg(s, body.awb, body.farm_kg)
+        _store_weights(s, body.awb, body.farm_kg)
         s.commit()
         return snapshot(s, view_topup or body.topup_id)
 
@@ -297,6 +320,31 @@ def awb_invoices(awb: str, uid: int = Depends(user_id)):
         k = norm_awb(awb)
         return [{"id": i.id, "farm": i.farm, "weight_kg": i.weight_kg, "topup_id": i.topup_id}
                 for i in s.exec(select(Invoice)).all() if norm_awb(i.awb) == k]
+
+
+class WeightsIn(BaseModel):
+    awb: str
+    farm_kg: dict[str, float] = {}
+    source_file: str | None = None
+
+
+@router.get("/weights/{awb}")
+def get_weights(awb: str, uid: int = Depends(user_id)):
+    """Breakdown for a MAWB + the farm invoices already on it."""
+    with session() as s:
+        row = s.get(AwbWeights, norm_awb(awb))
+        k = norm_awb(awb)
+        invs = [{"id": i.id, "farm": i.farm, "weight_kg": i.weight_kg, "topup_id": i.topup_id}
+                for i in s.exec(select(Invoice)).all() if norm_awb(i.awb) == k]
+        return {"awb": awb, "farm_kg": json.loads(row.farm_kg_json) if row else {}, "invoices": invs}
+
+
+@router.post("/weights")
+def save_weights(body: WeightsIn, uid: int = Depends(user_id)):
+    with session() as s:
+        _store_weights(s, body.awb, body.farm_kg, body.source_file)
+        s.commit()
+    return get_weights(body.awb, uid)
 
 
 @router.get("/farms")
@@ -348,7 +396,7 @@ async def export(tid: int, uid: int = Depends(user_id)):
         tmp = DATA_DIR / f"export_{tid}.xlsx"
         if MASTER_XLSX.exists():
             shutil.copy(MASTER_XLSX, tmp)
-        name, _ = excel.build(tmp, t, tops, invs, lines, logs)
+        name, _ = excel.build(tmp, t, tops, invs, lines, logs, awb_kg=_awb_kg(s))
         shutil.copy(tmp, MASTER_XLSX)          # master always holds the latest version
         s.add(t); s.commit()
     if BOT:

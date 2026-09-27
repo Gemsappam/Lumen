@@ -69,7 +69,9 @@ class Result:
     warnings: list = field(default_factory=list)
 
 
-def compute(topup_id, topups, invoices, lines, logistics) -> Result:
+def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result:
+    """awb_kg: {normalized MAWB: total kg of the uploaded per-farm breakdown}"""
+    awb_kg = awb_kg or {}
     tmap = {t.id: t for t in topups}
     rate = rate_of(tmap.get(topup_id))
     res = Result(rate=rate)
@@ -110,7 +112,7 @@ def compute(topup_id, topups, invoices, lines, logistics) -> Result:
         r = rate_of(tmap.get(lg.topup_id)) if lg.topup_id else 0
         rub = lg.rub if lg.rub is not None else (round((lg.usd or 0) * r) if r else None)
         if rub is None:
-            res.warnings.append(f"Логистика AWB {lg.awb}: есть только $ и нет курса — внеси сумму в ₽")
+            res.warnings.append(f"Логистика MAWB {lg.awb}: есть только $ и нет курса — внеси сумму в ₽")
             rub = 0
         g["usd"] += lg.usd or 0
         g["rub"] += rub
@@ -131,18 +133,22 @@ def compute(topup_id, topups, invoices, lines, logistics) -> Result:
     for (awb, leg), g in groups.items():
         invs = inv_by_awb.get(awb, [])
         if not invs:
-            res.warnings.append(f"Логистика AWB {awb} ({leg}): нет ни одного инвойса плантации с этим AWB")
+            res.warnings.append(f"Логистика MAWB {awb} ({leg}): пока нет ни одного инвойса плантации с этим MAWB")
             continue
         inv_stems = [sum(l.stems for l in lines_by_inv[i.id]) for i in invs]
         attr, w = (None, None) if g["basis"] == "stems" else _pick_basis(invs, ["weight_kg"])
         if attr is None:
-            w = inv_stems
             if g["basis"] != "stems" and len(invs) > 1:
-                res.warnings.append(f"AWB {awb}: не у всех плантаций указан вес — логистика разбита по стеблям")
+                # several farms, no kg breakdown yet: don't guess — leave freight unallocated until it's loaded
+                res.warnings.append(f"MAWB {awb}: нет разбивки кг по плантациям — логистика "
+                                    f"{g['provider'] or ''} пока не распределена. Загрузи «Разбивка кг по MAWB».")
+                continue
+            w = inv_stems
         tot = sum(w) or 1
+        g["kg_total"] = max(g["kg_total"], awb_kg.get(awb, 0))
         if attr == "weight_kg" and g["kg_total"] > tot + 0.01:
             # forwarder bill covers farms not entered yet: they keep their share, we don't dump it on the others
-            res.warnings.append(f"AWB {awb}: внесено {tot:g} из {g['kg_total']:g} кг по разбивке {g['provider'] or 'перевозчика'} — "
+            res.warnings.append(f"MAWB {awb}: внесено {tot:g} из {g['kg_total']:g} кг по разбивке {g['provider'] or 'перевозчика'} — "
                                 f"остальные плантации ещё без инвойсов")
             tot = g["kg_total"]
         for inv, wi in zip(invs, w):
@@ -168,5 +174,5 @@ def compute(topup_id, topups, invoices, lines, logistics) -> Result:
     have = {awb for (awb, _l) in groups}
     for inv in invoices:
         if inv.topup_id == topup_id and norm_awb(inv.awb) not in have and inv.awb:
-            res.warnings.append(f"{inv.farm} (AWB {inv.awb}): логистика ещё не внесена")
+            res.warnings.append(f"{inv.farm} (MAWB {inv.awb}): логистика ещё не внесена")
     return res

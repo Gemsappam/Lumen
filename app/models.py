@@ -77,6 +77,14 @@ class Logistics(SQLModel, table=True):
     farm_kg_json: str = "{}"               # forwarder breakdown {"Zeeflora": 250, ...}, applied to invoices on save
 
 
+class AwbWeights(SQLModel, table=True):
+    """Per-farm kg on one MAWB. Comes separately from the freight bill (Expolanka bills have no breakdown)."""
+    awb: str = Field(primary_key=True)     # normalized MAWB (digits only)
+    farm_kg_json: str = "{}"               # {"Zeeflora": 250, "Tambuzi": 30, ...}
+    note: str = ""
+    source_file: Optional[str] = None
+
+
 engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
 
 
