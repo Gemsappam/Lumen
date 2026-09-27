@@ -82,10 +82,19 @@ async def photo(m: Message):
     await _parse_and_reply(m, f.read(), "image/jpeg")
 
 
-@dp.channel_post(F.text == "/id")
+@dp.channel_post(F.text.startswith("/id"))
 async def channel_id(m: Message):
     """Post /id in the backup channel -> bot replies with the channel id for BACKUP_CHAT_ID."""
     await m.answer(f"BACKUP_CHAT_ID={m.chat.id}")
+
+
+@dp.message(ops, F.forward_origin.chat)
+async def forwarded_from_channel(m: Message):
+    """Forward any post from the channel to the bot -> it tells the channel id. Works even if
+    the bot isn't admin yet (but it must be admin for backups to work)."""
+    ch = m.forward_origin.chat
+    await m.answer(f"Канал «{ch.title}»\nBACKUP_CHAT_ID={ch.id}\n\nВставь эту строку в .env и перезапусти. "
+                   "Бот должен быть админом канала с правом публиковать и закреплять.")
 
 
 @dp.message(ops, Command("backup"))
