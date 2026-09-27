@@ -208,7 +208,9 @@ def snapshot(s, topup_id):
                        "msk_rub": round(c.msk_rub_stem, 2), "total_rub": round(c.total_rub_stem, 2)})
         out_inv.append({**inv.model_dump(), "rub_paid": res.invoice_rub[inv.id], "lines": ls})
     related = {norm_awb(i.awb) for i in invs if i.topup_id == topup_id}
-    out_log = [lg.model_dump() for lg in logs if lg.topup_id == topup_id or norm_awb(lg.awb) in related]
+    kg = _awb_kg(s)
+    out_log = [{**lg.model_dump(), "kg_total": kg.get(norm_awb(lg.awb), 0)}
+               for lg in logs if lg.topup_id == topup_id or norm_awb(lg.awb) in related]
     return {"topup": {**t.model_dump(), "rate": rate_of(t)}, "invoices": out_inv, "logistics": out_log,
             "usd_spent": round(res.usd_spent, 2), "rub_spent": round(res.rub_spent),
             "usd_left": round(t.usd - res.usd_spent, 2), "warnings": res.warnings}
@@ -304,7 +306,7 @@ def save_logistics(body: LogisticsIn, log_id: int | None = None, view_topup: int
             for k, v in data.items():
                 setattr(lg, k, v)
         s.add(lg)
-        _store_weights(s, body.awb, body.farm_kg)
+        _store_weights(s, body.awb, body.farm_kg, replace=True)
         s.commit()
         return snapshot(s, view_topup or body.topup_id)
 
@@ -464,10 +466,32 @@ def save_draft(parsed: dict) -> str:
 
 @router.get("/drafts")
 def list_drafts(uid: int = Depends(user_id)):
-    out = []
+    from .ai import find_mawb
+    out, seen, changed = [], set(), False
     for p in sorted(DRAFTS.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
         d = json.loads(p.read_text())
+        clean = find_mawb(d.get("awb") or "")               # old drafts: strip "/ HAWB ..."
+        if clean and clean != d.get("awb"):
+            d["awb"] = clean
+            p.write_text(json.dumps(d, ensure_ascii=False))
+        k = _draft_key(d)
+        if (k[1] or k[3]) and k in seen:                    # duplicate of a newer draft
+            p.unlink(); changed = True
+            continue
+        seen.add(k)
+        if d.get("doc_type") == "kg_breakdown" and d.get("awb"):
+            store_breakdown(d["awb"], d.get("per_farm_kg"), d.get("source_file"))   # belongs to the MAWB, not a draft
+            p.unlink(); changed = True
+            continue
         out.append({"id": p.stem, **d})
+    kg = {}
+    with session() as s:
+        kg = _awb_kg(s)
+    for d in out:
+        d["kg_total"] = kg.get(norm_awb(d.get("awb") or ""), 0)
+    if changed:
+        from .backup import mark_dirty
+        mark_dirty()
     return out
 
 

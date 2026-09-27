@@ -117,7 +117,7 @@ async home(){
     <p class="sub">Пополнение → инвойсы плантаций → логистика → Excel</p>
     ${drafts.length?`<h2>Черновики из чата</h2><div class="group">${drafts.map(d=>`
       <div class="row" data-draft="${d.id}"><div class="grow"><div class="t">${esc(d.doc_type==='kg_breakdown'?'Разбивка кг':d.doc_type==='freight_invoice'?'Фрахт · '+(d.freight?.provider||d.farm||''):(d.farm||'Документ'))}</div>
-      <div class="s">MAWB ${esc(d.awb||'?')} · ${d.doc_type==='kg_breakdown'?fmt((d.per_farm_kg||[]).reduce((a,x)=>a+(x.kg||0),0))+' кг':d.doc_type==='freight_invoice'?(d.freight?.total_usd?'$'+fmt(d.freight.total_usd,2):d.freight?.total_rub?fmt(d.freight.total_rub)+' ₽':'сумма?'):fmt((d.lines||[]).reduce((a,l)=>a+(l.stems||0),0))+' стеблей · $'+fmt(d.invoice_total_usd,2)}</div></div>
+      <div class="s">MAWB ${esc(d.awb||'?')} · ${d.doc_type==='kg_breakdown'?fmt((d.per_farm_kg||[]).reduce((a,x)=>a+(x.kg||0),0))+' кг':d.doc_type==='freight_invoice'?(d.freight?.total_usd?'$'+fmt(d.freight.total_usd,2):d.freight?.total_rub?fmt(d.freight.total_rub)+' ₽':'сумма?')+(d.kg_total?' · разбивка '+fmt(d.kg_total)+' кг ✓':' · разбивки кг нет'):fmt((d.lines||[]).reduce((a,l)=>a+(l.stems||0),0))+' стеблей · $'+fmt(d.invoice_total_usd,2)}</div></div>
       <span class="pill">разобрать</span></div>`).join('')}</div>`:''}
     <h2>Пополнения</h2>
     <div class="group">${tops.length?tops.map(t=>`
@@ -185,17 +185,17 @@ async topup({id, snap}){
   <h2>Логистика по MAWB этого пополнения</h2>
   <div class="group">${d.logistics.length?d.logistics.map(l=>`
     <div class="row" data-log="${l.id}"><div class="grow"><div class="t">${esc(l.provider||'Фрахт')} · ${l.leg==='air'?'авиа':'МСК'}</div>
-    <div class="s">MAWB ${esc(l.awb)}${l.topup_id!==t.id?' · оплачено не из этого пополнения':''}</div></div>
+    <div class="s">MAWB ${esc(l.awb)} · ${l.kg_total?fmt(l.kg_total)+' кг ✓':'<span style="color:var(--warn)">нет разбивки кг</span>'}${l.topup_id!==t.id?' · другое пополнение':''}</div></div>
     <div class="v">${l.usd?'$'+fmt(l.usd,2):''}${l.rub?'<div class="s">'+fmt(l.rub)+' ₽</div>':''}</div></div>`).join('')
     :'<div class="empty">Фрахт ещё не внесён — себестоимость пока без логистики.</div>'}</div>
-  <div class="actions"><button id="addLog">Добавить логистику</button><button id="addKg">Разбивка кг по MAWB</button></div>
+  <div class="actions"><button id="addLog">Добавить логистику</button></div>
   <div class="actions"><button id="edit">Изменить пополнение</button></div>`;
   $app.querySelectorAll('[data-inv]').forEach(e=>e.onclick=()=>go('invoice',{t,inv:d.invoices.find(i=>i.id==e.dataset.inv)}));
   $app.querySelectorAll('[data-log]').forEach(e=>e.onclick=()=>go('logistics',{t,lg:d.logistics.find(l=>l.id==e.dataset.log)}));
   document.getElementById('addInv').onclick=()=>go('invoice',{t});
   document.getElementById('addLog').onclick=()=>go('logistics',{t});
   document.getElementById('edit').onclick=()=>go('topupForm',{t});
-  document.getElementById('addKg').onclick=()=>go('weights',{t,awb:(d.invoices.find(i=>i.awb)||{}).awb||''});
+
   document.getElementById('xls').onclick=async e=>{e.target.disabled=true;try{const r=await api(`/topups/${t.id}/export`,{method:'POST'});toast(`Лист «${r.sheet}» отправлен в чат`)}catch(x){toast(x.message)}e.target.disabled=false};
   document.getElementById('audit').onclick=async e=>{
     e.target.disabled=true; e.target.textContent='Проверяю…';
@@ -308,22 +308,30 @@ async logistics({t, lg, draft}){
     <div class="field"><label>Как делить между плантациями</label><select name="basis">${[['auto','По весу, если он есть у всех'],['kg','По весу'],['stems','По стеблям']].map(([v,n])=>`<option value="${v}" ${lg.basis===v?'selected':''}>${n}</option>`).join('')}</select></div>
     <div class="field"><label>Дата оплаты</label><input name="paid_date" value="${esc(lg.paid_date||'')}"></div>
   </form>
-  <h2>Вес по плантациям в этом MAWB</h2>
-  <p class="hint">Можно оставить пустым — разбивку загрузишь потом отдельно через «Разбивка кг по MAWB».</p>
+  <h2>Разбивка кг по плантациям (этот MAWB)</h2>
+  <p class="hint">По ней делится этот фрахт. Можно внести позже — кинь разбивку боту с MAWB в подписи.</p>
   <div class="group" id="kg"><div class="empty">Впиши MAWB — подтяну плантации.</div></div>
   <div class="actions">${lg.id?'<button id="del" class="x">Удалить</button>':''}<button class="primary" id="save">Сохранить</button></div>`;
   const f=document.getElementById('f'), kg=document.getElementById('kg');
   let invs=[];
-  const loadAwb=async()=>{ if(!f.awb.value.trim())return; invs=await api('/awb/'+encodeURIComponent(f.awb.value.trim()));
-    kg.innerHTML = invs.length ? invs.map(i=>{const v=farmKg[i.farm]??Object.entries(farmKg).find(([k])=>k.toLowerCase()===i.farm.toLowerCase())?.[1]??i.weight_kg??'';
-      return `<div class="field"><label>${esc(i.farm)}${i.topup_id!==t.id?' (другое пополнение)':''}</label><input data-farm="${esc(i.farm)}" inputmode="decimal" value="${v}"></div>`}).join('')
-      + (Object.keys(farmKg).length?`<div class="hint" style="padding:8px 14px">В счёте консолидатора: ${Object.entries(farmKg).map(([k,v])=>esc(k)+' '+v+' кг').join(', ')}</div>`:'')
-      : '<div class="empty">Инвойсов плантаций с этим MAWB пока нет. Логистику можно сохранить — разделится, когда они появятся.</div>'};
+  const loadAwb=async()=>{ const a=f.awb.value.trim(); if(!a)return;
+    const r=await api('/weights/'+encodeURIComponent(a));
+    const merged={...r.farm_kg,...farmKg};                 // saved breakdown + whatever came with this document
+    const same=(x,y)=>x.toLowerCase().slice(0,4)===y.toLowerCase().slice(0,4);
+    const rows=[...Object.keys(merged)];
+    r.invoices.forEach(i=>{ if(!rows.some(k=>same(k,i.farm))) rows.push(i.farm) });
+    const val=fm=>merged[fm]??r.invoices.find(i=>same(i.farm,fm))?.weight_kg??'';
+    const note=fm=>r.invoices.some(i=>same(i.farm,fm))?'':' · инвойса ещё нет';
+    kg.innerHTML = rows.length ? rows.map(fm=>`<div class="field"><label>${esc(fm)}${note(fm)}</label><input data-farm="${esc(fm)}" inputmode="decimal" value="${val(fm)}"></div>`).join('')
+      + `<div class="hint num" style="padding:8px 14px" id="kgtot"></div>`
+      : '<div class="empty">Разбивки кг пока нет. Кинь её боту с MAWB в подписи — встанет сюда сама. Или впиши вручную ниже, когда появятся инвойсы.</div>';
+    const tot=()=>{let x=0;kg.querySelectorAll('input[data-farm]').forEach(i=>x+=numOrNull(i.value)||0);const e=document.getElementById('kgtot');if(e)e.textContent=`Итого ${fmt(x,1)} кг`};
+    kg.oninput=tot; tot();
+  };
   f.awb.onchange=loadAwb; loadAwb();
   document.getElementById('save').onclick=async()=>{
     const body={awb:f.awb.value.trim(),leg:f.leg.value,provider:f.provider.value.trim(),invoice_no:f.invoice_no.value.trim(),usd:numOrNull(f.usd.value),rub:numOrNull(f.rub.value),
       topup_id:f.topup.value?+f.topup.value:null,basis:f.basis.value,paid_date:f.paid_date.value,note:lg.note||'',source_file:lg.source_file||null,farm_kg:{}};
-    Object.assign(body.farm_kg, farmKg);   // full forwarder breakdown, also for farms not entered yet
     kg.querySelectorAll('[data-farm]').forEach(i=>{const v=numOrNull(i.value);if(v)body.farm_kg[i.dataset.farm]=v});
     if(!body.awb) return toast('Нужен MAWB');
     if(!body.usd&&!body.rub) return toast('Нужна сумма в $ или ₽');
