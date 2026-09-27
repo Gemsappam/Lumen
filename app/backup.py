@@ -22,7 +22,7 @@ from .config import DATA_DIR, MASTER_XLSX
 
 BACKUP_CHAT_ID = os.getenv("BACKUP_CHAT_ID", "").strip()
 DB_PATH = DATA_DIR / "lumen.db"
-DEBOUNCE_SEC = 60
+DEBOUNCE_SEC = 10
 
 _dirty = asyncio.Event()
 
@@ -83,6 +83,13 @@ async def restore_if_empty(bot) -> str:
     f = await bot.download(pm.document)
     _unzip(f.read())
     return f"restored from {pm.document.file_name}"
+
+
+async def flush(bot):
+    """On shutdown/restart: don't lose changes still waiting for the debounce."""
+    if _dirty.is_set():
+        _dirty.clear()
+        await backup_now(bot, "перед перезапуском")
 
 
 async def backup_loop(bot):

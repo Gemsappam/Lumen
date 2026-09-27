@@ -141,6 +141,8 @@ async def mawb_followup(m: Message):
     old, d["awb"] = d.get("awb"), ai.find_mawb(m.text)
     d["warnings"] = [w for w in d.get("warnings", []) if "MAWB" not in w and "awb" not in w.lower()]
     path.write_text(json.dumps(d, ensure_ascii=False))
+    from .backup import mark_dirty
+    mark_dirty()
     await m.answer(f"MAWB {d['awb']} записан в черновик #{did}" + (f" (было {old})" if old and old != d["awb"] else ""))
 
 

@@ -418,6 +418,8 @@ DRAFTS.mkdir(exist_ok=True)
 def save_draft(parsed: dict) -> str:
     did = uuid.uuid4().hex[:8]
     (DRAFTS / f"{did}.json").write_text(json.dumps(parsed, ensure_ascii=False))
+    from .backup import mark_dirty
+    mark_dirty()                      # drafts from the chat don't go through the API middleware
     return did
 
 

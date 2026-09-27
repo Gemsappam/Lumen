@@ -111,6 +111,11 @@ async def lifespan(app):
     yield
     for t in tasks:
         t.cancel()
+    if bot:
+        try:
+            await asyncio.wait_for(backup.flush(bot), timeout=20)
+        except Exception as e:
+            print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
 app = FastAPI(lifespan=lifespan)
