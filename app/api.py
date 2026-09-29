@@ -203,6 +203,61 @@ def leg_of(provider: str, fallback: str | None = None) -> str:
     return fallback or "air"
 
 
+def split_by_farm(out: dict) -> list[dict]:
+    """One trader invoice (NextWave) covering several farms -> one sub-invoice per farm."""
+    lines = out.get("lines") or []
+    farms = []
+    for l in lines:
+        f = (l.get("farm") or out.get("farm") or "").strip()
+        if f not in farms:
+            farms.append(f)
+    if len(farms) <= 1:
+        if farms and farms[0] and not out.get("farm"):
+            out["farm"] = farms[0]
+        return [out]
+    subs = []
+    for f in farms:
+        ls = [l for l in lines if (l.get("farm") or "").strip() == f]
+        d = {**out, "farm": f or out.get("farm"), "lines": ls,
+             "invoice_total_usd": round(sum((l.get("stems") or 0) * (l.get("price_usd") or 0) for l in ls), 2),
+             "subtotal_usd": None, "fees_usd": None, "weight_kg": None, "mawb_note": None,
+             "note": f"общий инвойс {out.get('invoice_no') or ''} ({', '.join(x for x in farms if x)})".strip(),
+             "warnings": [w for w in out.get("warnings", []) if "плантац" not in w.lower()]}
+        subs.append(d)
+    return subs
+
+
+def payments_for(text: str, subs: list[dict]):
+    """'Agriflora 301$ 26500₽\nMassai 306$ 26940₽' (or just two lines in order) -> [(usd, rub)] per sub.
+    One pair for several farms -> split by invoice value."""
+    segs = [s for s in re.split(r"[\n;]+", text or "") if any(money_from_text(s))]
+    pairs = [money_from_text(s) for s in segs]
+    if not pairs:
+        return None
+    if len(subs) == 1:
+        return [pairs[0]]
+    if len(pairs) == 1:          # one payment for all of them
+        usd, rub = pairs[0]
+        tot = sum(d.get("invoice_total_usd") or 0 for d in subs) or 1
+        return [(round(usd * (d.get("invoice_total_usd") or 0) / tot, 2) if usd else None,
+                 round(rub * (d.get("invoice_total_usd") or 0) / tot, 2) if rub else None) for d in subs]
+    out = [None] * len(subs)
+    rest = []
+    for seg, pr in zip(segs, pairs):
+        low = _norm_name(seg)
+        with session() as s:
+            hit = next((i for i, d in enumerate(subs) if out[i] is None and d.get("farm")
+                        and any(k[:4] in low for k in _farm_keys(s, d["farm"]) if len(k) >= 4)), None)
+        if hit is None:
+            rest.append(pr)
+        else:
+            out[hit] = pr
+    for i in range(len(out)):    # unnamed lines go in order
+        if out[i] is None and rest:
+            out[i] = rest.pop(0)
+    return out
+
+
 def book_document(out: dict, topup_id: int, usd, rub, uid: int):
     """Farm invoice / freight bill + paid $ and ₽ -> straight into the books, no Mini App.
     Returns (snapshot, what) or (None, reason)."""

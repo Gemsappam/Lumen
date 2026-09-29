@@ -80,6 +80,11 @@ DOMAIN = """Ты — бухгалтер-логист оптовой компан
 - Коробки: FB=1, HB=0.5, QB=0.25, EB=0.125. Stems = bunches × stems per bunch. Длина (40cm/50cm/60cm)
   — часть номенклатуры, пиши её в название: "Rose Madam Red 40cm".
 - Гортензии (Кондор, American Flowers): часто одна цена на всё, названия = цвета.
+- Трейдеры: NextWave (NEXTWAVE IMPORTS AND EXPORTS) выставляет ОДИН инвойс за несколько плантаций
+  (колонка FARM: "SIAN FLOWERS-AGRIFLORA" = Agriflora, "SIAN FLOWERS-MAASAI" = Massai). Для каждой строки
+  заполни lines[].farm каноническим именем плантации; верхнее поле farm = плантация, если она одна,
+  иначе null. Это нормально — не пиши про это warning, система сама разделит инвойс по плантациям.
+  Если у Documentation fee нет суммы — просто пропусти, без warning.
 - Строки вроде "Documentation Fees", упаковка, коробки внутри таблицы — это НЕ цветы: в lines их не пиши,
   их сумму положи в fees_usd.
 - Инвойсы кенийских плантаций обычно без MAWB (только агент Expolanka) — это нормально, не пиши warning про MAWB,
@@ -120,6 +125,7 @@ PARSE_TOOL = {
             "total_weight_kg": {"type": ["number", "null"], "description": "freight bill: chargeable weight kg"},
             "lines": {"type": "array", "items": {"type": "object", "properties": {
                 "name": {"type": "string"}, "boxes": {"type": ["number", "null"]},
+                "farm": {"type": ["string", "null"], "description": "real farm of this line if the invoice has a FARM column (canonical name)"},
                 "stems": {"type": "number"}, "price_usd": {"type": "number"},
                 "weight_kg": {"type": ["number", "null"]}, "line_total_usd": {"type": ["number", "null"]}},
                 "required": ["name", "stems", "price_usd"]}},

@@ -36,8 +36,18 @@ FORWARDERS = {
 }
 
 
+FARM_ALIASES = {"Agriflora": "SIAN FLOWERS-AGRIFLORA,SIAN FLOWERS -AGRIFLORA,Агрифлора,Агри",
+                "Massai": "SIAN FLOWERS-MAASAI,Maasai,Массай,Масаи"}
+
+
 def upsert_forwarders():
     with session() as s:
+        for name, al in FARM_ALIASES.items():
+            f = s.exec(select(Farm).where(Farm.name == name)).first()
+            if f and al.split(",")[0] not in (f.aliases or ""):
+                f.aliases = ",".join(x for x in [f.aliases, al] if x)
+                f.notes = (f.notes + " " if f.notes else "") + "Инвойсы приходят от трейдера NextWave одним файлом вместе с другой плантацией."
+                s.add(f)
         for name, (country, aliases, notes) in FORWARDERS.items():
             f = s.exec(select(Farm).where(Farm.name == name)).first() or Farm(name=name, country=country)
             f.is_forwarder, f.aliases, f.notes = True, aliases, notes
@@ -46,7 +56,11 @@ def upsert_forwarders():
 
 
 def seed():
-    upsert_forwarders()
+    _seed_farms()
+    upsert_forwarders()          # forwarders + aliases for existing farms (idempotent)
+
+
+def _seed_farms():
     with session() as s:
         if s.exec(select(Farm).where(Farm.is_forwarder == False)).first():  # noqa: E712
             return

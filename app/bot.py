@@ -10,12 +10,12 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMa
 from sqlmodel import select
 
 from . import ai
-from .api import (DRAFTS, active_topup, book_document, import_floratrack, fill_mawb, money_from_text, save_draft,
+from .api import (DRAFTS, active_topup, book_document, import_floratrack, payments_for, split_by_farm, fill_mawb, money_from_text, save_draft,
                   set_active_topup, store_breakdown, topup_from_text)
 from .config import ALLOWED_IDS, BOT_TOKEN, DATA_DIR, MASTER_XLSX, WEBAPP_URL
 from .models import Farm, Line, session
 
-LAST_DRAFT: dict[int, tuple[str, float]] = {}   # user -> (draft id, time)
+LAST_DRAFT: dict[int, tuple[list, float]] = {}   # user -> ([draft ids], time)
 bot = Bot(BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
 ops = F.from_user.id.in_(ALLOWED_IDS)
@@ -122,7 +122,7 @@ async def _parse_and_reply(m: Message, data: bytes, mime: str):
             await note.edit_text(head + "\n\n" + _applied_text(store_breakdown(out["awb"], kg, out.get("source_file"))))
             return
         did = save_draft(out)
-        LAST_DRAFT[m.from_user.id] = (did, time.time())
+        LAST_DRAFT[m.from_user.id] = ([did], time.time())
         await note.edit_text(head + "\n\nНапиши MAWB следующим сообщением — сохраню разбивку.")
         return
 
@@ -133,6 +133,10 @@ async def _parse_and_reply(m: Message, data: bytes, mime: str):
         return
     out["topup_id"] = t.id
     if out.get("doc_type") == "farm_invoice":
+        subs = split_by_farm(out)
+        if len(subs) > 1:
+            await _book_or_draft_multi(m, note, subs, t)
+            return
         fill_mawb(out, t.id)
     usd, rub = money_from_text(m.caption or "")
     if out.get("doc_type") == "freight_invoice" and usd is None:
@@ -151,10 +155,36 @@ async def _book_or_draft(m: Message, note, out: dict, t, usd, rub):
             return
         warn += f"\n⚠️ Не внёс сразу: {kind}"
     did = save_draft(out)
-    LAST_DRAFT[m.from_user.id] = (did, time.time())
+    LAST_DRAFT[m.from_user.id] = ([did], time.time())
     need = "₽" if usd else "$ и ₽"
     await note.edit_text(head + warn + f"\n\n→ пополнение {t.date}. Ответь суммой оплаты ({need}), например "
                          f"`{usd or 1198:g}$ 105472₽` — внесу сразу. Или «Учёт» → Черновики.", parse_mode="Markdown")
+
+
+async def _book_or_draft_multi(m: Message, note, subs: list, t):
+    """Trader invoice (NextWave): one file, several farms -> one invoice per farm, each paid separately."""
+    for d in subs:
+        d["topup_id"] = t.id
+        fill_mawb(d, t.id)
+    head = f"📄 Общий инвойс {subs[0].get('invoice_no') or ''} на {len(subs)} плантации — делю:\n" + "\n".join(
+        f"• {d['farm']}: {sum(l.get('stems') or 0 for l in d['lines']):g} ст, ${d['invoice_total_usd']:g}"
+        + (f", MAWB {d['awb']}" if d.get("awb") else ", MAWB ?") for d in subs)
+    pays = payments_for(m.caption or "", subs)
+    res, left = [], []
+    for d, pr in zip(subs, pays or [None] * len(subs)):
+        if pr and pr[0] and pr[1]:
+            snap, kind = book_document(d, t.id, pr[0], pr[1], m.from_user.id)
+            if snap:
+                res.append(f"{d['farm']}: " + _booked_text(snap, d, kind, t).split("\n")[0].replace("✅ ", "✅ "))
+                continue
+        left.append(d)
+    if left:
+        ids = [save_draft(d) for d in left]
+        LAST_DRAFT[m.from_user.id] = (ids, time.time())
+        ex = "\n".join(f"{d['farm']} {round(d['invoice_total_usd'])}$ 26500₽" for d in left)
+        res.append("Ответь оплатой по каждой плантации, по строке на каждую:\n`" + ex + "`\n"
+                   "Одна сумма на всех — разделю пропорционально инвойсу.")
+    await note.edit_text(head + "\n\n" + "\n".join(res), parse_mode="Markdown")
 
 
 def _doc_head(out: dict) -> str:
@@ -275,29 +305,37 @@ async def stranger(m: Message):
 
 @dp.message(ops, F.text.func(lambda t: any(money_from_text(t)) and not ai.find_mawb(t)))
 async def money_followup(m: Message):
-    """'1198$ 105472₽' right after a document -> books the last draft."""
-    did, ts = LAST_DRAFT.get(m.from_user.id, (None, 0))
-    path = DRAFTS / f"{did}.json" if did else None
-    if not path or not path.exists() or time.time() - ts > 30 * 60:
+    """'1198$ 105472₽' right after a document -> books the last draft(s).
+    For a split trader invoice: one line per farm ('Agriflora 301$ 26500₽'), or one sum for all."""
+    ids, ts = LAST_DRAFT.get(m.from_user.id, ([], 0))
+    paths = [DRAFTS / f"{i}.json" for i in ids if (DRAFTS / f"{i}.json").exists()]
+    if not paths or time.time() - ts > 30 * 60:
         await m.answer("Не к чему привязать суммы: сначала пришли документ (суммы можно прямо в подписи).")
         return
-    d = json.loads(path.read_text())
-    usd, rub = money_from_text(m.text)
-    if d.get("doc_type") == "freight_invoice" and usd is None:
-        usd = (d.get("freight") or {}).get("total_usd")
-    if not (usd and rub):
-        await m.answer("Нужны обе суммы: $ и ₽, например `1198$ 105472₽`", parse_mode="Markdown")
-        return
-    with session() as s:
-        from .models import TopUp
-        t = s.get(TopUp, d.get("topup_id") or 0)
-    t = t or active_topup()
-    snap, kind = book_document(d, t.id, usd, rub, m.from_user.id)
-    if not snap:
-        await m.answer(f"Не внёс: {kind}. Открой черновик в «Учёт».")
-        return
-    path.unlink()
-    await m.answer(_booked_text(snap, d, kind, t))
+    docs = [json.loads(p.read_text()) for p in paths]
+    pays = payments_for(m.text, docs) or []
+    from .models import TopUp
+    out, left = [], []
+    for p, d, pr in zip(paths, docs, pays + [None] * (len(docs) - len(pays))):
+        usd, rub = pr or (None, None)
+        if d.get("doc_type") == "freight_invoice" and usd is None:
+            usd = (d.get("freight") or {}).get("total_usd")
+        if not (usd and rub):
+            left.append(d.get("farm") or "документ")
+            continue
+        with session() as s:
+            t = s.get(TopUp, d.get("topup_id") or 0)
+        t = t or active_topup()
+        snap, kind = book_document(d, t.id, usd, rub, m.from_user.id)
+        if not snap:
+            out.append(f"Не внёс {d.get('farm') or ''}: {kind}")
+            continue
+        p.unlink()
+        out.append((f"{d['farm']}: " if len(docs) > 1 else "") + _booked_text(snap, d, kind, t))
+    if left:
+        out.append("Без сумм остались: " + ", ".join(left) + " — пришли `$ и ₽` для них.")
+        LAST_DRAFT[m.from_user.id] = ([p.stem for p in paths if p.exists()], time.time())
+    await m.answer("\n\n".join(out), parse_mode="Markdown")
 
 
 @dp.message(ops, Command("pop"))
@@ -330,7 +368,8 @@ async def set_topup(c: CallbackQuery):
 @dp.message(ops, F.text.func(lambda t: bool(ai.find_mawb(t))))
 async def mawb_followup(m: Message):
     """MAWB sent as a separate message right after a document -> goes into that draft."""
-    did, ts = LAST_DRAFT.get(m.from_user.id, (None, 0))
+    ids, ts = LAST_DRAFT.get(m.from_user.id, ([], 0))
+    did = ids[0] if ids else None
     path = DRAFTS / f"{did}.json" if did else None
     if not path or not path.exists() or time.time() - ts > 15 * 60:
         await m.answer("Не к чему привязать этот MAWB: сначала пришли документ (можно MAWB прямо в подписи к нему).")
