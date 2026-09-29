@@ -32,6 +32,19 @@ async def setup_menu_button():
         await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="Учёт", web_app=WebAppInfo(url=WEBAPP_URL)))
 
 
+@dp.errors()
+async def on_error(event):
+    import logging
+    logging.exception("handler error", exc_info=event.exception)
+    try:
+        msg = event.update.message
+        if msg:
+            await msg.answer(f"❌ Ошибка: {type(event.exception).__name__}: {str(event.exception)[:300]}")
+    except Exception:
+        pass
+    return True
+
+
 @dp.message(CommandStart(), ops)
 async def start(m: Message):
     kb = KB if WEBAPP_URL.startswith("https://") else None
@@ -98,7 +111,32 @@ async def _floratrack(m: Message, data: bytes):
 
 
 async def _parse_and_reply(m: Message, data: bytes, mime: str):
+    """Guard: never leave the user staring at 'Читаю документ…'."""
+    import asyncio, logging, traceback
+    note_holder = {}
+    try:
+        await asyncio.wait_for(_parse_and_reply_inner(m, data, mime, note_holder), timeout=240)
+    except asyncio.TimeoutError:
+        await _say(m, note_holder, "⏱ AI не ответил за 4 минуты. Пришли документ ещё раз — обычно со второго раза проходит.")
+    except Exception as e:
+        logging.exception("parse failed")
+        tb = traceback.format_exc().strip().splitlines()[-1]
+        await _say(m, note_holder, f"❌ Ошибка при разборе: {tb[:300]}\nПерешли это сообщение мне (разработчику) — починю.")
+
+
+async def _say(m: Message, holder: dict, text: str):
+    try:
+        if holder.get("note"):
+            await holder["note"].edit_text(text)
+            return
+    except Exception:
+        pass
+    await m.answer(text)
+
+
+async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dict):
     note = await m.answer("Читаю документ…")
+    holder["note"] = note
     with session() as s:
         fs = [f.model_dump() for f in s.exec(select(Farm)).all()]
         catalog = sorted({l.name for l in s.exec(select(Line)).all()})
@@ -157,8 +195,8 @@ async def _book_or_draft(m: Message, note, out: dict, t, usd, rub):
     did = save_draft(out)
     LAST_DRAFT[m.from_user.id] = ([did], time.time())
     need = "₽" if usd else "$ и ₽"
-    await note.edit_text(head + warn + f"\n\n→ пополнение {t.date}. Ответь суммой оплаты ({need}), например "
-                         f"`{usd or 1198:g}$ 105472₽` — внесу сразу. Или «Учёт» → Черновики.", parse_mode="Markdown")
+    await _edit(note, head + warn + f"\n\n→ пополнение {t.date}. Ответь суммой оплаты ({need}), например "
+                      f"`{usd or 1198:g}$ 105472₽` — внесу сразу. Или «Учёт» → Черновики.")
 
 
 async def _book_or_draft_multi(m: Message, note, subs: list, t):
@@ -181,10 +219,17 @@ async def _book_or_draft_multi(m: Message, note, subs: list, t):
     if left:
         ids = [save_draft(d) for d in left]
         LAST_DRAFT[m.from_user.id] = (ids, time.time())
-        ex = "\n".join(f"{d['farm']} {round(d['invoice_total_usd'])}$ 26500₽" for d in left)
+        ex = "\n".join(f"{d['farm']} {round(d['invoice_total_usd'])}$ …₽" for d in left)
         res.append("Ответь оплатой по каждой плантации, по строке на каждую:\n`" + ex + "`\n"
                    "Одна сумма на всех — разделю пропорционально инвойсу.")
-    await note.edit_text(head + "\n\n" + "\n".join(res), parse_mode="Markdown")
+    await _edit(note, head + "\n\n" + "\n".join(res))
+
+
+async def _edit(note, text: str):
+    try:
+        await note.edit_text(text, parse_mode="Markdown")
+    except Exception:
+        await note.edit_text(text.replace("`", ""))
 
 
 def _doc_head(out: dict) -> str:

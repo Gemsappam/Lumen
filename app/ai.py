@@ -16,11 +16,12 @@ from .config import AI_PROVIDER, ANTHROPIC_API_KEY, AUDIT_MODEL, OPENROUTER_API_
 # so the official SDK works with just a different base_url + Bearer key.
 if AI_PROVIDER == "openrouter":
     client = AsyncAnthropic(base_url="https://openrouter.ai/api", auth_token=OPENROUTER_API_KEY,
+                            timeout=110, max_retries=1,
                             api_key=None,
                             default_headers={"HTTP-Referer": WEBAPP_URL or "https://t.me", "X-Title": "Lumen Uchet"}) \
         if OPENROUTER_API_KEY else None
 else:
-    client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+    client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY, timeout=110, max_retries=1) if ANTHROPIC_API_KEY else None
 
 
 def model_id(name: str) -> str:
@@ -153,6 +154,29 @@ AUDIT_TOOL = {
 }
 
 
+def _pdf_to_pngs(data: bytes, max_pages: int = 5) -> list[bytes]:
+    """PDF -> page images. Through OpenRouter, images are the most reliable way to show Claude a PDF."""
+    import io
+    import pypdfium2 as pdfium
+    pdf = pdfium.PdfDocument(data)
+    out = []
+    for i in range(min(len(pdf), max_pages)):
+        img = pdf[i].render(scale=2).to_pil()          # ~150 dpi — small table text stays readable
+        buf = io.BytesIO()
+        img.save(buf, "PNG", optimize=True)
+        out.append(buf.getvalue())
+    return out
+
+
+def _blocks(data: bytes, mime: str) -> list:
+    if mime == "application/pdf" and AI_PROVIDER == "openrouter":
+        try:
+            return [_block(p, "image/png") for p in _pdf_to_pngs(data)]
+        except Exception:
+            pass
+    return [_block(data, mime)]
+
+
 def _block(data: bytes, mime: str):
     b64 = base64.standard_b64encode(data).decode()
     if mime == "application/pdf":
@@ -178,7 +202,7 @@ async def parse_document(data: bytes, mime: str, farms: list[dict], catalog: lis
            + "\n".join(catalog[:400]))
     out = await _structured(
         PARSE_MODEL, DOMAIN + "\n\n" + ctx,
-        [_block(data, mime),
+        [*_blocks(data, mime),
          {"type": "text", "text": "Распознай документ полностью, все строки. Проверь арифметику строк и итог."
                                   + (f"\n\nПодпись оператора к документу (она важнее документа — если там MAWB, "
                                      f"плантация или дата, бери оттуда): {note}" if note.strip() else "")}],
