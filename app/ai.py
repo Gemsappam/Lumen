@@ -64,12 +64,16 @@ DOMAIN = """Ты — бухгалтер-логист оптовой компан
 
 Нюансы, которые ты обязан учитывать:
 - Логистика у нас от двух перевозчиков:
-  • Expolanka — Кения → Амстердам. Несколько кенийских плантаций летят одним MAWB, Expolanka выставляет
-    счёт за фрахт в $. В её счёте НЕТ разбивки кг по плантациям — разбивка приходит отдельным документом.
-  • Floratrack (Флоратрак) — всё остальное: Эквадор, Колумбия и прочие.
-  Счёт перевозчика — это НЕ цветы, это логистика (doc_type=freight_invoice, leg=air).
+  • Expolanka — Кения → Амстердам (leg=air). Несколько кенийских плантаций летят одним MAWB, Expolanka
+    выставляет счёт за фрахт в $. В её счёте НЕТ разбивки кг по плантациям — разбивка приходит отдельным
+    документом. Вес из счёта (chargeable / оплачиваемый) пиши в total_weight_kg — от него считается ставка за кг.
+  • Floratrack (Флоратрак) — leg=msk: для Кении это Амстердам → Москва, для Эквадора, Колумбии и прочих — весь путь.
+  Счёт перевозчика — это НЕ цветы, это логистика (doc_type=freight_invoice).
 - MAWB vs HAWB: нас интересует ТОЛЬКО MAWB (master, обычно формат 3 цифры-8 цифр, напр. 065-4053 8245).
   HAWB (house) игнорируй полностью. В поле awb пиши только MAWB. Если в документе только HAWB — awb=null и warning.
+- Скрин покупки валюты («Покупка 1 732,5887 USDT за 152 000,01 RUB», «Запрос на вывод средств, Сумма ...»)
+  — это пополнение: doc_type=topup_receipt, заполни topup (rub, usd_bought, usd_withdrawn, order_no = номер заявки).
+  Числа в русском формате: пробел — разделитель тысяч, запятая — десятичная.
 - Документ, где только вес/коробки по плантациям на один MAWB (манифест, weight list, разбивка) —
   doc_type=kg_breakdown: заполни awb и per_farm_kg, lines оставь пустым.
 - Расходы на московской стороне (таможня, склад, доставка) — leg=msk.
@@ -85,6 +89,8 @@ DOMAIN = """Ты — бухгалтер-логист оптовой компан
 - Суммы оплаты в $ и ₽ вносит оператор, они всегда верные. Не спорь с ними и не пересчитывай.
 - Номера AWB бывают в форматах "065-4053 8245", "06540538245" — это одно и то же.
 - Не выдумывай. Если поле не читается — null и warning.
+- Даты в американском формате (09/16/2026 = 16.09.2026) — это нормально, пиши DD.MM.YYYY без warning.
+  Отсутствие коробок по строкам — не проблема, не пиши warning.
 - warnings — только реальные проблемы (не читается, не сходится, чего-то не хватает).
   Не пиши, что всё сошлось или что итог посчитан как сумма строк — это шум."""
 
@@ -94,7 +100,12 @@ PARSE_TOOL = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "doc_type": {"type": "string", "enum": ["farm_invoice", "freight_invoice", "kg_breakdown", "awb", "other"]},
+            "doc_type": {"type": "string", "enum": ["farm_invoice", "freight_invoice", "kg_breakdown", "topup_receipt", "awb", "other"]},
+            "topup": {"type": ["object", "null"], "description": "only for topup_receipt", "properties": {
+                "rub": {"type": ["number", "null"], "description": "RUB paid"},
+                "usd_bought": {"type": ["number", "null"], "description": "USDT/USD bought"},
+                "usd_withdrawn": {"type": ["number", "null"], "description": "amount in the withdrawal request, if shown"},
+                "order_no": {"type": ["string", "null"]}}},
             "farm": {"type": ["string", "null"], "description": "canonical farm name from the known list if it matches"},
             "country": {"type": ["string", "null"], "enum": ["Кения", "Эквадор", "Колумбия", None]},
             "invoice_no": {"type": ["string", "null"]},
@@ -106,7 +117,7 @@ PARSE_TOOL = {
             "subtotal_usd": {"type": ["number", "null"], "description": "subtotal exactly as printed"},
             "fees_usd": {"type": ["number", "null"], "description": "non-flower rows inside the table: documentation fees, boxes, packing, etc."},
             "invoice_total_usd": {"type": ["number", "null"], "description": "balance due incl. tax/fees"},
-            "total_weight_kg": {"type": ["number", "null"]},
+            "total_weight_kg": {"type": ["number", "null"], "description": "freight bill: chargeable weight kg"},
             "lines": {"type": "array", "items": {"type": "object", "properties": {
                 "name": {"type": "string"}, "boxes": {"type": ["number", "null"]},
                 "stems": {"type": "number"}, "price_usd": {"type": "number"},

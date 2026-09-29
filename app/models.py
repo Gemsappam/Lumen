@@ -60,8 +60,8 @@ class Line(SQLModel, table=True):
 
 class Logistics(SQLModel, table=True):
     """A freight / delivery cost tied to one AWB.
-    leg = 'air'  -> farm country → Moscow (Expolanka, cargo agent)
-    leg = 'msk'  -> Moscow side (customs, handling, delivery)"""
+    leg = 'air'  -> Expolanka: Kenya → Amsterdam
+    leg = 'msk'  -> Floratrack: Amsterdam → Moscow for Kenya, the whole route for Ecuador/Colombia"""
     id: Optional[int] = Field(default=None, primary_key=True)
     topup_id: Optional[int] = Field(default=None, foreign_key="topup.id", index=True)  # None = paid outside top-ups
     awb: str
@@ -75,6 +75,8 @@ class Logistics(SQLModel, table=True):
     note: str = ""
     source_file: Optional[str] = None
     farm_kg_json: str = "{}"               # forwarder breakdown {"Zeeflora": 250, ...}, applied to invoices on save
+    weight_kg: Optional[float] = None      # weight on the forwarder's bill: ₽ per kg = rub / weight_kg
+    ext_key: Optional[str] = Field(default=None, index=True)   # e.g. "ft:21.09-530:8245" — re-import updates, not duplicates
 
 
 class AwbWeights(SQLModel, table=True):
@@ -96,6 +98,12 @@ def init_db():
     if "farm_kg_json" not in cols:
         with engine.begin() as c:
             c.execute(text("ALTER TABLE logistics ADD COLUMN farm_kg_json VARCHAR DEFAULT '{}'"))
+    if "ext_key" not in cols:
+        with engine.begin() as c:
+            c.execute(text("ALTER TABLE logistics ADD COLUMN ext_key VARCHAR"))
+    if "weight_kg" not in cols:
+        with engine.begin() as c:
+            c.execute(text("ALTER TABLE logistics ADD COLUMN weight_kg FLOAT"))
 
 
 def session() -> Session:

@@ -13,9 +13,9 @@ from .calc import compute, norm_awb, rate_of
 
 HEAD = ["Страна", "Код клиента", "Номер / Дата инвойса", "MAWB", "Плантация", "Номенклатура",
         "Кол-во коробок", "Кол-во стеблей", "Вес (кг)", "Цена за цветок ($)", "Цена за цветок (Р)",
-        "Логистика авиа ($/стебель)", "Логистика авиа (Р/стебель)", "Логистика МСК (Р/стебель)",
+        "Expolanka ($/стебель)", "Expolanka (Р/стебель)", "Floratrack (Р/стебель)",
         "Общая себестоимость стебля (Р)", "Сумма в $ (оплачено)", "Сумма в Р (оплачено)",
-        "Оплачено", "Дата оплаты", "МРЦ", "Доля авиа-логистики AWB", "Доля МСК-логистики AWB"]
+        "Оплачено", "Дата оплаты", "МРЦ", "Доля Expolanka по MAWB", "Доля Floratrack по MAWB"]
 MERGE_COLS = [1, 2, 3, 4, 5, 16, 17, 18, 19]          # merged down each invoice block, like the original
 
 F = "Arial"
@@ -199,7 +199,7 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
     for (awb, leg), rr in leg_row.items():
         g = res.legs[(awb, leg)]
         ws.cell(rr, 1, awb)
-        ws.cell(rr, 2, "авиа" if leg == "air" else "МСК")
+        ws.cell(rr, 2, "Expolanka" if leg == "air" else "Floratrack")
         ws.cell(rr, 3, g["provider"])
         ws.cell(rr, 5, g["usd"] or None).font = BLUE
         own_usd = sum((lg.usd or 0) for lg in logistics if lg.id in g["ids"] and lg.topup_id == topup.id)

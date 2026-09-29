@@ -10,7 +10,7 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMa
 from sqlmodel import select
 
 from . import ai
-from .api import (DRAFTS, active_topup, book_document, fill_mawb, money_from_text, save_draft,
+from .api import (DRAFTS, active_topup, book_document, import_floratrack, fill_mawb, money_from_text, save_draft,
                   set_active_topup, store_breakdown, topup_from_text)
 from .config import ALLOWED_IDS, BOT_TOKEN, DATA_DIR, MASTER_XLSX, WEBAPP_URL
 from .models import Farm, Line, session
@@ -42,19 +42,59 @@ async def start(m: Message):
                    " без подписи — спрошу суммы.\n"
                    "• Документы идут в активное пополнение (последнее). Сменить: /pop, разово — дата в подписи.\n"
                    "• Разбивку кг кидай с MAWB в подписи.\n"
-                   "• Кинь .xlsx — он станет мастер-файлом учёта (новые листы пишутся в него)."
+                   "• Отчёт Floratrack (.xlsx) — привяжу машины к MAWB и посчитаю ₽ по вашим оплатам из «Баланса».\n"
+                   "• Любой другой .xlsx станет мастер-файлом учёта."
                    + ("" if kb else "\n\n⚠️ WEBAPP_URL не https — кнопка приложения отключена."),
                    reply_markup=kb)
 
 
 @dp.message(ops, F.document.file_name.lower().endswith(".xlsx"))
 async def master(m: Message):
+    f = await bot.download(m.document)
+    data = f.read()
+    from io import BytesIO
+    from openpyxl import load_workbook
+    from . import floratrack as ft
+    try:
+        is_ft = ft.is_floratrack(load_workbook(BytesIO(data), read_only=True))
+    except Exception:
+        is_ft = False
+    if is_ft:
+        await _floratrack(m, data)
+        return
     if MASTER_XLSX.exists():
         shutil.copy(MASTER_XLSX, DATA_DIR / f"учет_backup_{datetime.now():%Y%m%d_%H%M}.xlsx")
-    await bot.download(m.document, destination=MASTER_XLSX)
+    MASTER_XLSX.write_bytes(data)
     from .backup import mark_dirty
     mark_dirty()
     await m.answer("Мастер-файл обновлён ✅ (старый сохранён в бэкап)")
+
+
+async def _floratrack(m: Message, data: bytes):
+    note = await m.answer("Отчёт Floratrack — разбираю машины и оплаты…")
+    try:
+        r = import_floratrack(data)
+    except Exception as e:
+        await note.edit_text(f"Не смог разобрать отчёт: {e}")
+        return
+    fmt = lambda x: f"{x:,.0f}".replace(",", " ")
+    kinds = {"import": "Кения АМС-МСК", "ecuador": "Эквадор", "colombia": "Колумбия"}
+    recent = sorted(r["matched"], key=lambda x: x[1].date or datetime.min, reverse=True)[:12]
+    lines = [f"• {awb} · {kinds[c.kind]} · {c.kg:g} кг · ${c.usd:,.2f} × {c.rate:.2f} = {fmt(c.rub)} ₽"
+             + (" (курс предв.)" if c.provisional else "") for awb, c in recent]
+    txt = (f"🚚 Floratrack: привязано {len(r['matched'])} AWB (новых {r['added']}, обновлено {r['updated']}).\n"
+           f"Баланс у Floratrack: ${r['balance_usd']:,.2f}\n\n" + "\n".join(lines))
+    fresh = [c for c in r["unmatched"] if c.date and (datetime.now() - c.date).days <= 21]
+    if fresh:
+        txt += "\n\nНет наших инвойсов/разбивки с этими AWB (последние 3 недели):\n" + "\n".join(
+            f"• …{c.last4} · {kinds[c.kind]} · {c.kg:g} кг · {c.sheet}" for c in fresh[:15])
+        txt += "\nВнеси их и перекинь отчёт — привяжутся."
+    if r["ambiguous"]:
+        txt += "\n\n⚠️ Несколько MAWB с такими 4 цифрами, взял по весу: " + ", ".join(r["ambiguous"][:10])
+    warn = [w for w in r["warnings"] if "MAWB" in w][:8]
+    if warn:
+        txt += "\n\n⚠️ " + "\n⚠️ ".join(warn)
+    await note.edit_text(txt[:4000])
 
 
 async def _parse_and_reply(m: Message, data: bytes, mime: str):
@@ -68,6 +108,10 @@ async def _parse_and_reply(m: Message, data: bytes, mime: str):
         await note.edit_text(f"Не смог прочитать: {e}")
         return
     warn = ("\n⚠️ " + "\n⚠️ ".join(out["warnings"])) if out.get("warnings") else ""
+
+    if out.get("doc_type") == "topup_receipt":
+        await note.edit_text(_register_topup(out.get("topup") or {}, m.caption or ""))
+        return
 
     if out.get("doc_type") == "kg_breakdown":
         kg = out.get("per_farm_kg") or []
@@ -129,6 +173,8 @@ def _booked_text(snap: dict, out: dict, kind: str, t) -> str:
     if kind == "freight":
         lg = max((l for l in snap["logistics"] if l["topup_id"] == t.id), key=lambda l: l["id"])
         txt = (f"✅ Фрахт внесён в пополнение {t.date}: ${lg['usd'] or 0:g} / {fmt(lg['rub'] or 0)} ₽"
+               + (f" · {lg['weight_kg']:g} кг по счёту" if lg.get("weight_kg") else "")
+               + (f" · {lg['rub_per_kg']:.2f} ₽/кг" if lg.get("rub_per_kg") else "")
                + (f" · разбивка {lg['kg_total']:g} кг ✓" if lg.get("kg_total") else " · разбивки кг ещё нет"))
     else:
         inv = max(snap["invoices"], key=lambda i: i["id"])
@@ -140,6 +186,38 @@ def _booked_text(snap: dict, out: dict, kind: str, t) -> str:
     rel = [w for w in snap["warnings"] if (out.get("farm") or "~").lower()[:5] in w.lower()
            or (out.get("awb") or "~").replace("-", "")[:6] in w.replace("-", "")]
     return txt + ("\n⚠️ " + "\n⚠️ ".join(rel) if rel else "") + f"\nОстаток пополнения ${snap['usd_left']:g}"
+
+
+def _register_topup(tp: dict, caption: str) -> str:
+    """Crypto purchase screenshot -> new top-up dated today, and it becomes the active one."""
+    from .models import TopUp
+    rub = tp.get("rub")
+    usd = tp.get("usd_withdrawn") or tp.get("usd_bought")     # what actually left for payments
+    cu, cr = money_from_text(caption)                          # caption «1728.86$ 152000₽» overrides
+    usd, rub = cu or usd, cr or rub
+    if not (rub and usd):
+        return "Не нашёл на скрине обе суммы (₽ и USDT). Пришли ещё раз или подпиши: «1728.86$ 152000₽»."
+    order = (tp.get("order_no") or "").lstrip("#")
+    with session() as s:
+        if order:
+            dup = s.exec(select(TopUp).where(TopUp.note.contains(f"#{order}"))).first()
+            if dup:
+                return f"Это пополнение уже внесено: {dup.date}, {_n(dup.rub, 2)} ₽ → ${_n(dup.usd, 4)} (заявка #{order})."
+        note = f"заявка #{order}" if order else ""
+        if tp.get("usd_withdrawn") and tp.get("usd_bought"):
+            note += f"; куплено {tp['usd_bought']} USDT, выведено {tp['usd_withdrawn']}"
+        t = TopUp(date=datetime.now().strftime("%d.%m.%Y"), rub=rub, usd=usd, note=note.strip("; "))
+        s.add(t); s.commit(); s.refresh(t)
+    set_active_topup(t.id)
+    fee = ""
+    if tp.get("usd_withdrawn") and tp.get("usd_bought") and not cu:
+        fee = f"\n(куплено {tp['usd_bought']:g} USDT, за вывод ушло {tp['usd_bought'] - tp['usd_withdrawn']:.4f} — считаю по выведенным)"
+    return (f"💰 Новое пополнение {t.date}\n{_n(rub, 2)} ₽ → ${_n(usd, 4)}\nКурс {rub / usd:.4f} ₽/$" + fee +
+            "\n\nДокументы из чата теперь идут в него.")
+
+
+def _n(x: float, d: int) -> str:
+    return f"{x:,.{d}f}".replace(",", " ")
 
 
 def _applied_text(w: dict) -> str:

@@ -10,7 +10,9 @@ Rules (reverse-engineered from учет.xlsx, then made consistent):
         tax / doc fees above the line sum are NOT pushed into the stem price)
      stems mode: RUB_paid / Σ stems   (hydrangea style — one price for everything)
    RUB_paid and USD_paid are entered by the operator and are taken as-is.
-4. Logistics: each (AWB, leg) cost is spread over ALL farm invoices on that AWB
+4. Logistics: ₽ per kg = bill ₽ / bill kg (or breakdown total if the bill has no weight);
+   farm cost = ₽/kg × farm kg; per stem = farm cost / farm stems.
+   Each (AWB, leg) cost is spread over ALL farm invoices on that AWB
    (across any top-up), by farm kg if every farm has kg, else by stems.
    Inside an invoice: by line kg if all lines have it, else equally per stem (as in the old sheet).
    Per stem = share of leg RUB / stems.
@@ -105,7 +107,7 @@ def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result
     for inv in invoices:
         inv_by_awb[norm_awb(inv.awb)].append(inv)
 
-    groups = defaultdict(lambda: {"usd": 0.0, "rub": 0.0, "ids": [], "own": True, "basis": "auto", "provider": "", "kg_total": 0.0})
+    groups = defaultdict(lambda: {"usd": 0.0, "rub": 0.0, "ids": [], "own": True, "basis": "auto", "provider": "", "kg_total": 0.0, "kg_bill": 0.0})
     for lg in logistics:
         key = (norm_awb(lg.awb), lg.leg)
         g = groups[key]
@@ -125,6 +127,7 @@ def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result
         except ValueError:
             bd = {}
         g["kg_total"] = max(g["kg_total"], sum(float(v) for v in bd.values() if v))
+        g["kg_bill"] += getattr(lg, "weight_kg", None) or 0
         if lg.topup_id == topup_id:
             res.usd_spent += lg.usd or 0
             res.rub_spent += rub
@@ -151,6 +154,13 @@ def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result
             res.warnings.append(f"MAWB {awb}: внесено {tot:g} из {g['kg_total']:g} кг по разбивке {g['provider'] or 'перевозчика'} — "
                                 f"остальные плантации ещё без инвойсов")
             tot = g["kg_total"]
+        if attr == "weight_kg" and g["kg_bill"]:
+            # his rule: ₽ of the bill / kg of the bill = ₽ per kg; farm pays ₽/kg × its kg
+            if g["kg_total"] and abs(g["kg_bill"] - g["kg_total"]) > 0.5:
+                res.warnings.append(f"MAWB {awb}: вес по счёту {g['provider'] or ''} {g['kg_bill']:g} кг, "
+                                    f"по разбивке {g['kg_total']:g} кг — ставка ₽/кг считается от веса счёта")
+            tot = g["kg_bill"]
+        g["rub_per_kg"] = g["rub"] / tot if attr == "weight_kg" and tot else None
         for inv, wi in zip(invs, w):
             ls = lines_by_inv[inv.id]
             la, lw = _pick_basis(ls, ["weight_kg"])   # like the old sheet: equal per stem inside a farm

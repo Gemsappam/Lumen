@@ -98,6 +98,7 @@ class LogisticsIn(BaseModel):
     note: str = ""
     source_file: str | None = None
     farm_kg: dict[str, float] = {}     # optional: set weight_kg on farm invoices of this AWB
+    weight_kg: float | None = None     # weight on the bill
 
 
 class FarmIn(BaseModel):
@@ -193,6 +194,15 @@ def topup_from_text(text: str):
     return None
 
 
+def leg_of(provider: str, fallback: str | None = None) -> str:
+    p = (provider or "").lower()
+    if "flora" in p or "флора" in p:
+        return "msk"       # Floratrack
+    if "expolanka" in p or "экспо" in p:
+        return "air"       # Expolanka
+    return fallback or "air"
+
+
 def book_document(out: dict, topup_id: int, usd, rub, uid: int):
     """Farm invoice / freight bill + paid $ and ₽ -> straight into the books, no Mini App.
     Returns (snapshot, what) or (None, reason)."""
@@ -215,7 +225,9 @@ def book_document(out: dict, topup_id: int, usd, rub, uid: int):
         return save_invoice(body, None, uid), "invoice"
     if out.get("doc_type") == "freight_invoice":
         fr = out.get("freight") or {}
-        body = LogisticsIn(topup_id=topup_id, awb=out.get("awb") or "", leg=fr.get("leg") or "air",
+        prov = (fr.get("provider") or out.get("farm") or "")
+        body = LogisticsIn(topup_id=topup_id, awb=out.get("awb") or "", leg=leg_of(prov, fr.get("leg")),
+                           weight_kg=out.get("total_weight_kg"),
                            provider=fr.get("provider") or out.get("farm") or "", invoice_no=out.get("invoice_no") or "",
                            usd=usd, rub=rub, paid_date=today, source_file=out.get("source_file"),
                            farm_kg={x["farm"]: x["kg"] for x in fr.get("per_farm_kg") or [] if x.get("kg")})
@@ -223,6 +235,66 @@ def book_document(out: dict, topup_id: int, usd, rub, uid: int):
             return None, "нет MAWB"
         return save_logistics(body, None, topup_id, uid), "freight"
     return None, "этот тип документа сразу не вносится"
+
+
+def import_floratrack(data: bytes) -> dict:
+    """Floratrack xlsx -> one Floratrack logistics record per AWB, ₽ at the rate we actually paid.
+    Re-uploading the next report updates the same records (rates firm up once payments arrive)."""
+    from . import floratrack as ft
+    from .ai import find_mawb
+    rep = ft.parse(data)
+    added = updated = 0
+    matched, unmatched, ambiguous = [], [], []
+    with session() as s:
+        invs = s.exec(select(Invoice)).all()
+        weights = {w.awb: json.loads(w.farm_kg_json or "{}") for w in s.exec(select(AwbWeights)).all()}
+        expo = {}
+        for lg in s.exec(select(Logistics)).all():
+            if lg.leg == "air" and lg.weight_kg:
+                expo[norm_awb(lg.awb)] = expo.get(norm_awb(lg.awb), 0) + lg.weight_kg
+        known = {}
+        for i in invs:
+            k = norm_awb(i.awb)
+            if k:
+                known.setdefault(k, {"countries": set(), "kg": 0})["countries"].add(i.country)
+        for k, bd in weights.items():
+            known.setdefault(k, {"countries": {"Кения"}, "kg": 0})["kg"] = sum(float(v) for v in bd.values() if v)
+        for k, kg in expo.items():
+            known.setdefault(k, {"countries": {"Кения"}, "kg": 0})
+            known[k]["kg"] = known[k]["kg"] or kg
+        want = {"import": "Кения", "ecuador": "Эквадор", "colombia": "Колумбия"}
+        for ch in rep.charges:
+            cands = [k for k in known if k.isdigit() and k.endswith(ch.last4)]
+            same = [k for k in cands if want[ch.kind] in known[k]["countries"] or not any(known[k]["countries"])]
+            cands = same or cands
+            if len(cands) > 1:   # prefer the one whose kg agrees
+                cands.sort(key=lambda k: abs((known[k]["kg"] or 1e9) - ch.kg))
+                ambiguous.append(f"…{ch.last4} ({ch.sheet})")
+            if not cands:
+                unmatched.append(ch)
+                continue
+            awb = find_mawb(cands[0]) or cands[0]
+            if ch.kind == "import" and known[cands[0]]["kg"] and abs(known[cands[0]]["kg"] - ch.kg) > max(2, 0.05 * ch.kg):
+                rep.warnings.append(f"MAWB {awb}: у Floratrack {ch.kg:g} кг, у нас {known[cands[0]]['kg']:g} кг — проверь")
+            key = f"ft:{ch.sheet}:{ch.last4}"
+            lg = s.exec(select(Logistics).where(Logistics.ext_key == key)).first()
+            if lg:
+                updated += 1
+            else:
+                lg = Logistics(ext_key=key, awb=awb)
+                added += 1
+            lg.awb, lg.leg, lg.provider = awb, "msk", "Floratrack"
+            lg.topup_id, lg.usd, lg.rub, lg.weight_kg = None, round(ch.usd, 2), ch.rub, ch.kg
+            lg.invoice_no = ch.sheet
+            lg.paid_date = ch.date.strftime("%d.%m.%Y") if ch.date else ""
+            lg.note = ch.rate_note
+            s.add(lg)
+            matched.append((awb, ch))
+        s.commit()
+    from .backup import mark_dirty
+    mark_dirty()
+    return {"added": added, "updated": updated, "matched": matched, "unmatched": unmatched,
+            "ambiguous": ambiguous, "warnings": rep.warnings, "balance_usd": rep.balance_usd}
 
 
 def infer_mawb(farm: str, topup_id: int | None = None):
@@ -323,7 +395,8 @@ def snapshot(s, topup_id):
         out_inv.append({**inv.model_dump(), "rub_paid": res.invoice_rub[inv.id], "lines": ls})
     related = {norm_awb(i.awb) for i in invs if i.topup_id == topup_id}
     kg = _awb_kg(s)
-    out_log = [{**lg.model_dump(), "kg_total": kg.get(norm_awb(lg.awb), 0)}
+    rpk = {k: g.get("rub_per_kg") for k, g in res.legs.items()}
+    out_log = [{**lg.model_dump(), "kg_total": kg.get(norm_awb(lg.awb), 0), "rub_per_kg": rpk.get((norm_awb(lg.awb), lg.leg))}
                for lg in logs if lg.topup_id == topup_id or norm_awb(lg.awb) in related]
     act = _settings().get("active_topup")
     return {"topup": {**t.model_dump(), "rate": rate_of(t), "active": t.id == act}, "invoices": out_inv, "logistics": out_log,
@@ -375,6 +448,25 @@ def activate_topup(tid: int, uid: int = Depends(user_id)):
     return {"ok": True}
 
 
+@router.delete("/topups/{tid}")
+def delete_topup(tid: int, uid: int = Depends(user_id)):
+    """Delete a top-up with everything booked into it (its invoices + lines, freight paid from it)."""
+    with session() as s:
+        for inv in s.exec(select(Invoice).where(Invoice.topup_id == tid)).all():
+            for l in s.exec(select(Line).where(Line.invoice_id == inv.id)).all():
+                s.delete(l)
+            s.delete(inv)
+        for lg in s.exec(select(Logistics).where(Logistics.topup_id == tid)).all():
+            s.delete(lg)
+        t = s.get(TopUp, tid)
+        if t:
+            s.delete(t)
+        s.commit()
+    if _settings().get("active_topup") == tid:
+        SETTINGS.write_text(json.dumps({**_settings(), "active_topup": None}))   # falls back to the newest
+    return {"ok": True}
+
+
 @router.put("/topups/{tid}")
 def update_topup(tid: int, body: TopUpIn, uid: int = Depends(user_id)):
     with session() as s:
@@ -393,7 +485,9 @@ def get_topup(tid: int, uid: int = Depends(user_id)):
 
 @router.post("/invoices")
 def save_invoice(body: InvoiceIn, inv_id: int | None = None, uid: int = Depends(user_id)):
-    if not body.awb.strip():
+    from .ai import find_mawb
+    body.awb = find_mawb(body.awb) or body.awb.strip()   # one spelling everywhere: 065-40538245
+    if not body.awb:
         body.awb = infer_mawb(body.farm)[0] or ""      # typed by hand without MAWB -> take it from the breakdown
     with session() as s:
         data = body.model_dump(exclude={"lines"})
@@ -426,6 +520,9 @@ def delete_invoice(inv_id: int, uid: int = Depends(user_id)):
 def save_logistics(body: LogisticsIn, log_id: int | None = None, view_topup: int | None = None,
                    uid: int = Depends(user_id)):
     with session() as s:
+        from .ai import find_mawb
+        body.awb = find_mawb(body.awb) or body.awb.strip()
+        body.leg = leg_of(body.provider, body.leg)      # Expolanka -> air, Floratrack -> msk
         data = body.model_dump(exclude={"farm_kg"})
         lg = s.get(Logistics, log_id) if log_id else Logistics(**data)
         if log_id:
