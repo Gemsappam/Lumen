@@ -154,7 +154,12 @@ def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result
             res.warnings.append(f"MAWB {awb}: внесено {tot:g} из {g['kg_total']:g} кг по разбивке {g['provider'] or 'перевозчика'} — "
                                 f"остальные плантации ещё без инвойсов")
             tot = g["kg_total"]
-        if attr == "weight_kg" and g["kg_bill"]:
+        # one farm, no breakdown and no kg on the invoice -> nothing to split by: it takes the whole AWB.
+        # If the operator typed the farm's kg (other farms' goods ride on the same AWB) -> ₽/kg × its kg.
+        single = len(invs) == 1 and not awb_kg.get(awb) and not g["kg_total"] and not invs[0].weight_kg
+        if single:
+            tot = sum(w) or 1        # whole AWB belongs to this one farm: it takes 100% of the freight
+        elif attr == "weight_kg" and g["kg_bill"]:
             # his rule: ₽ of the bill / kg of the bill = ₽ per kg; farm pays ₽/kg × its kg
             if g["kg_total"] and abs(g["kg_bill"] - g["kg_total"]) > 0.5:
                 res.warnings.append(f"MAWB {awb}: вес по счёту {g['provider'] or ''} {g['kg_bill']:g} кг, "
@@ -164,7 +169,14 @@ def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result
         for inv, wi in zip(invs, w):
             ls = lines_by_inv[inv.id]
             la, lw = _pick_basis(ls, ["weight_kg"])   # like the old sheet: equal per stem inside a farm
-            if la is None:
+            fixed = [l for l in ls if l.weight_kg]
+            if la is None and fixed and inv.weight_kg and inv.weight_kg > sum(l.weight_kg for l in fixed):
+                # some boxes have a known weight (Zeeflora spray = 25 kg box): they take their kg,
+                # the rest of the farm's kg is shared by the other lines per stem
+                rest_kg = inv.weight_kg - sum(l.weight_kg for l in fixed)
+                rest_st = sum(l.stems for l in ls if not l.weight_kg) or 1
+                lw = [l.weight_kg if l.weight_kg else rest_kg * l.stems / rest_st for l in ls]
+            elif la is None:
                 lw = [l.stems for l in ls]
             lt = sum(lw) or 1
             for l, x in zip(ls, lw):

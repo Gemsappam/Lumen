@@ -24,8 +24,9 @@ BOT = None  # set by main.py so export can send the file into the chat
 
 # ---------- auth: Telegram Mini App initData --------------------------------------------
 def user_id(x_init_data: str = Header(default="")) -> int:
+    from .roles import role_of, sys_ids
     if DEV_NO_AUTH:
-        return next(iter(ALLOWED_IDS), 0)
+        return (sys_ids() or [next(iter(ALLOWED_IDS), 0)])[0]
     if not x_init_data:
         print("[lumen] auth: пустой initData", flush=True)
         raise HTTPException(401, "Нет данных входа от Telegram. Открой приложение кнопкой «📒 Открыть учёт» "
@@ -42,9 +43,27 @@ def user_id(x_init_data: str = Header(default="")) -> int:
     if time.time() - int(pairs.get("auth_date", 0)) > 7 * 86400:
         raise HTTPException(401, "Вход устарел — закрой и открой приложение заново")
     uid = json.loads(pairs.get("user", "{}")).get("id")
-    if uid not in ALLOWED_IDS:
-        raise HTTPException(403, f"Твой ID {uid} не в ALLOWED_IDS — добавь его в .env и перезапусти")
+    if not role_of(uid):
+        raise HTTPException(403, f"Нет доступа (ID {uid}). Напиши боту /start — системный админ получит запрос и выдаст роль.")
     return uid
+
+
+def writer(uid: int = Depends(user_id)) -> int:
+    from .roles import can_write
+    if not can_write(role_of_(uid)):
+        raise HTTPException(403, "Роль «1С оператор» — только просмотр")
+    return uid
+
+
+def sysadmin(uid: int = Depends(user_id)) -> int:
+    if role_of_(uid) != "sys":
+        raise HTTPException(403, "Только для системного супер-админа")
+    return uid
+
+
+def role_of_(uid):
+    from .roles import role_of
+    return role_of(uid)
 
 
 # ---------- schemas -------------------------------------------------------------------
@@ -107,6 +126,7 @@ class FarmIn(BaseModel):
     aliases: str = ""
     is_forwarder: bool = False
     notes: str = ""
+    box_kg_json: str = "{}"
 
 
 # ---------- helpers ------------------------------------------------------------------
@@ -203,6 +223,49 @@ def leg_of(provider: str, fallback: str | None = None) -> str:
     return fallback or "air"
 
 
+def _apply_box_rules(body):
+    """Farm rule 'these items come in a 25 kg box' -> kg on those lines (shared box split by stems)."""
+    with session() as s:
+        keys = _farm_keys(s, body.farm)
+        rules = {}
+        for f in s.exec(select(Farm)).all():
+            if _norm_name(f.name) in keys:
+                rules = json.loads(f.box_kg_json or "{}")
+    if not rules:
+        return
+    def with_boxmates(first):
+        """Invoice convention: a mixed box shows its box count on the first line only;
+        the following lines with no box count are in that same box (Fire Works + Salinero)."""
+        out, on = [], False
+        for l in body.lines:
+            if l in first:
+                out.append(l); on = True
+            elif on and not l.boxes and l.stems:
+                out.append(l)
+            else:
+                on = False
+        return out
+
+    for item, kg in rules.items():
+        ni = _norm_name(item)
+        hit = [l for l in body.lines if l.stems and (ni in _norm_name(l.name) or _norm_name(l.name) in ni)]
+        hit = with_boxmates(hit)
+        if not hit or any(l.weight_kg for l in hit):
+            continue
+        rules[item] = (kg, hit)
+    groups = {}                     # lines of different rules with the same kg share boxes (one mixed box)
+    for item, v in rules.items():
+        if isinstance(v, tuple):
+            kg, hit = v
+            groups.setdefault(kg, []).extend(l for l in hit if l not in groups.get(kg, []))
+    for kg, hit in groups.items():
+        boxes = max(1.0, sum(l.boxes or 0 for l in hit))
+        total = boxes * kg
+        st = sum(l.stems for l in hit) or 1
+        for l in hit:
+            l.weight_kg = round(total * l.stems / st, 3)
+
+
 def split_by_farm(out: dict) -> list[dict]:
     """One trader invoice (NextWave) covering several farms -> one sub-invoice per farm."""
     lines = out.get("lines") or []
@@ -263,6 +326,10 @@ def book_document(out: dict, topup_id: int, usd, rub, uid: int):
     Returns (snapshot, what) or (None, reason)."""
     from datetime import date
     today = date.today().strftime("%d.%m.%Y")
+    if usd and not rub:
+        with session() as s:
+            rub = round(usd * rate_of(s.get(TopUp, topup_id)))   # ₽ not given: $ × top-up rate
+        out["_rub_auto"] = rub
     if out.get("doc_type") == "farm_invoice":
         lines = [LineIn(name=l["name"], boxes=l.get("boxes"), stems=l.get("stems") or 0,
                         weight_kg=l.get("weight_kg"), price_usd=l.get("price_usd") or 0)
@@ -290,6 +357,21 @@ def book_document(out: dict, topup_id: int, usd, rub, uid: int):
             return None, "нет MAWB"
         return save_logistics(body, None, topup_id, uid), "freight"
     return None, "этот тип документа сразу не вносится"
+
+
+TEXT_KG_RE = re.compile(r"([A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё .\-]{1,40}?)\s*[:\-–]?\s*(\d+(?:[.,]\d+)?)\s*(?:кг|kg)?(?=\s|$|[,;\n])", re.I)
+
+
+def breakdown_from_text(text: str):
+    """'706-52324005 Agriflora 45 Massai 57' (any layout) -> (mawb, [{farm, kg}])."""
+    from .ai import find_mawb, MAWB_RE
+    awb = find_mawb(text)
+    if not awb:
+        return None, []
+    rest = MAWB_RE.sub(" ", text)
+    pairs = [{"farm": n.strip(" -:"), "kg": float(k.replace(",", "."))} for n, k in TEXT_KG_RE.findall(rest)
+             if n.strip(" -:").lower() not in ("mawb", "awb", "авб")]
+    return awb, pairs
 
 
 def import_floratrack(data: bytes) -> dict:
@@ -412,6 +494,15 @@ def _store_weights(s, awb, farm_kg, source_file=None, replace=False):
     if source_file:
         row.source_file = source_file
     s.add(row)
+    from .ai import find_mawb
+    for inv in s.exec(select(Invoice).order_by(Invoice.id.desc())).all():
+        if not inv.awb and _kg_for(s, inv.farm, farm_kg):
+            taken = any(norm_awb(i.awb) == key and _norm_name(i.farm) == _norm_name(inv.farm)
+                        for i in s.exec(select(Invoice)).all())
+            if not taken:
+                inv.awb = find_mawb(awb) or awb
+                s.add(inv)
+    s.flush()
     _apply_farm_kg(s, awb, farm_kg)
 
 
@@ -451,12 +542,16 @@ def snapshot(s, topup_id):
     related = {norm_awb(i.awb) for i in invs if i.topup_id == topup_id}
     kg = _awb_kg(s)
     rpk = {k: g.get("rub_per_kg") for k, g in res.legs.items()}
-    out_log = [{**lg.model_dump(), "kg_total": kg.get(norm_awb(lg.awb), 0), "rub_per_kg": rpk.get((norm_awb(lg.awb), lg.leg))}
+    tdate = {x.id: x.date for x in tops}
+    goods = {}
+    for i in invs:
+        goods.setdefault(norm_awb(i.awb), set()).add(tdate.get(i.topup_id, "?"))
+    out_log = [{**lg.model_dump(), "kg_total": kg.get(norm_awb(lg.awb), 0), "rub_per_kg": rpk.get((norm_awb(lg.awb), lg.leg)),
+                "goods_topups": sorted(goods.get(norm_awb(lg.awb), set()))}
                for lg in logs if lg.topup_id == topup_id or norm_awb(lg.awb) in related]
     act = _settings().get("active_topup")
     return {"topup": {**t.model_dump(), "rate": rate_of(t), "active": t.id == act}, "invoices": out_inv, "logistics": out_log,
-            "usd_spent": round(res.usd_spent, 2), "rub_spent": round(res.rub_spent),
-            "usd_left": round(t.usd - res.usd_spent, 2), "warnings": res.warnings}
+            "warnings": res.warnings}
 
 
 def history(s):
@@ -482,14 +577,73 @@ def list_topups(uid: int = Depends(user_id)):
         out = []
         for t in sorted(tops, key=lambda x: x.id, reverse=True):
             spent = sum(i.usd_paid for i in invs if i.topup_id == t.id) + sum(l.usd or 0 for l in logs if l.topup_id == t.id)
-            out.append({**t.model_dump(), "rate": rate_of(t), "usd_left": round(t.usd - spent, 2),
+            out.append({**t.model_dump(), "rate": rate_of(t),
                         "active": bool(active) and t.id == active.id,
                         "n_invoices": sum(1 for i in invs if i.topup_id == t.id)})
         return out
 
 
+def money_of(tid: int) -> dict:
+    with session() as s:
+        tops, invs, lines, logs = _all(s)
+        t = s.get(TopUp, tid)
+        res = compute(tid, tops, invs, lines, logs, _awb_kg(s))
+        return {"usd_spent": round(res.usd_spent, 2), "usd_left": round(t.usd - res.usd_spent, 2)}
+
+
+@router.get("/money")
+def money(uid: int = Depends(sysadmin)):
+    """Остатки — только системному супер-админу."""
+    with session() as s:
+        ids = [t.id for t in s.exec(select(TopUp)).all()]
+    return {tid: money_of(tid) for tid in ids}
+
+
+@router.get("/me")
+def me(uid: int = Depends(user_id)):
+    from .roles import ROLE_NAMES, can_write, sees_money
+    r = role_of_(uid)
+    return {"id": uid, "role": r, "role_name": ROLE_NAMES.get(r, r), "can_write": can_write(r), "sees_money": sees_money(r)}
+
+
+class UserIn(BaseModel):
+    tg_id: int
+    name: str = ""
+    role: str
+
+
+@router.get("/users")
+def list_users(uid: int = Depends(sysadmin)):
+    from .roles import users
+    return users()
+
+
+@router.post("/users")
+def save_user(body: UserIn, uid: int = Depends(sysadmin)):
+    from .roles import set_role, users
+    try:
+        set_role(body.tg_id, body.role, body.name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    from .backup import mark_dirty
+    mark_dirty()
+    return users()
+
+
+@router.delete("/users/{tg}")
+def drop_user(tg: int, uid: int = Depends(sysadmin)):
+    from .roles import remove, users
+    try:
+        remove(tg)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    from .backup import mark_dirty
+    mark_dirty()
+    return users()
+
+
 @router.post("/topups")
-def create_topup(body: TopUpIn, uid: int = Depends(user_id)):
+def create_topup(body: TopUpIn, uid: int = Depends(writer)):
     with session() as s:
         t = TopUp(**body.model_dump())
         s.add(t); s.commit(); s.refresh(t)
@@ -498,13 +652,13 @@ def create_topup(body: TopUpIn, uid: int = Depends(user_id)):
 
 
 @router.post("/topups/{tid}/activate")
-def activate_topup(tid: int, uid: int = Depends(user_id)):
+def activate_topup(tid: int, uid: int = Depends(writer)):
     set_active_topup(tid)
     return {"ok": True}
 
 
 @router.delete("/topups/{tid}")
-def delete_topup(tid: int, uid: int = Depends(user_id)):
+def delete_topup(tid: int, uid: int = Depends(writer)):
     """Delete a top-up with everything booked into it (its invoices + lines, freight paid from it)."""
     with session() as s:
         for inv in s.exec(select(Invoice).where(Invoice.topup_id == tid)).all():
@@ -523,7 +677,7 @@ def delete_topup(tid: int, uid: int = Depends(user_id)):
 
 
 @router.put("/topups/{tid}")
-def update_topup(tid: int, body: TopUpIn, uid: int = Depends(user_id)):
+def update_topup(tid: int, body: TopUpIn, uid: int = Depends(writer)):
     with session() as s:
         t = s.get(TopUp, tid)
         for k, v in body.model_dump().items():
@@ -539,9 +693,13 @@ def get_topup(tid: int, uid: int = Depends(user_id)):
 
 
 @router.post("/invoices")
-def save_invoice(body: InvoiceIn, inv_id: int | None = None, uid: int = Depends(user_id)):
+def save_invoice(body: InvoiceIn, inv_id: int | None = None, uid: int = Depends(writer)):
     from .ai import find_mawb
     body.awb = find_mawb(body.awb) or body.awb.strip()   # one spelling everywhere: 065-40538245
+    _apply_box_rules(body)
+    prices = {round(l.price_usd, 4) for l in body.lines if l.stems}
+    if not inv_id and len(prices) == 1 and len(body.lines) > 1:
+        body.alloc_mode = "stems"    # one price for everything (hydrangeas): ₽ paid / stems
     if not body.awb:
         body.awb = infer_mawb(body.farm)[0] or ""      # typed by hand without MAWB -> take it from the breakdown
     with session() as s:
@@ -561,7 +719,7 @@ def save_invoice(body: InvoiceIn, inv_id: int | None = None, uid: int = Depends(
 
 
 @router.delete("/invoices/{inv_id}")
-def delete_invoice(inv_id: int, uid: int = Depends(user_id)):
+def delete_invoice(inv_id: int, uid: int = Depends(writer)):
     with session() as s:
         inv = s.get(Invoice, inv_id)
         for l in s.exec(select(Line).where(Line.invoice_id == inv_id)).all():
@@ -573,7 +731,7 @@ def delete_invoice(inv_id: int, uid: int = Depends(user_id)):
 
 @router.post("/logistics")
 def save_logistics(body: LogisticsIn, log_id: int | None = None, view_topup: int | None = None,
-                   uid: int = Depends(user_id)):
+                   uid: int = Depends(writer)):
     with session() as s:
         from .ai import find_mawb
         body.awb = find_mawb(body.awb) or body.awb.strip()
@@ -590,7 +748,7 @@ def save_logistics(body: LogisticsIn, log_id: int | None = None, view_topup: int
 
 
 @router.delete("/logistics/{log_id}")
-def delete_logistics(log_id: int, view_topup: int, uid: int = Depends(user_id)):
+def delete_logistics(log_id: int, view_topup: int, uid: int = Depends(writer)):
     with session() as s:
         s.delete(s.get(Logistics, log_id)); s.commit()
         return snapshot(s, view_topup)
@@ -646,7 +804,7 @@ def get_weights(awb: str, uid: int = Depends(user_id)):
 
 
 @router.post("/weights")
-def save_weights(body: WeightsIn, uid: int = Depends(user_id)):
+def save_weights(body: WeightsIn, uid: int = Depends(writer)):
     with session() as s:
         _store_weights(s, body.awb, body.farm_kg, body.source_file)
         s.commit()
@@ -660,7 +818,7 @@ def farms(uid: int = Depends(user_id)):
 
 
 @router.post("/farms")
-def save_farm(body: FarmIn, farm_id: int | None = None, uid: int = Depends(user_id)):
+def save_farm(body: FarmIn, farm_id: int | None = None, uid: int = Depends(writer)):
     with session() as s:
         f = s.get(Farm, farm_id) if farm_id else Farm(**body.model_dump())
         if farm_id:
@@ -671,7 +829,7 @@ def save_farm(body: FarmIn, farm_id: int | None = None, uid: int = Depends(user_
 
 
 @router.post("/parse")
-async def parse(file: UploadFile = File(...), uid: int = Depends(user_id)):
+async def parse(file: UploadFile = File(...), uid: int = Depends(writer)):
     data = await file.read()
     mime = file.content_type or "application/pdf"
     if mime not in ("application/pdf", "image/jpeg", "image/png", "image/webp"):
@@ -688,7 +846,7 @@ async def parse(file: UploadFile = File(...), uid: int = Depends(user_id)):
 
 
 @router.post("/topups/{tid}/audit")
-async def audit(tid: int, uid: int = Depends(user_id)):
+async def audit(tid: int, uid: int = Depends(writer)):
     with session() as s:
         snap, hist = snapshot(s, tid), history(s)
     return await ai.audit_topup(snap, hist)
@@ -715,6 +873,51 @@ async def export(tid: int, uid: int = Depends(user_id)):
         except Exception as e:
             print(f"[lumen] backup after export failed: {e}", flush=True)
     return {"ok": True, "sheet": name}
+
+
+def awb_spread(awb: str) -> list[dict]:
+    """Farms on this MAWB (any top-up) and their logistics per stem after the latest freight."""
+    k = norm_awb(awb)
+    with session() as s:
+        tops, invs, lines, logs = _all(s)
+        kg = _awb_kg(s)
+        tmap = {t.id: t for t in tops}
+        out = []
+        for tid in sorted({i.topup_id for i in invs if norm_awb(i.awb) == k}):
+            res = compute(tid, tops, invs, lines, logs, kg)
+            for i in invs:
+                if i.topup_id == tid and norm_awb(i.awb) == k:
+                    ls = [l for l in lines if l.invoice_id == i.id]
+                    st = sum(l.stems for l in ls) or 1
+                    out.append({"farm": i.farm, "topup_id": tid, "topup": tmap[tid].date, "stems": st,
+                                "air": sum(res.lines[l.id].air_rub_stem * l.stems for l in ls) / st,
+                                "msk": sum(res.lines[l.id].msk_rub_stem * l.stems for l in ls) / st})
+        return out
+
+
+async def export_topups(ids: list[int], uid: int, caption: str):
+    """Rebuild the sheets of several top-ups in the master file and send it once."""
+    from aiogram.types import FSInputFile
+    names = []
+    with session() as s:
+        tops, invs, lines, logs = _all(s)
+        kg = _awb_kg(s)
+        tmp = DATA_DIR / "export_multi.xlsx"
+        if MASTER_XLSX.exists():
+            shutil.copy(MASTER_XLSX, tmp)
+        for tid in ids:
+            t = s.get(TopUp, tid)
+            if not t:
+                continue
+            name, _ = excel.build(tmp, t, tops, invs, lines, logs, awb_kg=kg)
+            names.append(name)
+            s.add(t)
+        s.commit()
+        shutil.copy(tmp, MASTER_XLSX)
+    if BOT and names:
+        await BOT.send_document(uid, FSInputFile(MASTER_XLSX, filename="учет.xlsx"),
+                                caption=caption + "\nОбновлены листы: " + ", ".join(f"«{n}»" for n in names))
+    return names
 
 
 # ---------- drafts: invoices sent straight into the bot chat, waiting for the operator ----
@@ -790,6 +993,6 @@ def list_drafts(uid: int = Depends(user_id)):
 
 
 @router.delete("/drafts/{did}")
-def drop_draft(did: str, uid: int = Depends(user_id)):
+def drop_draft(did: str, uid: int = Depends(writer)):
     (DRAFTS / f"{did}.json").unlink(missing_ok=True)
     return {"ok": True}

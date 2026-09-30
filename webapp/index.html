@@ -69,6 +69,8 @@ form{margin:0}
 .empty{padding:22px 16px;text-align:center;color:var(--muted)}
 .hint{font-size:12px;color:var(--muted);margin:6px 16px 0}
 .x{color:var(--err);background:none;padding:4px 8px}
+.ro #save,.ro #del,.ro .x,.ro .drop,.ro #addLine,.ro #new,.ro #addInv,.ro #addLog,.ro #addRow,.ro #edit,.ro #delTop,.ro #act,.ro #audit,.ro #drafts{display:none!important}
+.ro input,.ro select,.ro textarea{pointer-events:none;opacity:.85}
 #toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom,0));transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:10px 16px;border-radius:12px;font-size:14px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:90%}
 #toast.on{opacity:1}
 @media (prefers-reduced-motion:reduce){#toast{transition:none}}
@@ -105,17 +107,20 @@ async function render(view,args){
   try{ await VIEWS[view](args) }catch(e){ $app.innerHTML=`<div class="empty">Не загрузилось: ${esc(e.message)}</div>` }
 }
 
-let FARMS=[];
+let FARMS=[], ME=null, MONEY={};
+async function whoami(){ if(!ME){ ME=await api('/me'); document.body.classList.toggle('ro',!ME.can_write) }
+  if(ME.sees_money){ try{MONEY=await api('/money')}catch(e){} } }
 const VIEWS = {
 
 // ======================= HOME =======================
 async home(){
-  const [tops, drafts] = await Promise.all([api('/topups'), api('/drafts')]);
+  await whoami();
+  const [tops, drafts] = await Promise.all([api('/topups'), ME.can_write?api('/drafts'):Promise.resolve([])]);
   FARMS = FARMS.length ? FARMS : await api('/farms');
   $app.innerHTML = `
     <h1>Учёт поставок</h1>
     <p class="sub">Пополнение → инвойсы плантаций → логистика → Excel</p>
-    ${drafts.length?`<h2>Черновики из чата</h2><div class="group">${drafts.map(d=>`
+    ${drafts.length?`<h2 id="drafts">Черновики из чата</h2><div class="group">${drafts.map(d=>`
       <div class="row" data-draft="${d.id}"><div class="grow"><div class="t">${esc(d.doc_type==='kg_breakdown'?'Разбивка кг':d.doc_type==='freight_invoice'?'Фрахт · '+(d.freight?.provider||d.farm||''):(d.farm||'Документ'))}</div>
       <div class="s">MAWB ${esc(d.awb||'?')} · ${d.doc_type==='kg_breakdown'?fmt((d.per_farm_kg||[]).reduce((a,x)=>a+(x.kg||0),0))+' кг':d.doc_type==='freight_invoice'?(d.freight?.total_usd?'$'+fmt(d.freight.total_usd,2):d.freight?.total_rub?fmt(d.freight.total_rub)+' ₽':'сумма?')+(d.kg_total?' · разбивка '+fmt(d.kg_total)+' кг ✓':' · разбивки кг нет'):fmt((d.lines||[]).reduce((a,l)=>a+(l.stems||0),0))+' стеблей · $'+fmt(d.invoice_total_usd,2)}</div></div>
       <span class="pill">разобрать</span></div>`).join('')}</div>`:''}
@@ -123,9 +128,11 @@ async home(){
     <div class="group">${tops.length?tops.map(t=>`
       <div class="row" data-top="${t.id}"><div class="grow"><div class="t">${esc(t.date)}${t.active?' <span class="pill">сюда идут документы</span>':''}</div>
       <div class="s num">${fmt(t.rub)} ₽ → $${fmt(t.usd)} · курс ${fmt(t.rate,4)}</div></div>
-      <div class="v"><div class="num">$${fmt(t.usd_left,2)}</div><div class="s">остаток</div></div></div>`).join('')
+      ${ME.sees_money&&MONEY[t.id]?`<div class="v"><div class="num">$${fmt(MONEY[t.id].usd_left,2)}</div><div class="s">остаток</div></div>`:''}</div>`).join('')
       :'<div class="empty">Пополнений пока нет. Начни с первого.</div>'}</div>
-    <div class="actions"><button class="primary" id="new">Новое пополнение</button><button id="farms">Плантации</button></div>`;
+    <div class="actions"><button class="primary" id="new">Новое пополнение</button><button id="farms">Плантации</button></div>
+    ${ME.role==='sys'?'<div class="actions"><button id="users">Пользователи и роли</button></div>':''}
+    <p class="hint" style="margin:8px 16px">Роль: ${esc(ME.role_name)}</p>`;
   $app.querySelectorAll('[data-top]').forEach(e=>e.onclick=()=>go('topup',{id:+e.dataset.top}));
   $app.querySelectorAll('[data-draft]').forEach(e=>e.onclick=()=>{const d=drafts.find(x=>x.id===e.dataset.draft);
     if(d.doc_type==='kg_breakdown'){d._draftId=d.id;return go('weights',{t:null,draft:d})}   // weights don't belong to a top-up
@@ -134,6 +141,7 @@ async home(){
     go('draft',{d,tops})});
   document.getElementById('new').onclick=()=>go('topupForm',{});
   document.getElementById('farms').onclick=()=>go('farms');
+  document.getElementById('users')?.addEventListener('click',()=>go('users'));
 },
 
 // ======================= TOP-UP FORM =======================
@@ -163,6 +171,7 @@ async topupForm({t}){
 
 // ======================= TOP-UP DETAIL =======================
 async topup({id, snap}){
+  await whoami();
   const d = snap || await api('/topups/'+id); const t=d.topup;
   const byAwb={}; d.invoices.forEach(i=>(byAwb[i.awb||'без MAWB']??=[]).push(i));
   $app.innerHTML=`
@@ -171,7 +180,7 @@ async topup({id, snap}){
     <div><div class="lbl">Отправили</div><div class="big">${fmt(t.rub)} ₽</div></div>
     <div class="arrow">→</div>
     <div><div class="lbl">Зачислено</div><div class="big">$${fmt(t.usd)}</div></div>
-    <div class="foot"><span>Курс ${fmt(t.rate,4)}</span><span>Потрачено $${fmt(d.usd_spent,2)}</span><span>Остаток $${fmt(d.usd_left,2)}</span></div>
+    <div class="foot"><span>Курс ${fmt(t.rate,4)}</span>${ME.sees_money&&MONEY[t.id]?`<span>Потрачено $${fmt(MONEY[t.id].usd_spent,2)}</span><span>Остаток $${fmt(MONEY[t.id].usd_left,2)}</span>`:''}</div>
   </div>
   <div class="actions"><button id="audit">AI-проверка</button><button class="primary" id="xls">Excel в чат</button></div>
   <div id="auditbox"></div>
@@ -187,7 +196,7 @@ async topup({id, snap}){
   <h2>Логистика по MAWB этого пополнения</h2>
   <div class="group">${d.logistics.length?d.logistics.map(l=>`
     <div class="row" data-log="${l.id}"><div class="grow"><div class="t">${esc(l.provider||'Фрахт')} · ${l.leg==='air'?'Кения → Амстердам':'Floratrack'}${l.rub_per_kg?' · '+fmt(l.rub_per_kg,2)+' ₽/кг':''}</div>
-    <div class="s">MAWB ${esc(l.awb)} · ${l.kg_total?fmt(l.kg_total)+' кг ✓':'<span style="color:var(--warn)">нет разбивки кг</span>'}${l.topup_id!==t.id?' · другое пополнение':''}</div></div>
+    <div class="s">MAWB ${esc(l.awb)} · ${l.kg_total?fmt(l.kg_total)+' кг ✓':'<span style="color:var(--warn)">нет разбивки кг</span>'}${l.topup_id!==t.id?' · оплачено не отсюда':''}${(l.goods_topups||[]).some(d=>d!==t.date)?' · товар из '+l.goods_topups.filter(d=>d!==t.date).join(', '):''}</div></div>
     <div class="v">${l.usd?'$'+fmt(l.usd,2):''}${l.rub?'<div class="s">'+fmt(l.rub)+' ₽</div>':''}</div></div>`).join('')
     :'<div class="empty">Фрахт ещё не внесён — себестоимость пока без логистики.</div>'}</div>
   <div class="actions"><button id="addLog">Добавить логистику</button></div>
@@ -417,11 +426,32 @@ async draft({d,tops}){
   $app.innerHTML=`<h1>${esc(d.farm||d.freight?.provider||'Черновик')}</h1>
   <p class="sub">${d.doc_type==='farm_invoice'?'Инвойс плантации':d.doc_type==='kg_breakdown'?'Разбивка кг по плантациям':'Счёт за логистику'} · MAWB ${esc(d.awb||'?')}. Из какого пополнения оплачен?</p>
   ${d.warnings?.length?`<div class="warn">${d.warnings.map(w=>`<div>${esc(w)}</div>`).join('')}</div>`:''}
-  <div class="group" style="margin-top:12px">${tops.map(t=>`<div class="row" data-t="${t.id}"><div class="grow"><div class="t">${esc(t.date)}</div><div class="s num">остаток $${fmt(t.usd_left,2)}</div></div></div>`).join('')||'<div class="empty">Сначала создай пополнение.</div>'}</div>
+  <div class="group" style="margin-top:12px">${tops.map(t=>`<div class="row" data-t="${t.id}"><div class="grow"><div class="t">${esc(t.date)}</div><div class="s num">$${fmt(t.usd,2)}</div></div></div>`).join('')||'<div class="empty">Сначала создай пополнение.</div>'}</div>
   <div class="actions"><button class="x" id="drop">Выбросить черновик</button></div>`;
   $app.querySelectorAll('[data-t]').forEach(e=>e.onclick=()=>{const t=tops.find(x=>x.id==e.dataset.t); d._draftId=d.id;
     stack.pop(); go(d.doc_type==='farm_invoice'?'invoice':d.doc_type==='kg_breakdown'?'weights':'logistics',{t,draft:d})});
   document.getElementById('drop').onclick=async()=>{await api('/drafts/'+d.id,{method:'DELETE'});back()};
+},
+
+// ======================= USERS (system super-admin) =======================
+async users(){
+  const list=await api('/users');
+  const R={sys:'Системный супер-админ',super:'Супер-админ',viewer:'1С оператор'};
+  const sel=(v,n)=>`<select data-role="${n}">${Object.entries(R).map(([k,t])=>`<option value="${k}" ${k===v?'selected':''}>${t}</option>`).join('')}</select>`;
+  $app.innerHTML=`<h1>Пользователи</h1>
+  <p class="sub">Системный супер-админ видит остатки и назначает роли. Супер-админ — всё, кроме остатков. 1С оператор — только смотрит и скачивает Excel.
+  Новый человек пишет боту /start — тебе придёт запрос с кнопками.</p>
+  <div class="group">${list.map(u=>`<div class="row"><div class="grow"><div class="t">${esc(u.name||'—')}</div><div class="s num">ID ${u.tg_id}</div></div>
+    ${sel(u.role,u.tg_id)}<button class="x" data-rm="${u.tg_id}">×</button></div>`).join('')}</div>
+  <h2>Добавить вручную</h2>
+  <form id="f" class="group"><div class="two"><div class="field"><label>Telegram ID</label><input name="id" inputmode="numeric"></div>
+  <div class="field"><label>Имя</label><input name="name"></div></div>
+  <div class="field"><label>Роль</label>${sel('viewer','new').replace('data-role="new"','name="role"')}</div></form>
+  <div class="actions"><button class="primary" id="add">Добавить</button></div>`;
+  const save=async(id,role,name='')=>{try{await api('/users',{method:'POST',body:{tg_id:+id,role,name}});toast('Сохранено')}catch(e){toast(e.message)} render('users',{})};
+  $app.querySelectorAll('select[data-role]').forEach(x=>x.onchange=()=>save(x.dataset.role,x.value,(list.find(u=>u.tg_id==x.dataset.role)||{}).name));
+  $app.querySelectorAll('[data-rm]').forEach(x=>x.onclick=async()=>{if(!confirm('Убрать доступ?'))return;try{await api('/users/'+x.dataset.rm,{method:'DELETE'})}catch(e){toast(e.message)} render('users',{})});
+  document.getElementById('add').onclick=()=>{const f=document.getElementById('f');if(!numOrNull(f.id.value))return toast('Нужен ID');save(f.id.value,f.role.value,f.name.value.trim())};
 },
 
 // ======================= FARMS =======================
@@ -441,10 +471,12 @@ async farm({f}){
     <div class="field"><label>Страна</label><select name="country">${['Кения','Эквадор','Колумбия'].map(c=>`<option ${c===f.country?'selected':''}>${c}</option>`).join('')}</select></div>
     <div class="field"><label>Как ещё пишется в инвойсах (через запятую)</label><input name="aliases" value="${esc(f.aliases)}"></div>
     <div class="field"><label>Это перевозчик / консолидатор</label><select name="fw"><option value="0">нет</option><option value="1" ${f.is_forwarder?'selected':''}>да</option></select></div>
-    <div class="field"><label>Нюансы для AI</label><textarea name="notes" rows="4">${esc(f.notes)}</textarea></div></form>
+    <div class="field"><label>Нюансы для AI</label><textarea name="notes" rows="4">${esc(f.notes)}</textarea></div>
+    <div class="field"><label>Фиксированный вес коробки: «номенклатура = кг», по строке</label><textarea name="boxkg" rows="3" placeholder="Spray Rose Reflex Bicolour 60cm = 25">${esc(Object.entries(JSON.parse(f.box_kg_json||'{}')).map(([k,v])=>k+' = '+v).join('\n'))}</textarea></div></form>
   <div class="actions"><button class="primary" id="save">Сохранить</button></div>`;
   const F=document.getElementById('f');
-  document.getElementById('save').onclick=async()=>{await api('/farms'+(f.id?'?farm_id='+f.id:''),{method:'POST',body:{name:F.name.value.trim(),country:F.country.value,aliases:F.aliases.value,is_forwarder:F.fw.value==='1',notes:F.notes.value}});FARMS=[];toast('Сохранено');back()};
+  document.getElementById('save').onclick=async()=>{await api('/farms'+(f.id?'?farm_id='+f.id:''),{method:'POST',body:{name:F.name.value.trim(),country:F.country.value,aliases:F.aliases.value,is_forwarder:F.fw.value==='1',notes:F.notes.value,
+    box_kg_json:JSON.stringify(Object.fromEntries(F.boxkg.value.split('\n').map(x=>x.split('=')).filter(x=>x.length===2&&x[0].trim()&&numOrNull(x[1])).map(x=>[x[0].trim(),numOrNull(x[1])])))}});FARMS=[];toast('Сохранено');back()};
 },
 };
 

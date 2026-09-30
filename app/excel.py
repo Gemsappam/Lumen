@@ -47,7 +47,7 @@ def _topups_row(wb, topup):
     """Row of this top-up in 'Пополнения' (created if missing). Returns row number."""
     if "Пополнения" not in wb.sheetnames:
         ws = wb.create_sheet("Пополнения")
-        for c, h in enumerate(["Дата пополнения", "Сумма в Руб (пополнение)", "Предыдущий остаток руб",
+        for c, h in enumerate(["Дата пополнения", "Сумма в Руб (пополнение)", "",
                                "Сумма в $ (пополнение)", "Курс"], 1):
             ws.cell(1, c, h).font = BOLD
     ws = wb["Пополнения"]
@@ -63,8 +63,6 @@ def _topups_row(wb, topup):
             row -= 1
     ws.cell(row, 1, topup.date)
     ws.cell(row, 2, topup.rub).font = BLUE
-    if topup.prev_balance_rub is not None:
-        ws.cell(row, 3, topup.prev_balance_rub).font = BLUE
     ws.cell(row, 4, topup.usd).font = BLUE
     ws.cell(row, 5, f"=B{row}/D{row}")
     return row
@@ -95,12 +93,9 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
         cell.font, cell.fill, cell.alignment, cell.border = BOLD, HFILL, CENTER, BOX
     ws.row_dimensions[1].height = 45
     ws["A2"], ws["B2"] = "Курс пополнения", f"='Пополнения'!E{trow}"
-    ws["C2"], ws["D2"] = "Пополнено $", f"='Пополнения'!D{trow}"
-    ws["E2"] = "Остаток $"
     ws["B2"].number_format = "0.0000"
-    for c in "ACE":
-        ws[f"{c}2"].font = BOLD
-    ws["B2"].font = ws["D2"].font = Font(name=F, color="008000")
+    ws["A2"].font = BOLD
+    ws["B2"].font = Font(name=F, color="008000")
 
     own_invs = [i for i in invoices if i.topup_id == topup.id]
     lines_by = defaultdict(list)
@@ -214,10 +209,7 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
         ws.cell(rr, 5).number_format = USD
         ws.cell(rr, 6).number_format = RUB0
 
-    spent = "+".join(usd_cells + log_usd_cells) or "0"
-    ws["F2"] = f"=D2-({spent})"
-    ws["F2"].number_format = USD
-    ws["F2"].font = BOLD
+    # balance ("Остаток") intentionally not written: only the system super-admin sees it, in the app
 
     # warnings
     wr = leg_start + len(leg_row) + 3

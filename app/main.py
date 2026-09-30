@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sys
 import socket
@@ -40,8 +41,16 @@ FARM_ALIASES = {"Agriflora": "SIAN FLOWERS-AGRIFLORA,SIAN FLOWERS -AGRIFLORA,А�
                 "Massai": "SIAN FLOWERS-MAASAI,Maasai,Массай,Масаи"}
 
 
+BOX_RULES = {"Zeeflora": {"Spray Rose Reflex Bicolour 60cm": 25, "Spray Rose Fire Works Bi-Pink 60cm": 25}}
+
+
 def upsert_forwarders():
     with session() as s:
+        for name, rules in BOX_RULES.items():
+            f = s.exec(select(Farm).where(Farm.name == name)).first()
+            if f and (f.box_kg_json or "{}") == "{}":
+                f.box_kg_json = json.dumps(rules, ensure_ascii=False)
+                s.add(f)
         for name, al in FARM_ALIASES.items():
             f = s.exec(select(Farm).where(Farm.name == name)).first()
             if f and al.split(",")[0] not in (f.aliases or ""):
@@ -101,6 +110,8 @@ async def lifespan(app):
 
     init_db()
     seed()
+    from . import roles
+    roles.seed()
 
     tasks = []
     opened = []

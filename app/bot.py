@@ -10,7 +10,7 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMa
 from sqlmodel import select
 
 from . import ai
-from .api import (DRAFTS, active_topup, book_document, import_floratrack, payments_for, split_by_farm, fill_mawb, money_from_text, save_draft,
+from .api import (DRAFTS, money_of, active_topup, awb_spread, breakdown_from_text, export_topups, book_document, import_floratrack, payments_for, split_by_farm, fill_mawb, money_from_text, save_draft,
                   set_active_topup, store_breakdown, topup_from_text)
 from .config import ALLOWED_IDS, BOT_TOKEN, DATA_DIR, MASTER_XLSX, WEBAPP_URL
 from .models import Farm, Line, session
@@ -18,7 +18,10 @@ from .models import Farm, Line, session
 LAST_DRAFT: dict[int, tuple[list, float]] = {}   # user -> ([draft ids], time)
 bot = Bot(BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
-ops = F.from_user.id.in_(ALLOWED_IDS)
+from . import roles
+ops = F.from_user.id.func(lambda i: roles.role_of(i) is not None)          # any registered user
+wr = F.from_user.id.func(lambda i: roles.can_write(roles.role_of(i)))       # sys + super
+sysf = F.from_user.id.func(lambda i: roles.role_of(i) == "sys")
 
 # Only INLINE buttons and the menu button pass initData (login) to the Mini App.
 # Reply-keyboard buttons open it without initData -> "bad initData".
@@ -47,6 +50,12 @@ async def on_error(event):
 
 @dp.message(CommandStart(), ops)
 async def start(m: Message):
+    r = roles.role_of(m.from_user.id)
+    if not roles.can_write(r):
+        await m.answer("Учёт поставок Люмен · роль «1С оператор» (просмотр).\n"
+                       "• «Учёт» — смотреть пополнения, инвойсы, себестоимость.\n• /excel — прислать актуальный Excel.",
+                       reply_markup=KB if WEBAPP_URL.startswith("https://") else None)
+        return
     kb = KB if WEBAPP_URL.startswith("https://") else None
     await m.answer("Обновил кнопки 👇", reply_markup=ReplyKeyboardRemove())   # remove the old reply keyboard
     await m.answer("Учёт поставок Люмен.\n\n"
@@ -61,7 +70,7 @@ async def start(m: Message):
                    reply_markup=kb)
 
 
-@dp.message(ops, F.document.file_name.lower().endswith(".xlsx"))
+@dp.message(wr, F.document.file_name.lower().endswith(".xlsx"))
 async def master(m: Message):
     f = await bot.download(m.document)
     data = f.read()
@@ -96,7 +105,8 @@ async def _floratrack(m: Message, data: bytes):
     lines = [f"• {awb} · {kinds[c.kind]} · {c.kg:g} кг · ${c.usd:,.2f} × {c.rate:.2f} = {fmt(c.rub)} ₽"
              + (" (курс предв.)" if c.provisional else "") for awb, c in recent]
     txt = (f"🚚 Floratrack: привязано {len(r['matched'])} AWB (новых {r['added']}, обновлено {r['updated']}).\n"
-           f"Баланс у Floratrack: ${r['balance_usd']:,.2f}\n\n" + "\n".join(lines))
+           + (f"Баланс у Floratrack: ${r['balance_usd']:,.2f}\n" if roles.sees_money(roles.role_of(m.from_user.id)) else "")
+           + "\n" + "\n".join(lines))
     fresh = [c for c in r["unmatched"] if c.date and (datetime.now() - c.date).days <= 21]
     if fresh:
         txt += "\n\nНет наших инвойсов/разбивки с этими AWB (последние 3 недели):\n" + "\n".join(
@@ -104,10 +114,13 @@ async def _floratrack(m: Message, data: bytes):
         txt += "\nВнеси их и перекинь отчёт — привяжутся."
     if r["ambiguous"]:
         txt += "\n\n⚠️ Несколько MAWB с такими 4 цифрами, взял по весу: " + ", ".join(r["ambiguous"][:10])
+    affected = sorted({x["topup_id"] for awb, _c in r["matched"] for x in awb_spread(awb)})
     warn = [w for w in r["warnings"] if "MAWB" in w][:8]
     if warn:
         txt += "\n\n⚠️ " + "\n⚠️ ".join(warn)
     await note.edit_text(txt[:4000])
+    if affected:
+        await export_topups(affected, m.from_user.id, "🚚 Floratrack разнесён по пополнениям, где лежит этот товар.")
 
 
 async def _parse_and_reply(m: Message, data: bytes, mime: str):
@@ -182,21 +195,36 @@ async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dic
     await _book_or_draft(m, note, out, t, usd, rub)
 
 
+_AUTO_EXPORT: set = set()
+
+
+async def _flush_export(uid: int, caption: str):
+    """Freight paid from a new top-up for goods from an older one -> resend both sheets."""
+    if _AUTO_EXPORT:
+        ids = sorted(_AUTO_EXPORT)
+        _AUTO_EXPORT.clear()
+        try:
+            await export_topups(ids, uid, caption)
+        except Exception as e:
+            await bot.send_message(uid, f"Не смог обновить Excel: {e}")
+
+
 async def _book_or_draft(m: Message, note, out: dict, t, usd, rub):
     """Both sums known -> straight into the top-up. Otherwise a draft waiting for '1198$ 105472₽'."""
     warn = ("\n⚠️ " + "\n⚠️ ".join(out["warnings"])) if out.get("warnings") else ""
     head = _doc_head(out)
-    if usd and rub:
+    if usd:
         snap, kind = book_document(out, t.id, usd, rub, m.from_user.id)
         if snap:
-            await note.edit_text(head + warn + "\n\n" + _booked_text(snap, out, kind, t))
+            await note.edit_text(head + warn + "\n\n" + _booked_text(snap, out, kind, t, m.from_user.id))
+            await _flush_export(m.from_user.id, "📊 Логистика легла на товар из прошлого пополнения.")
             return
         warn += f"\n⚠️ Не внёс сразу: {kind}"
     did = save_draft(out)
     LAST_DRAFT[m.from_user.id] = ([did], time.time())
-    need = "₽" if usd else "$ и ₽"
-    await _edit(note, head + warn + f"\n\n→ пополнение {t.date}. Ответь суммой оплаты ({need}), например "
-                      f"`{usd or 1198:g}$ 105472₽` — внесу сразу. Или «Учёт» → Черновики.")
+    await _edit(note, head + warn + f"\n\n→ пополнение {t.date}. Ответь суммой оплаты в $, например "
+                      f"`{round(out.get('invoice_total_usd') or 1000)}$` — ₽ посчитаю по курсу пополнения "
+                      f"({t.rub / t.usd:.2f}). Если списали иначе — добавь ₽: `1115$ 98000₽`.")
 
 
 async def _book_or_draft_multi(m: Message, note, subs: list, t):
@@ -210,17 +238,17 @@ async def _book_or_draft_multi(m: Message, note, subs: list, t):
     pays = payments_for(m.caption or "", subs)
     res, left = [], []
     for d, pr in zip(subs, pays or [None] * len(subs)):
-        if pr and pr[0] and pr[1]:
+        if pr and pr[0]:
             snap, kind = book_document(d, t.id, pr[0], pr[1], m.from_user.id)
             if snap:
-                res.append(f"{d['farm']}: " + _booked_text(snap, d, kind, t).split("\n")[0].replace("✅ ", "✅ "))
+                res.append(f"{d['farm']}: " + _booked_text(snap, d, kind, t, m.from_user.id).split("\n")[0].replace("✅ ", "✅ "))
                 continue
         left.append(d)
     if left:
         ids = [save_draft(d) for d in left]
         LAST_DRAFT[m.from_user.id] = (ids, time.time())
-        ex = "\n".join(f"{d['farm']} {round(d['invoice_total_usd'])}$ …₽" for d in left)
-        res.append("Ответь оплатой по каждой плантации, по строке на каждую:\n`" + ex + "`\n"
+        ex = "\n".join(f"{d['farm']} {round(d['invoice_total_usd'])}$" for d in left)
+        res.append("Ответь оплатой в $ по каждой плантации, по строке на каждую (₽ посчитаю по курсу пополнения):\n`" + ex + "`\n"
                    "Одна сумма на всех — разделю пропорционально инвойсу.")
     await _edit(note, head + "\n\n" + "\n".join(res))
 
@@ -243,7 +271,7 @@ def _doc_head(out: dict) -> str:
             + (f"\n🔗 {out['mawb_note']}" if out.get("mawb_note") else ""))
 
 
-def _booked_text(snap: dict, out: dict, kind: str, t) -> str:
+def _booked_text(snap: dict, out: dict, kind: str, t, uid: int | None = None) -> str:
     fmt = lambda x: f"{x:,.0f}".replace(",", " ")
     if kind == "freight":
         lg = max((l for l in snap["logistics"] if l["topup_id"] == t.id), key=lambda l: l["id"])
@@ -251,16 +279,30 @@ def _booked_text(snap: dict, out: dict, kind: str, t) -> str:
                + (f" · {lg['weight_kg']:g} кг по счёту" if lg.get("weight_kg") else "")
                + (f" · {lg['rub_per_kg']:.2f} ₽/кг" if lg.get("rub_per_kg") else "")
                + (f" · разбивка {lg['kg_total']:g} кг ✓" if lg.get("kg_total") else " · разбивки кг ещё нет"))
+        spread = awb_spread(lg["awb"])
+        if spread:
+            col = "air" if lg["leg"] == "air" else "msk"
+            txt += "\nЛегло на:\n" + "\n".join(
+                f"• {x['farm']} (пополнение {x['topup']}): {x[col]:.2f} ₽/ст" for x in spread)
+            other = sorted({x["topup"] for x in spread if x["topup_id"] != t.id})
+            if other:
+                txt += f"\n↪️ Товар оплачен из другого пополнения ({', '.join(other)}) — его себестоимость обновлена, Excel пришлю."
+                _AUTO_EXPORT.add(t.id)
+                _AUTO_EXPORT.update(x["topup_id"] for x in spread)
     else:
         inv = max(snap["invoices"], key=lambda i: i["id"])
         st = sum(l["stems"] for l in inv["lines"]) or 1
         flower = sum(l["price_rub"] * l["stems"] for l in inv["lines"]) / st
         logi = sum((l["air_rub"] + l["msk_rub"]) * l["stems"] for l in inv["lines"]) / st
-        txt = (f"✅ Внесено в пополнение {t.date}: ${inv['usd_paid']:g} / {fmt(inv['rub_paid'])} ₽\n"
+        txt = (f"✅ Внесено в пополнение {t.date}: ${inv['usd_paid']:g} / {fmt(inv['rub_paid'])} ₽"
+               + (f" (по курсу {t.rub / t.usd:.2f})" if out.get("_rub_auto") else "") + "\n"
                f"Себестоимость в среднем {flower + logi:.2f} ₽/стебель (цветок {flower:.2f} + логистика {logi:.2f})")
     rel = [w for w in snap["warnings"] if (out.get("farm") or "~").lower()[:5] in w.lower()
            or (out.get("awb") or "~").replace("-", "")[:6] in w.replace("-", "")]
-    return txt + ("\n⚠️ " + "\n⚠️ ".join(rel) if rel else "") + f"\nОстаток пополнения ${snap['usd_left']:g}"
+    txt += ("\n⚠️ " + "\n⚠️ ".join(rel) if rel else "")
+    if uid and roles.sees_money(roles.role_of(uid)):
+        txt += f"\nОстаток пополнения ${money_of(t.id)['usd_left']:g}"
+    return txt
 
 
 def _register_topup(tp: dict, caption: str) -> str:
@@ -306,13 +348,13 @@ def _applied_text(w: dict) -> str:
     return txt
 
 
-@dp.message(ops, F.document.mime_type.in_({"application/pdf", "image/jpeg", "image/png"}))
+@dp.message(wr, F.document.mime_type.in_({"application/pdf", "image/jpeg", "image/png"}))
 async def doc(m: Message):
     f = await bot.download(m.document)
     await _parse_and_reply(m, f.read(), m.document.mime_type)
 
 
-@dp.message(ops, F.photo)
+@dp.message(wr, F.photo)
 async def photo(m: Message):
     f = await bot.download(m.photo[-1])
     await _parse_and_reply(m, f.read(), "image/jpeg")
@@ -324,7 +366,7 @@ async def channel_id(m: Message):
     await m.answer(f"BACKUP_CHAT_ID={m.chat.id}")
 
 
-@dp.message(ops, F.forward_origin.chat)
+@dp.message(wr, F.forward_origin.chat)
 async def forwarded_from_channel(m: Message):
     """Forward any post from the channel to the bot -> it tells the channel id. Works even if
     the bot isn't admin yet (but it must be admin for backups to work)."""
@@ -333,7 +375,7 @@ async def forwarded_from_channel(m: Message):
                    "Бот должен быть админом канала с правом публиковать и закреплять.")
 
 
-@dp.message(ops, Command("backup"))
+@dp.message(sysf, Command("backup"))
 async def manual_backup(m: Message):
     from .backup import BACKUP_CHAT_ID, backup_now
     if not BACKUP_CHAT_ID:
@@ -345,10 +387,70 @@ async def manual_backup(m: Message):
 
 @dp.message(~ops)
 async def stranger(m: Message):
-    await m.answer(f"Нет доступа. Твой ID: {m.from_user.id} — добавь его в ALLOWED_IDS в .env и перезапусти.")
+    u = m.from_user
+    await m.answer("Запрос на доступ отправлен администратору. Как только он выдаст роль — напиши /start.")
+    who = f"{u.full_name}" + (f" (@{u.username})" if u.username else "") + f", ID {u.id}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Супер-админ", callback_data=f"role:{u.id}:super"),
+         InlineKeyboardButton(text="1С оператор", callback_data=f"role:{u.id}:viewer")],
+        [InlineKeyboardButton(text="Системный супер-админ", callback_data=f"role:{u.id}:sys")],
+        [InlineKeyboardButton(text="Отклонить", callback_data=f"role:{u.id}:no")]])
+    for sid in roles.sys_ids():
+        try:
+            await bot.send_message(sid, f"🔑 Просит доступ: {who}", reply_markup=kb)
+        except Exception:
+            pass
 
 
-@dp.message(ops, F.text.func(lambda t: any(money_from_text(t)) and not ai.find_mawb(t)))
+@dp.callback_query(F.data.startswith("role:"), sysf)
+async def give_role(c: CallbackQuery):
+    _, uid, role = c.data.split(":")
+    uid = int(uid)
+    if role == "no":
+        await c.message.edit_text(c.message.text + "\n❌ Отклонено")
+        await c.answer()
+        return
+    name = c.message.text.split(": ", 1)[-1].split(",")[0]
+    try:
+        roles.set_role(uid, role, name)
+    except ValueError as e:
+        await c.answer(str(e), show_alert=True)
+        return
+    from .backup import mark_dirty
+    mark_dirty()
+    await c.message.edit_text(c.message.text + f"\n✅ Роль: {roles.ROLE_NAMES[role]}")
+    try:
+        await bot.send_message(uid, f"Доступ выдан: {roles.ROLE_NAMES[role]}. Нажми /start.")
+    except Exception:
+        pass
+    await c.answer()
+
+
+@dp.message(sysf, Command("users"))
+async def list_users_cmd(m: Message):
+    lines = [f"• {u['name'] or '—'} · ID {u['tg_id']} · {u['role_name']}" for u in roles.users()]
+    await m.answer("Пользователи:\n" + "\n".join(lines) + "\n\nМенять роли — «Учёт» → Пользователи.")
+
+
+@dp.message(ops, Command("excel"))
+async def excel_cmd(m: Message):
+    """Everyone (including 1С) can get the current report."""
+    from .models import TopUp
+    with session() as s:
+        ids = [t.id for t in s.exec(select(TopUp)).all()]
+    if not ids:
+        await m.answer("Пока нет ни одного пополнения.")
+        return
+    await m.answer("Собираю учёт…")
+    await export_topups(ids, m.from_user.id, "📊 Актуальный учёт")
+
+
+@dp.message(ops, F.document | F.photo)
+async def viewer_upload(m: Message):
+    await m.answer("У тебя роль «1С оператор» — только просмотр. Отчёт: /excel или «Учёт» → «Excel в чат».")
+
+
+@dp.message(wr, F.text.func(lambda t: any(money_from_text(t)) and not ai.find_mawb(t)))
 async def money_followup(m: Message):
     """'1198$ 105472₽' right after a document -> books the last draft(s).
     For a split trader invoice: one line per farm ('Agriflora 301$ 26500₽'), or one sum for all."""
@@ -365,7 +467,7 @@ async def money_followup(m: Message):
         usd, rub = pr or (None, None)
         if d.get("doc_type") == "freight_invoice" and usd is None:
             usd = (d.get("freight") or {}).get("total_usd")
-        if not (usd and rub):
+        if not usd:
             left.append(d.get("farm") or "документ")
             continue
         with session() as s:
@@ -376,14 +478,15 @@ async def money_followup(m: Message):
             out.append(f"Не внёс {d.get('farm') or ''}: {kind}")
             continue
         p.unlink()
-        out.append((f"{d['farm']}: " if len(docs) > 1 else "") + _booked_text(snap, d, kind, t))
+        out.append((f"{d['farm']}: " if len(docs) > 1 else "") + _booked_text(snap, d, kind, t, m.from_user.id))
+        await _flush_export(m.from_user.id, "📊 Логистика легла на товар из прошлого пополнения.")
     if left:
-        out.append("Без сумм остались: " + ", ".join(left) + " — пришли `$ и ₽` для них.")
+        out.append("Без сумм остались: " + ", ".join(left) + " — пришли `$` для них.")
         LAST_DRAFT[m.from_user.id] = ([p.stem for p in paths if p.exists()], time.time())
     await m.answer("\n\n".join(out), parse_mode="Markdown")
 
 
-@dp.message(ops, Command("pop"))
+@dp.message(wr, Command("pop"))
 async def choose_topup(m: Message):
     """Pick the top-up that chat documents go to."""
     from .models import TopUp
@@ -398,7 +501,7 @@ async def choose_topup(m: Message):
     await m.answer("Куда вносить документы из чата:", reply_markup=kb)
 
 
-@dp.callback_query(F.data.startswith("pop:"), F.from_user.id.in_(ALLOWED_IDS))
+@dp.callback_query(F.data.startswith("pop:"), wr)
 async def set_topup(c: CallbackQuery):
     from .models import TopUp
     tid = int(c.data.split(":")[1])
@@ -410,9 +513,16 @@ async def set_topup(c: CallbackQuery):
     await c.answer()
 
 
-@dp.message(ops, F.text.func(lambda t: bool(ai.find_mawb(t))))
+@dp.message(wr, F.text.func(lambda t: bool(ai.find_mawb(t))))
 async def mawb_followup(m: Message):
-    """MAWB sent as a separate message right after a document -> goes into that draft."""
+    """MAWB sent as a separate message right after a document -> goes into that draft.
+    MAWB + 'Farm kg' pairs in one message -> a kg breakdown for that MAWB."""
+    awb_t, pairs = breakdown_from_text(m.text)
+    if len(pairs) >= 1:
+        w = store_breakdown(awb_t, pairs)
+        await m.answer(f"⚖️ Разбивка MAWB {awb_t}: " + ", ".join(f"{p['farm']} {p['kg']:g} кг" for p in pairs)
+                       + "\n" + _applied_text(w))
+        return
     ids, ts = LAST_DRAFT.get(m.from_user.id, ([], 0))
     did = ids[0] if ids else None
     path = DRAFTS / f"{did}.json" if did else None

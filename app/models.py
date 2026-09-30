@@ -24,6 +24,7 @@ class Farm(SQLModel, table=True):
     aliases: str = ""                      # comma separated: "ZEEFLORA,zeeflora"
     is_forwarder: bool = False             # Expolanka etc.
     notes: str = ""                        # free-text nuances the AI should know
+    box_kg_json: str = "{}"                # {"Spray Rose Reflex Bicolour 60cm": 25} — fixed kg per box of these items
 
 
 class Invoice(SQLModel, table=True):
@@ -79,6 +80,13 @@ class Logistics(SQLModel, table=True):
     ext_key: Optional[str] = Field(default=None, index=True)   # e.g. "ft:21.09-530:8245" — re-import updates, not duplicates
 
 
+class User(SQLModel, table=True):
+    """Who can use the bot. role: sys (sees money + manages users) | super (everything but money) | viewer (1С: read-only)."""
+    tg_id: int = Field(primary_key=True)
+    name: str = ""
+    role: str = "viewer"
+
+
 class AwbWeights(SQLModel, table=True):
     """Per-farm kg on one MAWB. Comes separately from the freight bill (Expolanka bills have no breakdown)."""
     awb: str = Field(primary_key=True)     # normalized MAWB (digits only)
@@ -98,6 +106,10 @@ def init_db():
     if "farm_kg_json" not in cols:
         with engine.begin() as c:
             c.execute(text("ALTER TABLE logistics ADD COLUMN farm_kg_json VARCHAR DEFAULT '{}'"))
+    fcols = {c["name"] for c in inspect(engine).get_columns("farm")}
+    if "box_kg_json" not in fcols:
+        with engine.begin() as c:
+            c.execute(text("ALTER TABLE farm ADD COLUMN box_kg_json VARCHAR DEFAULT '{}'"))
     if "ext_key" not in cols:
         with engine.begin() as c:
             c.execute(text("ALTER TABLE logistics ADD COLUMN ext_key VARCHAR"))
