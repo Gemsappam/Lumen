@@ -60,7 +60,18 @@ async def truck_forwarded(m: Message):
     from datetime import timedelta
     origin = getattr(m, "forward_origin", None)
     sent = (origin.date if origin else m.date).replace(tzinfo=None) + timedelta(hours=3)
-    await _truck_event(None, m.text, sent, notify_uid=m.from_user.id)
+    text = m.text
+    # pasted (not forwarded) text may start with the original date: «29.09 15:08 …» / «29.09.2026 15:08 …»
+    d = re.match(r"\s*(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?[ ,]+(\d{1,2}):(\d{2})\s*", text or "")
+    if d and not origin:
+        y = int(d.group(3)) if d.group(3) else _msk_now().year
+        y = y + 2000 if y < 100 else y
+        try:
+            sent = datetime(y, int(d.group(2)), int(d.group(1)), int(d.group(4)), int(d.group(5)))
+            text = text[d.end():]
+        except ValueError:
+            pass
+    await _truck_event(None, text, sent, notify_uid=m.from_user.id)
 
 
 @dp.message(pv, CommandStart(), ops)
