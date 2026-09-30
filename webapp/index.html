@@ -509,11 +509,12 @@ async transit(){
   const eta=i=>i.eta?`прибытие ${i.eta.slice(8,10)}.${i.eta.slice(5,7)} ${i.eta.slice(11,16)}`:'';
   $app.innerHTML=`<h1>Груз в пути</h1>
   <p class="sub">≈ по курсу ${fmt(v.est_rate,2)} (пополнение ${esc(v.est_topup||'—')}). Приблизительная себестоимость — отклонение до ±10%.</p>
-  ${Object.keys(by).length?Object.entries(by).map(([awb,list])=>`<h2>MAWB ${esc(awb)}${list.find(x=>x.eta)?' · '+eta(list.find(x=>x.eta)):''}</h2>
+  ${Object.keys(by).length?Object.entries(by).map(([awb,list])=>`<h2>${awb==='без MAWB'?'MAWB ещё не известен':'MAWB '+esc(awb)}${list.find(x=>x.eta)?' · '+eta(list.find(x=>x.eta)):''}</h2>
     <div class="group">${list.map(i=>`<div class="row" data-ti="${i.id}"><div class="grow">
       <div class="t">${esc(i.farm)}</div>
       <div style="margin:3px 0"><span class="pill ${i.paid_state==='paid'?'ok':'warn'}">${i.paid_state==='paid'?'оплачен · '+esc(i.topup):'не оплачен'}</span></div>
-      <div class="s num">${fmt(i.stems)} ст · ${i.paid_state==='paid'?'':'≈$'+fmt(i.est_usd||0,0)+' · '}логистика: ${esc(i.logi_source)}</div></div>
+      <div class="s num">${fmt(i.stems)} ст${i.paid_state==='paid'?'':' · ≈$'+fmt(i.est_usd||0,0)}</div>
+      <div class="s num">${legsOf(i).map(l=>`${l.name} ${fmt(l.per,2)}`).join(' + ')} ₽/ст</div></div>
       <div class="v"><div class="num">${i.approx?'≈ ':''}${fmt(i.avg_rub,2)} ₽</div><div class="s">${i.approx?'±10% · ':''}за стебель</div></div></div>`).join('')}</div>`).join('')
     :'<div class="empty">Всё прибыло — в пути ничего нет.</div>'}
   ${v.unpaid_logistics.length?`<h2>Неоплаченная логистика</h2><div class="group">${v.unpaid_logistics.map(l=>`<div class="row"><div class="grow">
@@ -531,9 +532,16 @@ async transitInv({i,v}){
   $app.innerHTML=`<h1>${esc(i.farm)}</h1>
   <p class="sub">MAWB ${esc(i.awb||'?')} · ${i.paid_state==='paid'?'оплачен из пополнения '+esc(i.topup):'не оплачен · ≈$'+fmt(i.est_usd||0,2)}
     ${i.eta?' · прибытие '+esc(i.eta.replace('T',' ')):''}<br>Логистика: ${esc(i.logi_source)}${i.approx?' · приблизительно, ±10%':''}</p>
-  <div class="group scroll"><table class="lines"><thead><tr><th>Номенклатура</th><th>Ст.</th><th>$</th><th>Цветок ₽</th><th>Лог. ₽</th><th>Итого ₽/ст</th></tr></thead>
+  <h2>Логистика</h2>
+  <div class="group">${legsOf(i).map(l=>`<div class="row"><div class="grow"><div class="t">${esc(l.name)}</div><div class="s">${esc(l.src)}</div></div>
+      <div class="v"><div class="num">${fmt(l.rub)} ₽</div><div class="s num">${fmt(l.per,2)} ₽/ст</div></div></div>`).join('')}
+    <div class="row"><div class="grow"><div class="t">Итого логистика</div></div><div class="v"><div class="num"><b>${fmt(i.rub_logi)} ₽</b></div>
+      <div class="s num">${fmt(i.rub_logi/(i.stems||1),2)} ₽/ст</div></div></div></div>
+  <h2>По позициям, ₽ на стебель</h2>
+  <div class="group scroll"><table class="lines"><thead><tr><th>Номенклатура</th><th>Ст.</th><th>$</th><th>Цветок</th>${legsOf(i).map(l=>`<th>${l.name.replace('ТК ','')}</th>`).join('')}<th>Итого</th></tr></thead>
   <tbody>${i.lines.map(l=>`<tr><td style="padding:8px 4px">${esc(l.name)}</td><td class="calc">${fmt(l.stems)}</td><td class="calc">${l.price_usd}</td>
-    <td class="calc">${fmt(l.price_rub,2)}</td><td class="calc">${fmt(l.logi_rub,2)}</td><td class="calc"><b>${i.approx?'≈':''}${fmt(l.total_rub,2)}</b></td></tr>`).join('')}</tbody></table></div>
+    <td class="calc">${fmt(l.price_rub,2)}</td>${legsOf(i).map(g=>`<td class="calc">${fmt(g.k==='air'?l.air_rub:l.msk_rub,2)}</td>`).join('')}
+    <td class="calc"><b>${i.approx?'≈':''}${fmt(l.total_rub,2)}</b></td></tr>`).join('')}</tbody></table></div>
   <div class="actions">${i.paid_state==='unpaid'?'<button class="primary" id="pay">Оплачен</button>':''}<button id="arr">Прибыл</button></div>
   <div class="actions"><button id="edit">Редактировать инвойс</button></div>`;
   document.getElementById('pay')?.addEventListener('click',()=>payForm({kind:'invoices',id:i.id,usd:i.est_usd}));
@@ -549,9 +557,10 @@ async stock(){
   const sum=(l,k)=>l.reduce((a,i)=>a+(i[k]||0),0);
   const block=(title,list,approx)=>`<h2>${title}</h2>
     <div class="group"><div class="row"><div class="grow"><div class="big num">${approx?'≈ ':''}${fmt(sum(list,'rub_goods')+sum(list,'rub_logi'))} ₽</div>
-      <div class="s num">товар ${fmt(sum(list,'rub_goods'))} ₽ · логистика ${fmt(sum(list,'rub_logi'))} ₽ · ${list.length} инв.</div></div></div>
+      <div class="s num">товар ${fmt(sum(list,'rub_goods'))} ₽ · ТК Кения ${fmt(list.reduce((a,i)=>a+((i.legs||{}).air?.rub||0),0))} ₽ · ТК МСК ${fmt(list.reduce((a,i)=>a+((i.legs||{}).msk?.rub||0),0))} ₽ · ${list.length} инв.</div></div></div>
     ${list.map(i=>`<div class="row" data-ti="${i.id}"><div class="grow"><div class="t">${esc(i.farm)}</div><div class="s">MAWB ${esc(i.awb||'?')} · ${fmt(i.stems)} ст</div></div>
-      <div class="v"><div class="num">${i.approx?'≈ ':''}${fmt(i.rub_goods+i.rub_logi)} ₽</div><div class="s num">${fmt(i.rub_goods)} + ${fmt(i.rub_logi)}</div></div></div>`).join('')}</div>`;
+      <div class="v"><div class="num">${i.approx?'≈ ':''}${fmt(i.rub_goods+i.rub_logi)} ₽</div>
+        <div class="s num">товар ${fmt(i.rub_goods)}</div>${legsOf(i).map(l=>`<div class="s num">${l.name} ${fmt(l.rub)}</div>`).join('')}</div></div>`).join('')}</div>`;
   $app.innerHTML=`<h1>Товарные остатки</h1>
   <p class="sub">Рублёвые суммы груза в пути по инвойсам: товар + логистика. Неоплаченные — по курсу ${fmt(v.est_rate,2)} (пополнение ${esc(v.est_topup||'—')}).</p>
   ${block('Оплаченные в пути',paid,paid.some(i=>i.approx))}
@@ -623,6 +632,9 @@ async farm({f}){
     box_kg_json:JSON.stringify(Object.fromEntries(F.boxkg.value.split('\n').map(x=>x.split('=')).filter(x=>x.length===2&&x[0].trim()&&numOrNull(x[1])).map(x=>[x[0].trim(),numOrNull(x[1])])))}});FARMS=[];toast('Сохранено');back()};
 },
 };
+
+// logistics legs shown for an invoice: ТК Кения only for Kenya (or when it has money), ТК МСК always
+const legsOf=i=>['air','msk'].map(k=>({k,...(i.legs||{})[k]})).filter(l=>l.name&&(l.k==='msk'||i.country==='Кения'||l.rub));
 
 // «Оплачен»: which top-up + $ (₽ by that top-up's rate unless typed)
 async function payForm({kind,id,usd}){

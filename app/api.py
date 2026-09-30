@@ -1105,6 +1105,9 @@ def transit_view(s=None) -> dict:
             has_msk = any(res.lines[l.id].msk_rub_stem for l in ls)
             notes, approx_legs = [], False
             est = {l.id: [res.lines[l.id].air_rub_stem, res.lines[l.id].msk_rub_stem] for l in ls}
+            k = norm_awb(i.awb)
+            src = {"air": ("счёт ТК" + (" (≈ по последнему курсу)" if (k, "air") in res.estimated_legs else "")) if has_air else "нет данных",
+                   "msk": ("счёт ТК" + (" (предварительный курс)" if (k, "msk") in res.estimated_legs else "")) if has_msk else "нет данных"}
             if country == "Кения":
                 for leg, has, label in (("air", has_air, "Expolanka"), ("msk", has_msk, "Floratrack")):
                     if has:
@@ -1117,6 +1120,8 @@ def transit_view(s=None) -> dict:
                             got += 1
                     notes.append(f"{label}: копия прошлой поставки ({got}/{len(ls)} поз.)" if got
                                  else f"{label}: нет прошлой поставки этих позиций")
+                    src[leg] = (f"копия прошлой поставки ({got}/{len(ls)} поз.)" if got
+                                else "нет прошлой поставки этих позиций")
                     approx_legs = True
             elif country in FT_TARIFF and not has_msk:
                 if ft_rate is None:
@@ -1127,17 +1132,21 @@ def transit_view(s=None) -> dict:
                     for l in ls:
                         est[l.id][1] = per
                     notes.append(f"Floratrack: тариф {FT_TARIFF[country]} $/кг × {w:g} кг × {ft_rate[0]:.2f}")
+                    src["msk"] = f"тариф {FT_TARIFF[country]} $/кг × {w:g} кг × {ft_rate[0]:.2f}"
                 else:
+                    src["msk"] = "нет кг фермы — пришли разбивку" if not w else "нет курса ЦБ"
                     notes.append("Floratrack: нет кг фермы — пришли разбивку или впиши кг" if not w else "Floratrack: нет курса ЦБ")
                 approx_legs = True
             legs_est = any((norm_awb(i.awb), leg) in res.estimated_legs for leg in ("air", "msk"))
             if (has_air or has_msk) and not notes:
                 notes.append("по счетам" + (" (часть приблизительно)" if legs_est else ""))
             rows = []
-            flower_rub = logi_rub = 0.0
+            flower_rub = logi_rub = air_rub = msk_rub = 0.0
             for l in ls:
                 c = res.lines[l.id]
                 lg = sum(est[l.id])
+                air_rub += est[l.id][0] * l.stems
+                msk_rub += est[l.id][1] * l.stems
                 rows.append({**l.model_dump(), "price_rub": round(c.price_rub, 2), "logi_rub": round(lg, 2),
                              "air_rub": round(est[l.id][0], 2), "msk_rub": round(est[l.id][1], 2),
                              "total_rub": round(c.price_rub + lg, 2)})
@@ -1148,7 +1157,9 @@ def transit_view(s=None) -> dict:
                         "paid_state": "paid" if i.topup_id else "unpaid", "topup": tdate.get(i.topup_id),
                         "rub_goods": round(res.invoice_rub.get(i.id) or flower_rub), "rub_logi": round(logi_rub),
                         "avg_rub": round((flower_rub + logi_rub) / st, 2), "approx": approx,
-                        "logi_source": "; ".join(notes) or "нет данных",
+                        "logi_source": ("; ".join(notes) or "нет данных").replace("Expolanka", "ТК Кения").replace("Floratrack", "ТК МСК"),
+                        "legs": {"air": {"name": "ТК Кения", "rub": round(air_rub), "per": round(air_rub / st, 4), "src": src["air"]},
+                                 "msk": {"name": "ТК МСК", "rub": round(msk_rub), "per": round(msk_rub / st, 4), "src": src["msk"]}},
                         "rub_paid": res.invoice_rub.get(i.id)})
         unpaid_logs = [{**lg.model_dump(), "rub_est": round((lg.usd or 0) * res.est_rate)}
                        for lg in logs if not lg.paid]
