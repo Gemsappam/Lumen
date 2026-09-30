@@ -37,7 +37,8 @@ FORWARDERS = {
 }
 
 
-FARM_ALIASES = {"Agriflora": "SIAN FLOWERS-AGRIFLORA,SIAN FLOWERS -AGRIFLORA,Агрифлора,Агри",
+FARM_ALIASES = {"PjDave": "PJ FLORA,PJ FLOWERS,PJ",
+                "Agriflora": "SIAN FLOWERS-AGRIFLORA,SIAN FLOWERS -AGRIFLORA,Агрифлора,Агри",
                 "Massai": "SIAN FLOWERS-MAASAI,Maasai,Массай,Масаи"}
 
 
@@ -67,6 +68,18 @@ def upsert_forwarders():
 def seed():
     _seed_farms()
     upsert_forwarders()          # forwarders + aliases for existing farms (idempotent)
+    _seed_box_dims()
+
+
+def _seed_box_dims():
+    """Box sizes Expolanka reported (WhatsApp, 09.2025–09.2026) -> registry, once."""
+    from .api import _settings, SETTINGS, learn_dims
+    from .volumetric import SEED_TEXT, parse_message
+    st = _settings()
+    if st.get("box_dims_seeded"):
+        return
+    learn_dims(parse_message(SEED_TEXT))
+    SETTINGS.write_text(json.dumps({**_settings(), "box_dims_seeded": True}))
 
 
 def _seed_farms():
@@ -133,6 +146,8 @@ async def lifespan(app):
         tasks.append(asyncio.create_task(dp.start_polling(bot, handle_signals=False,
                                                            allowed_updates=dp.resolve_used_update_types())))
         tasks.append(asyncio.create_task(backup.backup_loop(bot)))
+        from .bot import scheduler_loop
+        tasks.append(asyncio.create_task(scheduler_loop()))
     yield
     for t in tasks:
         t.cancel()

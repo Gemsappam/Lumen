@@ -25,12 +25,13 @@ class Farm(SQLModel, table=True):
     is_forwarder: bool = False             # Expolanka etc.
     notes: str = ""                        # free-text nuances the AI should know
     box_kg_json: str = "{}"                # {"Spray Rose Reflex Bicolour 60cm": 25} — fixed kg per box of these items
+    box_dims_json: str = "{}"              # Expolanka box sizes seen: {"100.48.25": 40} -> volumetric kg = L*W*H/6000
 
 
 class Invoice(SQLModel, table=True):
-    """A farm invoice, paid from a top-up."""
+    """A farm invoice. topup_id = the top-up it was paid from; 0 = not paid yet (груз в пути, не оплачен)."""
     id: Optional[int] = Field(default=None, primary_key=True)
-    topup_id: int = Field(foreign_key="topup.id", index=True)
+    topup_id: int = Field(default=0, index=True)
     country: str = ""
     client_code: str = "Люмен"
     invoice_no: str = ""
@@ -46,6 +47,9 @@ class Invoice(SQLModel, table=True):
     paid_date: str = ""
     note: str = ""
     source_file: Optional[str] = None
+    est_usd: Optional[float] = None        # unpaid: approximate $ Arman expects to pay (with costs)
+    eta: Optional[str] = None              # ISO datetime (MSK) when the goods count as arrived
+    arrived_at: Optional[str] = None       # set when arrived; None = в пути
 
 
 class Line(SQLModel, table=True):
@@ -66,6 +70,7 @@ class Logistics(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     topup_id: Optional[int] = Field(default=None, foreign_key="topup.id", index=True)  # None = paid outside top-ups
     awb: str
+    paid: bool = True                      # False = Expolanka bill on deferred payment (≈ ₽ at the latest top-up rate)
     leg: str = "air"
     provider: str = ""
     invoice_no: str = ""
@@ -107,6 +112,9 @@ def init_db():
         with engine.begin() as c:
             c.execute(text("ALTER TABLE logistics ADD COLUMN farm_kg_json VARCHAR DEFAULT '{}'"))
     fcols = {c["name"] for c in inspect(engine).get_columns("farm")}
+    if "box_dims_json" not in fcols:
+        with engine.begin() as c:
+            c.execute(text("ALTER TABLE farm ADD COLUMN box_dims_json VARCHAR DEFAULT '{}'"))
     if "box_kg_json" not in fcols:
         with engine.begin() as c:
             c.execute(text("ALTER TABLE farm ADD COLUMN box_kg_json VARCHAR DEFAULT '{}'"))
@@ -116,6 +124,16 @@ def init_db():
     if "weight_kg" not in cols:
         with engine.begin() as c:
             c.execute(text("ALTER TABLE logistics ADD COLUMN weight_kg FLOAT"))
+    if "paid" not in cols:
+        with engine.begin() as c:
+            c.execute(text("ALTER TABLE logistics ADD COLUMN paid BOOLEAN DEFAULT 1"))
+    icols = {c["name"] for c in inspect(engine).get_columns("invoice")}
+    for col, typ in (("est_usd", "FLOAT"), ("eta", "VARCHAR"), ("arrived_at", "VARCHAR")):
+        if col not in icols:
+            with engine.begin() as c:
+                c.execute(text(f"ALTER TABLE invoice ADD COLUMN {col} {typ}"))
+                if col == "arrived_at":   # everything booked before this feature is already on the shelf
+                    c.execute(text("UPDATE invoice SET arrived_at = 'до учёта в пути'"))
 
 
 def session() -> Session:

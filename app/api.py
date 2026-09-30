@@ -85,7 +85,8 @@ class LineIn(BaseModel):
 
 
 class InvoiceIn(BaseModel):
-    topup_id: int
+    topup_id: int = 0                  # 0 = not paid yet (груз в пути)
+    est_usd: float | None = None       # unpaid: approximate $
     country: str = ""
     client_code: str = "Люмен"
     invoice_no: str = ""
@@ -118,6 +119,7 @@ class LogisticsIn(BaseModel):
     source_file: str | None = None
     farm_kg: dict[str, float] = {}     # optional: set weight_kg on farm invoices of this AWB
     weight_kg: float | None = None     # weight on the bill
+    paid: bool = True                  # False = deferred (Expolanka)
 
 
 class FarmIn(BaseModel):
@@ -127,6 +129,7 @@ class FarmIn(BaseModel):
     is_forwarder: bool = False
     notes: str = ""
     box_kg_json: str = "{}"
+    box_dims_json: str = "{}"
 
 
 # ---------- helpers ------------------------------------------------------------------
@@ -321,18 +324,22 @@ def payments_for(text: str, subs: list[dict]):
     return out
 
 
-def book_document(out: dict, topup_id: int, usd, rub, uid: int):
-    """Farm invoice / freight bill + paid $ and ₽ -> straight into the books, no Mini App.
+def book_document(out: dict, topup_id: int, usd, rub, uid: int, paid: bool = True):
+    """Farm invoice / freight bill -> straight into the books, no Mini App.
+    paid=True: into top-up `topup_id` with the $ (and ₽, else $ × rate) actually paid.
+    paid=False: груз в пути — farm invoice with ≈$ (usd), freight bill with its own $.
     Returns (snapshot, what) or (None, reason)."""
     from datetime import date
     today = date.today().strftime("%d.%m.%Y")
-    if usd and not rub:
+    if not paid:
+        topup_id, rub = 0, None
+    if paid and usd and not rub:
         with session() as s:
             rub = round(usd * rate_of(s.get(TopUp, topup_id)))   # ₽ not given: $ × top-up rate
         out["_rub_auto"] = rub
     if out.get("doc_type") == "farm_invoice":
         lines = [LineIn(name=l["name"], boxes=l.get("boxes"), stems=l.get("stems") or 0,
-                        weight_kg=l.get("weight_kg"), price_usd=l.get("price_usd") or 0)
+                        weight_kg=None, price_usd=l.get("price_usd") or 0)       # kg on farm invoices is never right
                  for l in out.get("lines", []) if l.get("name") and l.get("stems")]
         if not lines or not out.get("farm"):
             return None, "не распознаны строки или плантация"
@@ -341,21 +348,23 @@ def book_document(out: dict, topup_id: int, usd, rub, uid: int):
             country = out.get("country") or next((x.country for x in f if x.name.lower() == out["farm"].lower()), "")
         body = InvoiceIn(topup_id=topup_id, country=country, invoice_no=out.get("invoice_no") or "",
                          invoice_date=out.get("invoice_date") or "", awb=out.get("awb") or "", farm=out["farm"],
-                         weight_kg=out.get("weight_kg"), invoice_total_usd=out.get("invoice_total_usd"),
-                         usd_paid=usd, rub_paid_override=rub, paid_date=today,
+                         weight_kg=out.get("weight_kg") if out.get("mawb_note") else None,   # only from a breakdown
+                         invoice_total_usd=out.get("invoice_total_usd"),
+                         usd_paid=usd if paid else 0, rub_paid_override=rub, paid_date=today if paid else "",
+                         paid=paid, est_usd=None if paid else usd,
                          note=out.get("mawb_note") or "", source_file=out.get("source_file"), lines=lines)
         return save_invoice(body, None, uid), "invoice"
     if out.get("doc_type") == "freight_invoice":
         fr = out.get("freight") or {}
         prov = (fr.get("provider") or out.get("farm") or "")
-        body = LogisticsIn(topup_id=topup_id, awb=out.get("awb") or "", leg=leg_of(prov, fr.get("leg")),
+        body = LogisticsIn(topup_id=topup_id or None, paid=paid, awb=out.get("awb") or "", leg=leg_of(prov, fr.get("leg")),
                            weight_kg=out.get("total_weight_kg"),
                            provider=fr.get("provider") or out.get("farm") or "", invoice_no=out.get("invoice_no") or "",
-                           usd=usd, rub=rub, paid_date=today, source_file=out.get("source_file"),
+                           usd=usd, rub=rub, paid_date=today if paid else "", source_file=out.get("source_file"),
                            farm_kg={x["farm"]: x["kg"] for x in fr.get("per_farm_kg") or [] if x.get("kg")})
         if not body.awb:
             return None, "нет MAWB"
-        return save_logistics(body, None, topup_id, uid), "freight"
+        return save_logistics(body, None, topup_id or None, uid), "freight"
     return None, "этот тип документа сразу не вносится"
 
 
@@ -374,12 +383,70 @@ def breakdown_from_text(text: str):
     return awb, pairs
 
 
+# ---------- volumetric weights (Expolanka) ------------------------------------------------
+def resolve_farm(s, name: str, create_country: str | None = None):
+    """'Zee flora' / 'Maasai' / 'Redlands' -> the Farm row (alias / prefix match); optionally create."""
+    n = _norm_name(name)
+    if not n:
+        return None
+    farms = s.exec(select(Farm)).all()
+    for f in farms:
+        keys = {_norm_name(x) for x in [f.name] + (f.aliases or "").split(",") if x.strip()}
+        if n in keys or any(len(k) >= 4 and len(n) >= 4 and (k.startswith(n) or n.startswith(k)) for k in keys):
+            return f
+    if n.startswith("zee"):
+        return next((f for f in farms if f.name == "Zeeflora"), None)
+    if create_country:
+        f = Farm(name=name.strip().title(), country=create_country, aliases=name.strip().upper())
+        s.add(f); s.flush()
+        return f
+    return None
+
+
+def learn_dims(entries: list, create_country: str | None = "Кения"):
+    """Remember which box sizes each farm ships (registry of usual boxes)."""
+    with session() as s:
+        for e in entries:
+            f = resolve_farm(s, e["farm"], create_country)
+            if not f:
+                continue
+            d = json.loads(f.box_dims_json or "{}")
+            for n, key, *_ in e["dims"]:
+                if len(_) and _[-1] == "обычная коробка":
+                    continue
+                d[key] = d.get(key, 0) + n
+            f.box_dims_json = json.dumps(d)
+            s.add(f)
+        s.commit()
+
+
+def usual_dims(name: str):
+    from .volumetric import usual
+    with session() as s:
+        f = resolve_farm(s, name)
+        return usual(json.loads(f.box_dims_json or "{}")) if f else None
+
+
+def volumetric_breakdown(text: str) -> list:
+    """WhatsApp weights message -> [{farm (canonical), boxes, kg, dims}] by L×W×H/6000."""
+    from .volumetric import parse_message
+    out = parse_message(text, usual_dims=usual_dims)
+    with session() as s:
+        for e in out:
+            f = resolve_farm(s, e["farm"])
+            e["raw"] = e["farm"]
+            if f:
+                e["farm"] = f.name
+    return out
+
+
 def import_floratrack(data: bytes) -> dict:
     """Floratrack xlsx -> one Floratrack logistics record per AWB, ₽ at the rate we actually paid.
     Re-uploading the next report updates the same records (rates firm up once payments arrive)."""
     from . import floratrack as ft
     from .ai import find_mawb
-    rep = ft.parse(data)
+    from .cbr import floratrack_rate
+    rep = ft.parse(data, floratrack_rate())
     added = updated = 0
     matched, unmatched, ambiguous = [], [], []
     with session() as s:
@@ -523,6 +590,8 @@ def _fill_weight_from_logistics(s, inv):
 
 
 def snapshot(s, topup_id):
+    if not topup_id:
+        return transit_view(s)
     tops, invs, lines, logs = _all(s)
     t = next((x for x in tops if x.id == topup_id), None)
     if not t:
@@ -716,6 +785,9 @@ def save_invoice(body: InvoiceIn, inv_id: int | None = None, uid: int = Depends(
             s.add(Line(invoice_id=inv.id, **l.model_dump()))
         _fill_weight_from_logistics(s, inv)
         s.commit()
+        if not inv.topup_id:
+            inv.paid = False
+            s.add(inv); s.commit()
         return snapshot(s, inv.topup_id)
 
 
@@ -745,7 +817,7 @@ def save_logistics(body: LogisticsIn, log_id: int | None = None, view_topup: int
         s.add(lg)
         _store_weights(s, body.awb, body.farm_kg, replace=True)
         s.commit()
-        return snapshot(s, view_topup or body.topup_id)
+        return snapshot(s, view_topup or body.topup_id or 0)
 
 
 @router.delete("/logistics/{log_id}")
@@ -934,6 +1006,231 @@ async def export_all(uid: int = Depends(user_id)):
         except Exception as e:
             print(f"[lumen] backup after export failed: {e}", flush=True)
     return {"ok": True, "sheets": names}
+
+
+# ---------- груз в пути ------------------------------------------------------------------
+FT_TARIFF = {"Эквадор": 7.51, "Колумбия": 7.11}   # $/kg, consolidation door-to-Moscow
+
+
+def _country_of(s, inv) -> str:
+    if inv.country:
+        return inv.country
+    keys = _farm_keys(s, inv.farm)
+    for f in s.exec(select(Farm)).all():
+        if _norm_name(f.name) in keys:
+            return f.country
+    return ""
+
+
+def _prev_leg(invs, lines, res, inv, line, leg):
+    """Kenya without a bill yet: logistics per stem of the previous shipment of the SAME farm and SAME item."""
+    key = "air_rub_stem" if leg == "air" else "msk_rub_stem"
+    name = _norm_name(line.name)
+    for p in sorted((i for i in invs if i.farm.lower() == inv.farm.lower() and i.id < inv.id), key=lambda x: -x.id):
+        for l in lines:
+            if l.invoice_id == p.id and _norm_name(l.name) == name and getattr(res.lines[l.id], key):
+                return getattr(res.lines[l.id], key), p
+    return None, None
+
+
+def transit_view(s=None) -> dict:
+    """Everything not arrived yet: paid (in a top-up) and unpaid, with ≈ cost per stem.
+    Missing freight is estimated per leg:
+      Kenya  — copy of the previous shipment of this farm & this item (Expolanka and/or Floratrack)
+      Ecuador/Colombia — Floratrack tariff 7.51 / 7.11 $/kg × farm kg × (ЦБ today + 3) / 0.96"""
+    from .cbr import floratrack_rate
+    own = s is None
+    s = s or session()
+    try:
+        tops, invs, lines, logs = _all(s)
+        kg = _awb_kg(s)
+        res = compute(0, tops, invs, lines, logs, kg)
+        tdate = {t.id: t.date for t in tops}
+        by_inv = defaultdict(list)
+        for l in lines:
+            by_inv[l.invoice_id].append(l)
+        moving = [i for i in invs if not i.arrived_at]
+        ft_rate = None
+        out = []
+        for i in sorted(moving, key=lambda x: (norm_awb(x.awb), x.id)):
+            ls = by_inv[i.id]
+            st = sum(l.stems for l in ls) or 1
+            country = _country_of(s, i)
+            has_air = any(res.lines[l.id].air_rub_stem for l in ls)
+            has_msk = any(res.lines[l.id].msk_rub_stem for l in ls)
+            notes, approx_legs = [], False
+            est = {l.id: [res.lines[l.id].air_rub_stem, res.lines[l.id].msk_rub_stem] for l in ls}
+            if country == "Кения":
+                for leg, has, label in (("air", has_air, "Expolanka"), ("msk", has_msk, "Floratrack")):
+                    if has:
+                        continue
+                    got = 0
+                    for l in ls:
+                        v, p = _prev_leg(invs, lines, res, i, l, leg)
+                        if v:
+                            est[l.id][0 if leg == "air" else 1] = v
+                            got += 1
+                    notes.append(f"{label}: копия прошлой поставки ({got}/{len(ls)} поз.)" if got
+                                 else f"{label}: нет прошлой поставки этих позиций")
+                    approx_legs = True
+            elif country in FT_TARIFF and not has_msk:
+                if ft_rate is None:
+                    ft_rate = floratrack_rate()
+                w = i.weight_kg
+                if w and ft_rate[0]:
+                    per = FT_TARIFF[country] * w * ft_rate[0] / st
+                    for l in ls:
+                        est[l.id][1] = per
+                    notes.append(f"Floratrack: тариф {FT_TARIFF[country]} $/кг × {w:g} кг × {ft_rate[0]:.2f}")
+                else:
+                    notes.append("Floratrack: нет кг фермы — пришли разбивку или впиши кг" if not w else "Floratrack: нет курса ЦБ")
+                approx_legs = True
+            legs_est = any((norm_awb(i.awb), leg) in res.estimated_legs for leg in ("air", "msk"))
+            if (has_air or has_msk) and not notes:
+                notes.append("по счетам" + (" (часть приблизительно)" if legs_est else ""))
+            rows = []
+            flower_rub = logi_rub = 0.0
+            for l in ls:
+                c = res.lines[l.id]
+                lg = sum(est[l.id])
+                rows.append({**l.model_dump(), "price_rub": round(c.price_rub, 2), "logi_rub": round(lg, 2),
+                             "air_rub": round(est[l.id][0], 2), "msk_rub": round(est[l.id][1], 2),
+                             "total_rub": round(c.price_rub + lg, 2)})
+                flower_rub += c.price_rub * l.stems
+                logi_rub += lg * l.stems
+            approx = (not i.topup_id) or legs_est or approx_legs
+            out.append({**i.model_dump(), "lines": rows, "stems": st, "country": country,
+                        "paid_state": "paid" if i.topup_id else "unpaid", "topup": tdate.get(i.topup_id),
+                        "rub_goods": round(res.invoice_rub.get(i.id) or flower_rub), "rub_logi": round(logi_rub),
+                        "avg_rub": round((flower_rub + logi_rub) / st, 2), "approx": approx,
+                        "logi_source": "; ".join(notes) or "нет данных",
+                        "rub_paid": res.invoice_rub.get(i.id)})
+        unpaid_logs = [{**lg.model_dump(), "rub_est": round((lg.usd or 0) * res.est_rate)}
+                       for lg in logs if not lg.paid]
+        return {"invoices": out, "unpaid_logistics": unpaid_logs, "est_rate": res.est_rate,
+                "est_topup": max(tops, key=lambda t: t.id).date if tops else None}
+    finally:
+        if own:
+            s.close()
+
+
+@router.get("/transit")
+def get_transit(uid: int = Depends(user_id)):
+    return transit_view()
+
+
+class PayIn(BaseModel):
+    topup_id: int
+    usd: float | None = None
+    rub: float | None = None
+
+
+def pay_invoice(inv_id: int, topup_id: int, usd: float, rub: float | None = None) -> dict:
+    from datetime import date
+    with session() as s:
+        inv, t = s.get(Invoice, inv_id), s.get(TopUp, topup_id)
+        if not inv or not t:
+            raise ValueError("нет такого инвойса или пополнения")
+        inv.topup_id, inv.usd_paid, inv.paid = topup_id, usd, True
+        inv.rub_paid_override = rub if rub else round(usd * rate_of(t))
+        inv.paid_date = date.today().strftime("%d.%m.%Y")
+        s.add(inv); s.commit()
+        out = {"farm": inv.farm, "usd": usd, "rub": inv.rub_paid_override, "topup": t.date, "auto": not rub}
+    from .backup import mark_dirty
+    mark_dirty()
+    return out
+
+
+def pay_logistics(log_id: int, topup_id: int, usd: float | None = None, rub: float | None = None) -> dict:
+    from datetime import date
+    with session() as s:
+        lg, t = s.get(Logistics, log_id), s.get(TopUp, topup_id)
+        if not lg or not t:
+            raise ValueError("нет такой логистики или пополнения")
+        lg.topup_id, lg.paid = topup_id, True
+        lg.usd = usd or lg.usd
+        lg.rub = rub if rub else None          # None -> $ × rate of the top-up in the calc
+        lg.paid_date = date.today().strftime("%d.%m.%Y")
+        s.add(lg); s.commit()
+        out = {"provider": lg.provider, "usd": lg.usd, "rub": rub or round((lg.usd or 0) * rate_of(t)), "topup": t.date}
+    from .backup import mark_dirty
+    mark_dirty()
+    return out
+
+
+@router.post("/invoices/{inv_id}/pay")
+def api_pay_invoice(inv_id: int, body: PayIn, uid: int = Depends(writer)):
+    try:
+        pay_invoice(inv_id, body.topup_id, body.usd, body.rub)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return transit_view()
+
+
+@router.post("/logistics/{log_id}/pay")
+def api_pay_logistics(log_id: int, body: PayIn, uid: int = Depends(writer)):
+    try:
+        pay_logistics(log_id, body.topup_id, body.usd, body.rub)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return transit_view()
+
+
+@router.post("/invoices/{inv_id}/arrived")
+def api_arrived(inv_id: int, back: bool = False, uid: int = Depends(writer)):
+    """Manual: mark arrived (or back to 'в пути')."""
+    from datetime import datetime
+    with session() as s:
+        inv = s.get(Invoice, inv_id)
+        inv.arrived_at = None if back else datetime.now().strftime("%d.%m.%Y %H:%M") + " (вручную)"
+        s.add(inv); s.commit()
+    from .backup import mark_dirty
+    mark_dirty()
+    return transit_view()
+
+
+def set_eta(awbs: list[str], eta_iso: str) -> tuple[list, list]:
+    """Floratrack chat: these MAWBs arrive at eta -> set eta on their invoices still in transit."""
+    matched, unknown = [], []
+    with session() as s:
+        invs = s.exec(select(Invoice)).all()
+        for a in awbs:
+            k = norm_awb(a)
+            hit = [i for i in invs if norm_awb(i.awb) == k and not i.arrived_at]
+            if not hit:
+                unknown.append(a)
+                continue
+            for i in hit:
+                i.eta = eta_iso
+                s.add(i)
+            matched.append((a, [i.farm for i in hit]))
+        s.commit()
+    from .backup import mark_dirty
+    mark_dirty()
+    return matched, unknown
+
+
+def arrive_due(now_iso: str) -> list[dict]:
+    """Scheduler: invoices whose eta has passed become arrived."""
+    done = []
+    with session() as s:
+        for i in s.exec(select(Invoice)).all():
+            if not i.arrived_at and i.eta and i.eta <= now_iso:
+                i.arrived_at = i.eta.replace("T", " ")[:16] + " (Floratrack)"
+                s.add(i)
+                done.append({"farm": i.farm, "awb": i.awb, "paid": bool(i.topup_id)})
+        s.commit()
+    if done:
+        from .backup import mark_dirty
+        mark_dirty()
+    return done
+
+
+def unpaid_items() -> dict:
+    """For the Tuesday/Wednesday payment reminder."""
+    v = transit_view()
+    invs = [x for x in v["invoices"] if x["paid_state"] == "unpaid"]
+    return {"invoices": invs, "logistics": v["unpaid_logistics"], "rate": v["est_rate"], "topup": v["est_topup"]}
 
 
 # ---------- drafts: invoices sent straight into the bot chat, waiting for the operator ----

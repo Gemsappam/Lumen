@@ -9,6 +9,10 @@ Rules (from Arman):
   the "Баланс" tab lists every payment "пп 264 000,00 ₽ -4%" -> $2 910.91 credited. Payments close
   charges first-in-first-out, so each truck gets the effective ₽/$ of the payment(s) that covered it.
 - Floratrack writes only the last 4 digits of the AWB. We match them to our MAWBs; kg must agree.
+- Not paid yet (no payment in «Баланс» covers it, or the truck isn't in «Баланс» yet):
+  provisional ₽ = $ × (ЦБ today from cbr.ru + 3) / 0.96. (The rate on the truck sheet already has +3,
+  so if cbr.ru is unreachable we fall back to sheet rate / 0.96.)
+  The next report with the payment replaces it with the real rate.
 """
 from __future__ import annotations
 
@@ -37,6 +41,7 @@ class AwbCharge:
     rate: float = 0.0
     provisional: bool = False     # truck not (fully) covered by a payment yet
     rate_note: str = ""
+    cb: float = 0.0               # USD rate on the truck sheet (ЦБ)
 
 
 @dataclass
@@ -54,7 +59,20 @@ def _num(v) -> float:
 
 
 def is_floratrack(wb) -> bool:
-    return "Баланс" in wb.sheetnames and sum(1 for n in wb.sheetnames if SHEET_RE.match(n)) >= 1
+    return sum(1 for n in wb.sheetnames if SHEET_RE.match(n)) >= 1 and (
+        "Баланс" in wb.sheetnames or any(_looks_like_truck(wb[n]) for n in wb.sheetnames if SHEET_RE.match(n)))
+
+
+def _looks_like_truck(ws) -> bool:
+    return bool(_find_row(ws, "ЭКВАДОР КОНСОЛИДАЦИЯ", 1) or _find_row(ws, "ИМПОРТ АМС-МСК", 1))
+
+
+def provisional_rate(sheet_rate: float, today: tuple | None = None) -> tuple[float, str]:
+    """Arman's rule while Floratrack hasn't been paid: (ЦБ today + 3) / 0.96.
+    today = (rate, note) from cbr.floratrack_rate(); fallback: truck-sheet rate (already ЦБ+3) / 0.96."""
+    if today and today[0]:
+        return today[0], today[1]
+    return (sheet_rate / 0.96 if sheet_rate else 0.0), f"курс листа машины {sheet_rate:.4f} (ЦБ+3) / 0.96 — сайт ЦБ недоступен"
 
 
 def _find_row(ws, label, start=1, end=120):
@@ -115,6 +133,8 @@ def _truck(ws):
         for x in out:
             x.usd = total_usd * x.usd / calc
     # mixed truck: Kenya = import + preecooling (EUR × EUR rate ÷ USD rate), Ecuador/Colombia = consolidation only
+    for x in out:
+        x.cb = usd
     return date, total_usd, out
 
 
@@ -157,17 +177,17 @@ def _fifo(rows, warnings):
             need -= take
             if p["usd"] <= 1e-6:
                 pays.popleft()
-        if need > 1e-6:              # not paid yet: estimate with the latest payment rate
-            prov = True
-            rub += need * (last_rate or 0)
-        out[c["row"]] = (rub / c["usd"] if c["usd"] else 0, prov, ", ".join(used))
+        prov = need > 1e-6          # part (or all) of the truck not paid yet
+        out[c["row"]] = (rub, need if prov else 0.0, ", ".join(used))
     return out
 
 
-def parse(data: bytes) -> Report:
+def parse(data: bytes, today: tuple | None = None) -> Report:
     wb = load_workbook(io.BytesIO(data), data_only=True)
     rep = Report()
-    rows = _balance(wb["Баланс"])
+    rows = _balance(wb["Баланс"]) if "Баланс" in wb.sheetnames else []
+    if not rows:
+        rep.warnings.append("В файле нет вкладки «Баланс» — всё посчитано по предварительному курсу (ЦБ + 3) / 0.96")
     rates = _fifo(rows, rep.warnings)
     charges = [x for x in rows if x["type"] == "charge"]
     rep.balance_usd = sum(x["usd"] for x in rows if x["type"] == "payment") - sum(x["usd"] for x in charges)
@@ -182,19 +202,32 @@ def parse(data: bytes) -> Report:
         cands = [c for c in charges if c["row"] not in used_rows and abs(c["usd"] - total) < 0.1]
         if date:
             cands.sort(key=lambda c: abs((c["date"] - date).days))
-        if not cands:
-            rep.warnings.append(f"{name}: машина на ${total:.2f} не найдена во вкладке «Баланс» — курс не определён")
-            continue
-        c = cands[0]
-        used_rows.add(c["row"])
-        rate, prov, note = rates[c["row"]]
         s = sum(a.usd for a in awbs)
         if abs(s - total) > 1:
             rep.warnings.append(f"{name}: сумма по AWB ${s:.2f} ≠ итог листа ${total:.2f} (в машине есть что-то кроме консолидации/импорта)")
+        cb = awbs[0].cb
+        prate, pnote = provisional_rate(cb, today)
+        if cands:
+            c = cands[0]
+            used_rows.add(c["row"])
+            rub_cov, usd_left, note = rates[c["row"]]
+            share_cov = (c["usd"] - usd_left) / c["usd"] if c["usd"] else 0
+        else:
+            rub_cov, usd_left, note, share_cov = 0.0, total, "", 0.0
         for a in awbs:
-            a.rate, a.provisional = rate, prov
-            a.rub = round(a.usd * rate, 2)
-            a.rate_note = f"машина {name}, курс {rate:.4f} ₽/$ по оплатам «Баланс» {note or '—'}" + (
-                " — ещё не оплачено полностью, курс предварительный" if prov else "")
+            # covered part at the payment rate, uncovered part at (ЦБ + 3) / 0.96
+            part_cov = a.usd * share_cov
+            rub = (rub_cov * (a.usd / total) if total else 0) + (a.usd - part_cov) * prate
+            a.rub = round(rub, 2)
+            a.rate = a.rub / a.usd if a.usd else 0
+            a.provisional = share_cov < 0.9999
+            if not a.provisional:
+                a.rate_note = f"машина {name}, курс {a.rate:.4f} ₽/$ по оплатам «Баланс» {note or '—'}"
+            elif share_cov > 0:
+                a.rate_note = (f"машина {name}, курс {a.rate:.4f} — частично оплачено ({note}), остаток по "
+                               f"{pnote} — предварительный")
+            else:
+                a.rate_note = (f"машина {name}, курс {a.rate:.4f} = {pnote} — предварительный, "
+                               f"оплаты в «Балансе» ещё нет")
             rep.charges.append(a)
     return rep

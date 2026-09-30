@@ -67,6 +67,9 @@ class Result:
     lines: dict = field(default_factory=dict)             # line_id -> LineCalc
     legs: dict = field(default_factory=dict)              # (awb, leg) -> {"usd","rub","ids","own"}
     usd_spent: float = 0.0
+    est_rate: float = 0.0
+    estimated_inv: set = field(default_factory=set)     # unpaid invoices (≈)
+    estimated_legs: set = field(default_factory=set)    # (awb, leg) with ≈ ₽
     rub_spent: float = 0.0
     warnings: list = field(default_factory=list)
 
@@ -77,14 +80,21 @@ def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result
     tmap = {t.id: t for t in topups}
     rate = rate_of(tmap.get(topup_id))
     res = Result(rate=rate)
+    latest = max(topups, key=lambda t: t.id) if topups else None
+    est_rate = rate_of(latest)            # unpaid goods / unpaid freight: ≈ at the last top-up rate
+    res.est_rate = est_rate
     lines_by_inv = defaultdict(list)
     for l in lines:
         lines_by_inv[l.invoice_id].append(l)
 
     # ---- flowers -------------------------------------------------------------
     for inv in invoices:
-        r = rate_of(tmap.get(inv.topup_id))
-        rub = inv.rub_paid_override if inv.rub_paid_override is not None else round(inv.usd_paid * r)
+        unpaid = not inv.topup_id
+        r = est_rate if unpaid else rate_of(tmap.get(inv.topup_id))
+        usd = (inv.usd_paid or getattr(inv, "est_usd", None) or 0) if unpaid else inv.usd_paid
+        rub = inv.rub_paid_override if (inv.rub_paid_override is not None and not unpaid) else round(usd * r)
+        if unpaid:
+            res.estimated_inv.add(inv.id)
         res.invoice_rub[inv.id] = rub
         ls = lines_by_inv[inv.id]
         stems = sum(l.stems for l in ls)
@@ -94,7 +104,7 @@ def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result
             if inv.alloc_mode == "stems" or value == 0:
                 lc.price_rub = rub / stems if stems else 0
             else:
-                lc.price_rub = l.price_usd * rub / inv.usd_paid if inv.usd_paid else 0
+                lc.price_rub = l.price_usd * rub / usd if usd else (l.price_usd * r if unpaid else 0)
             res.lines[l.id] = lc
         if inv.topup_id == topup_id:
             res.usd_spent += inv.usd_paid
@@ -113,6 +123,11 @@ def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result
         g = groups[key]
         r = rate_of(tmap.get(lg.topup_id)) if lg.topup_id else 0
         rub = lg.rub if lg.rub is not None else (round((lg.usd or 0) * r) if r else None)
+        if rub is None and not getattr(lg, "paid", True) and lg.usd:
+            rub = round(lg.usd * est_rate)            # Expolanka on deferred payment: ≈ at the last rate
+            res.estimated_legs.add((norm_awb(lg.awb), lg.leg))
+        if "предварительн" in (getattr(lg, "note", "") or ""):
+            res.estimated_legs.add((norm_awb(lg.awb), lg.leg))
         if rub is None:
             res.warnings.append(f"Логистика MAWB {lg.awb}: есть только $ и нет курса — внеси сумму в ₽")
             rub = 0

@@ -1,9 +1,11 @@
 import json
+import re
+import asyncio
 import shutil
 import time
 from datetime import datetime
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonWebApp, Message,
                            ReplyKeyboardRemove, WebAppInfo)
@@ -18,6 +20,7 @@ from .models import Farm, Line, session
 LAST_DRAFT: dict[int, tuple[list, float]] = {}   # user -> ([draft ids], time)
 bot = Bot(BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
+pv = F.chat.type == "private"          # every dp.message handler is private-only; groups -> `grp` router
 from . import roles
 ops = F.from_user.id.func(lambda i: roles.role_of(i) is not None)          # any registered user
 wr = F.from_user.id.func(lambda i: roles.can_write(roles.role_of(i)))       # sys + super
@@ -48,7 +51,7 @@ async def on_error(event):
     return True
 
 
-@dp.message(CommandStart(), ops)
+@dp.message(pv, CommandStart(), ops)
 async def start(m: Message):
     r = roles.role_of(m.from_user.id)
     if not roles.can_write(r):
@@ -70,7 +73,7 @@ async def start(m: Message):
                    reply_markup=kb)
 
 
-@dp.message(wr, F.document.file_name.lower().endswith(".xlsx"))
+@dp.message(pv, wr, F.document.file_name.lower().endswith(".xlsx"))
 async def master(m: Message):
     f = await bot.download(m.document)
     data = f.read()
@@ -177,22 +180,164 @@ async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dic
         await note.edit_text(head + "\n\nНапиши MAWB следующим сообщением — сохраню разбивку.")
         return
 
-    t = topup_from_text(m.caption or "") or active_topup()
-    if not t:
-        did = save_draft(out)
-        await note.edit_text("Сначала создай пополнение в «Учёт» — документ лежит в черновиках.")
-        return
-    out["topup_id"] = t.id
+    # farm invoice / freight bill -> «оплачен?» flow
+    subs = split_by_farm(out) if out.get("doc_type") == "farm_invoice" else [out]
+    t = topup_from_text(m.caption or "")
     if out.get("doc_type") == "farm_invoice":
-        subs = split_by_farm(out)
-        if len(subs) > 1:
-            await _book_or_draft_multi(m, note, subs, t)
+        for d in subs:
+            fill_mawb(d, t.id if t else None)     # MAWB from the Expolanka breakdown right away
+    cu, _cr = money_from_text(m.caption or "")
+    flow = {"ids": [save_draft(d) for d in subs], "paid": None, "topup": t.id if t else None,
+            "pays": None, "kind": out.get("doc_type"), "ts": time.time(), "note": note}
+    if "не оплач" in (m.caption or "").lower():
+        flow["paid"] = False
+    elif cu or t:
+        flow["paid"] = True                       # sums or a top-up date in the caption = paid
+    if cu:
+        flow["pays"] = payments_for(m.caption or "", subs)
+        if flow["paid"] is False:                 # «не оплачен 1100$» = approximate $
+            flow["approx"] = True
+    FLOW[m.from_user.id] = flow
+    LAST_DRAFT[m.from_user.id] = (flow["ids"], time.time())
+    await _step(m.from_user.id, head=_flow_head(subs) + warn)
+
+
+# ---------- the «оплачен? → откуп → $» conversation --------------------------------------
+FLOW: dict[int, dict] = {}   # user -> current document in progress
+
+
+def _flow_docs(flow):
+    docs = []
+    for i in flow["ids"]:
+        p = DRAFTS / f"{i}.json"
+        if p.exists():
+            docs.append((p, json.loads(p.read_text())))
+    return docs
+
+
+def _flow_head(subs) -> str:
+    if len(subs) > 1:
+        return (f"📄 Общий инвойс {subs[0].get('invoice_no') or ''} на {len(subs)} плантации — делю:\n" + "\n".join(
+            f"• {d['farm']}: {sum(l.get('stems') or 0 for l in d['lines']):g} ст, ${d['invoice_total_usd']:g}"
+            + (f", MAWB {d['awb']}" if d.get("awb") else ", MAWB ?") for d in subs))
+    return _doc_head(subs[0])
+
+
+def _kb(rows):
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=d) for t, d in r] for r in rows])
+
+
+async def _send(uid: int, text: str, kb=None, note=None):
+    if note is not None:
+        try:
+            await note.edit_text(text, reply_markup=kb)
             return
-        fill_mawb(out, t.id)
-    usd, rub = money_from_text(m.caption or "")
-    if out.get("doc_type") == "freight_invoice" and usd is None:
-        usd = (out.get("freight") or {}).get("total_usd")          # $ of a freight bill is on the bill itself
-    await _book_or_draft(m, note, out, t, usd, rub)
+        except Exception:
+            pass
+    await bot.send_message(uid, text, reply_markup=kb)
+
+
+async def _step(uid: int, head: str = ""):
+    """Ask the next missing thing, or book when everything is known."""
+    from .models import TopUp
+    flow = FLOW.get(uid)
+    if not flow:
+        return
+    docs = _flow_docs(flow)
+    if not docs:
+        FLOW.pop(uid, None)
+        return
+    note, flow["note"] = flow.get("note"), None
+    head = (head + "\n\n") if head else ""
+    freight = flow["kind"] == "freight_invoice"
+    if flow["paid"] is None:
+        await _send(uid, head + "Оплачен?", _kb([[("✅ Оплачен", "fl:paid"), ("🚚 Не оплачен — в пути", "fl:unpaid")]]), note)
+        return
+    if flow["paid"] and not flow["topup"]:
+        with session() as s:
+            tops = s.exec(select(TopUp).order_by(TopUp.id.desc()).limit(8)).all()
+        if not tops:
+            await _send(uid, head + "Нет ни одного пополнения — создай его (скрин покупки USDT или «Учёт»).", None, note)
+            return
+        rows = [[(f"{x.date} · курс {x.rub / x.usd:.2f}", f"fl:tp:{x.id}")] for x in tops]
+        await _send(uid, head + "Из какого пополнения оплачен?", _kb(rows), note)
+        return
+    if freight and not flow["pays"]:
+        usd = (docs[0][1].get("freight") or {}).get("total_usd")
+        if usd:
+            flow["pays"] = [(usd, None)]           # the bill's own $
+    if not flow["pays"]:
+        many = len(docs) > 1
+        if flow["paid"]:
+            t = None
+            with session() as s:
+                t = s.get(TopUp, flow["topup"])
+            ask = (f"Сколько $ оплатили{' — по строке на ферму' if many else ''}? ₽ посчитаю по курсу "
+                   f"{t.date} ({t.rub / t.usd:.2f}). Если списали иначе — добавь ₽.")
+        else:
+            ask = (f"Примерно сколько $ будет оплата{' — по строке на ферму' if many else ''}? "
+                   f"Себестоимость посчитаю заранее (±10%).")
+        ex = "\n".join(f"{d['farm']} {round(d.get('invoice_total_usd') or 1000)}$" for _p, d in docs) if many else \
+            f"{round(docs[0][1].get('invoice_total_usd') or 1000)}$"
+        await _send(uid, head + ask + f"\nНапример:\n{ex}", None, note)
+        return
+    await _book_flow(uid, head, note)
+
+
+async def _book_flow(uid: int, head: str, note):
+    from .models import TopUp
+    flow = FLOW.pop(uid, None)
+    docs = _flow_docs(flow)
+    t = None
+    if flow["paid"]:
+        with session() as s:
+            t = s.get(TopUp, flow["topup"])
+    pays = flow["pays"] + [None] * (len(docs) - len(flow["pays"]))
+    out = []
+    for (p, d), pr in zip(docs, pays):
+        usd, rub = pr or (None, None)
+        if d.get("doc_type") == "farm_invoice":
+            fill_mawb(d, t.id if t else None)
+        snap, kind = book_document(d, t.id if t else 0, usd, rub, uid, paid=bool(flow["paid"]))
+        if not snap:
+            out.append(f"❌ {d.get('farm') or ''}: не внёс — {kind}. Черновик в «Учёт».")
+            continue
+        p.unlink(missing_ok=True)
+        pre = f"{d['farm']}: " if len(docs) > 1 else ""
+        out.append(pre + (_booked_text(snap, d, kind, t, uid) if t else _transit_text(snap, d, kind)))
+    await _send(uid, head + "\n\n".join(out), None, note)
+    await _flush_export(uid, "📊 Логистика легла на товар из прошлого пополнения.")
+
+
+def _transit_text(v: dict, d: dict, kind: str) -> str:
+    fmt = lambda x: f"{x:,.0f}".replace(",", " ")
+    if kind == "freight":
+        lg = max(v["unpaid_logistics"], key=lambda x: x["id"]) if v["unpaid_logistics"] else None
+        return (f"🚚 Фрахт в пути, не оплачен: ${lg['usd']:g} ≈ {fmt(lg['rub_est'])} ₽ по курсу {v['est_rate']:.2f} "
+                f"(последнее пополнение {v['est_topup']})") if lg else "🚚 Фрахт внесён как неоплаченный"
+    inv = max(v["invoices"], key=lambda x: x["id"])
+    return (f"🚚 В пути, не оплачен: ≈${inv['est_usd']:g} ≈ {fmt(inv['rub_goods'])} ₽ (курс {v['est_rate']:.2f}, "
+            f"пополнение {v['est_topup']})\n"
+            f"≈ Себестоимость {inv['avg_rub']:.2f} ₽/ст ±10% (логистика: {inv['logi_source']})\n"
+            "Оплатишь — нажми «Оплачен» в «В пути» или в напоминании во вторник/среду.")
+
+
+@dp.callback_query(F.data.startswith("fl:"), wr)
+async def flow_button(c: CallbackQuery):
+    flow = FLOW.get(c.from_user.id)
+    if not flow:
+        await c.answer("Документ уже обработан или устарел", show_alert=True)
+        return
+    part = c.data.split(":")
+    if part[1] == "paid":
+        flow["paid"] = True
+    elif part[1] == "unpaid":
+        flow["paid"] = False
+    elif part[1] == "tp":
+        flow["topup"] = int(part[2])
+    flow["note"] = c.message
+    await c.answer()
+    await _step(c.from_user.id)
 
 
 _AUTO_EXPORT: set = set()
@@ -348,13 +493,13 @@ def _applied_text(w: dict) -> str:
     return txt
 
 
-@dp.message(wr, F.document.mime_type.in_({"application/pdf", "image/jpeg", "image/png"}))
+@dp.message(pv, wr, F.document.mime_type.in_({"application/pdf", "image/jpeg", "image/png"}))
 async def doc(m: Message):
     f = await bot.download(m.document)
     await _parse_and_reply(m, f.read(), m.document.mime_type)
 
 
-@dp.message(wr, F.photo)
+@dp.message(pv, wr, F.photo)
 async def photo(m: Message):
     f = await bot.download(m.photo[-1])
     await _parse_and_reply(m, f.read(), "image/jpeg")
@@ -366,7 +511,7 @@ async def channel_id(m: Message):
     await m.answer(f"BACKUP_CHAT_ID={m.chat.id}")
 
 
-@dp.message(wr, F.forward_origin.chat)
+@dp.message(pv, wr, F.forward_origin.chat)
 async def forwarded_from_channel(m: Message):
     """Forward any post from the channel to the bot -> it tells the channel id. Works even if
     the bot isn't admin yet (but it must be admin for backups to work)."""
@@ -375,7 +520,7 @@ async def forwarded_from_channel(m: Message):
                    "Бот должен быть админом канала с правом публиковать и закреплять.")
 
 
-@dp.message(sysf, Command("backup"))
+@dp.message(pv, sysf, Command("backup"))
 async def manual_backup(m: Message):
     from .backup import BACKUP_CHAT_ID, backup_now
     if not BACKUP_CHAT_ID:
@@ -385,7 +530,7 @@ async def manual_backup(m: Message):
     await m.answer("💾 Бэкап отправлен в канал и закреплён")
 
 
-@dp.message(~ops)
+@dp.message(pv, ~ops)
 async def stranger(m: Message):
     u = m.from_user
     await m.answer("Запрос на доступ отправлен администратору. Как только он выдаст роль — напиши /start.")
@@ -426,13 +571,13 @@ async def give_role(c: CallbackQuery):
     await c.answer()
 
 
-@dp.message(sysf, Command("users"))
+@dp.message(pv, sysf, Command("users"))
 async def list_users_cmd(m: Message):
     lines = [f"• {u['name'] or '—'} · ID {u['tg_id']} · {u['role_name']}" for u in roles.users()]
     await m.answer("Пользователи:\n" + "\n".join(lines) + "\n\nМенять роли — «Учёт» → Пользователи.")
 
 
-@dp.message(ops, Command("excel"))
+@dp.message(pv, ops, Command("excel"))
 async def excel_cmd(m: Message):
     """Everyone (including 1С) can get the current report."""
     from .models import TopUp
@@ -445,13 +590,65 @@ async def excel_cmd(m: Message):
     await export_topups(ids, m.from_user.id, "📊 Актуальный учёт")
 
 
-@dp.message(ops, F.document | F.photo)
+@dp.message(pv, ops, F.document | F.photo)
 async def viewer_upload(m: Message):
     await m.answer("У тебя роль «1С оператор» — только просмотр. Отчёт: /excel или «Учёт» → «Excel в чат».")
 
 
-@dp.message(wr, F.text.func(lambda t: any(money_from_text(t)) and not ai.find_mawb(t)))
+@dp.message(pv, wr, F.text.func(lambda t: bool(re.search(r"(?:9\d|1[0-4]\d)\s*[.,x×*]\s*\d{2}\s*[.,x×*]\s*\d{2}(?!\d)", t or ""))))
+async def weights_message(m: Message):
+    """Expolanka weights from WhatsApp ('Zeeflora - 11 - 100.48.25 …') -> volumetric kg per farm."""
+    from .api import learn_dims, volumetric_breakdown
+    rows = volumetric_breakdown(m.text)
+    if not rows:
+        await m.answer("Не понял размеры. Формат как у Expolanka: `Zeeflora - 11 - 100.48.25`", parse_mode="Markdown")
+        return
+    learn_dims([r for r in rows if r["farm"] != "?"])
+    fmt = lambda x: f"{x:g}"
+    lines = []
+    for r in rows:
+        parts = " + ".join(f"{n}×{d} ({fmt(k)} кг)" + (" — обычная коробка" if len(rest) else "")
+                           for n, d, k, *rest in r["dims"])
+        lines.append(f"• {r['farm']}: {r['boxes']} кор. = {fmt(r['kg'])} кг  [{parts}]")
+    total = sum(r["kg"] for r in rows)
+    txt = "📦 Объёмный вес (Д×Ш×В / 6000):\n" + "\n".join(lines) + f"\nИтого {fmt(round(total, 1))} кг"
+    if any(r["farm"] == "?" for r in rows):
+        txt += "\n⚠️ У одной строки нет фермы — допиши имя и пришли ещё раз"
+    per = [{"farm": r["farm"], "kg": round(r["kg"], 1), "boxes": r["boxes"]} for r in rows if r["farm"] != "?"]
+    awb = ai.find_mawb(m.text)
+    if awb:
+        await m.answer(txt + "\n\n" + _applied_text(store_breakdown(awb, per)))
+        return
+    did = save_draft({"doc_type": "kg_breakdown", "awb": None, "per_farm_kg": per, "lines": [], "warnings": [],
+                      "source": "volumetric"})
+    LAST_DRAFT[m.from_user.id] = ([did], time.time())
+    await m.answer(txt + "\n\nНапиши MAWB этой отправки — сохраню как разбивку.")
+
+
+@dp.message(pv, wr, F.text.func(lambda t: any(money_from_text(t)) and not ai.find_mawb(t)))
 async def money_followup(m: Message):
+    flow = FLOW.get(m.from_user.id)
+    if flow and time.time() - flow["ts"] < 60 * 60:
+        docs = _flow_docs(flow)
+        pays = payments_for(m.text, [d for _p, d in docs]) or []
+        if not any(pr and pr[0] for pr in pays):
+            await m.answer("Не вижу суммы в $ — напиши, например, `1115$`", parse_mode="Markdown")
+            return
+        flow["pays"] = pays
+        await _step(m.from_user.id)
+        return
+    pay = PAY.get(m.from_user.id)
+    if pay and pay.get("topup"):
+        usd, rub = money_from_text(m.text)
+        if not usd:
+            await m.answer("Нужна сумма в $, например `1115$`", parse_mode="Markdown")
+            return
+        await _finish_pay(m.from_user.id, usd, rub)
+        return
+    await _money_followup_legacy(m)
+
+
+async def _money_followup_legacy(m: Message):
     """'1198$ 105472₽' right after a document -> books the last draft(s).
     For a split trader invoice: one line per farm ('Agriflora 301$ 26500₽'), or one sum for all."""
     ids, ts = LAST_DRAFT.get(m.from_user.id, ([], 0))
@@ -486,7 +683,7 @@ async def money_followup(m: Message):
     await m.answer("\n\n".join(out), parse_mode="Markdown")
 
 
-@dp.message(wr, Command("pop"))
+@dp.message(pv, wr, Command("pop"))
 async def choose_topup(m: Message):
     """Pick the top-up that chat documents go to."""
     from .models import TopUp
@@ -513,7 +710,7 @@ async def set_topup(c: CallbackQuery):
     await c.answer()
 
 
-@dp.message(wr, F.text.func(lambda t: bool(ai.find_mawb(t))))
+@dp.message(pv, wr, F.text.func(lambda t: bool(ai.find_mawb(t))))
 async def mawb_followup(m: Message):
     """MAWB sent as a separate message right after a document -> goes into that draft.
     MAWB + 'Farm kg' pairs in one message -> a kg breakdown for that MAWB."""
@@ -543,6 +740,228 @@ async def mawb_followup(m: Message):
     await m.answer(f"MAWB {d['awb']} записан в черновик #{did}" + (f" (было {old})" if old and old != d["awb"] else ""))
 
 
-@dp.message(ops)
+# ---------- payments from the reminder / «В пути» -----------------------------------------
+PAY: dict[int, dict] = {}    # user -> {"type": "i"|"l", "id": .., "topup": ..}
+
+
+async def _ask_pay_topup(uid: int, kind: str, oid: int, note=None):
+    from .models import TopUp
+    PAY[uid] = {"type": kind, "id": oid, "topup": None}
+    with session() as s:
+        tops = s.exec(select(TopUp).order_by(TopUp.id.desc()).limit(8)).all()
+    rows = [[(f"{x.date} · курс {x.rub / x.usd:.2f}", f"pt:{x.id}")] for x in tops]
+    await _send(uid, "Из какого пополнения оплачен?", _kb(rows), note)
+
+
+@dp.callback_query(F.data.startswith("pay:"), wr)
+async def pay_button(c: CallbackQuery):
+    _, kind, oid = c.data.split(":")
+    await c.answer()
+    await _ask_pay_topup(c.from_user.id, kind, int(oid))
+
+
+@dp.callback_query(F.data.startswith("pt:"), wr)
+async def pay_topup_button(c: CallbackQuery):
+    from .models import Invoice, Logistics, TopUp
+    pay = PAY.get(c.from_user.id)
+    if not pay:
+        await c.answer("Устарело — нажми «Оплачен» ещё раз", show_alert=True)
+        return
+    pay["topup"] = int(c.data.split(":")[1])
+    await c.answer()
+    with session() as s:
+        t = s.get(TopUp, pay["topup"])
+        o = s.get(Invoice if pay["type"] == "i" else Logistics, pay["id"])
+        hint = (o.est_usd if pay["type"] == "i" else o.usd) if o else None
+        name = (o.farm if pay["type"] == "i" else o.provider) if o else "?"
+    kb = _kb([[(f"Как было: ${hint:g}", f"pu:{hint}")]]) if hint else None
+    await c.message.edit_text(f"{name} → пополнение {t.date}. Сколько $ оплатили? ₽ посчитаю по курсу {t.rub / t.usd:.2f}"
+                              f" (если списали иначе — добавь ₽: `1115$ 98000₽`).", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("pu:"), wr)
+async def pay_same_usd(c: CallbackQuery):
+    await c.answer()
+    await _finish_pay(c.from_user.id, float(c.data.split(":")[1]), None, c.message)
+
+
+async def _finish_pay(uid: int, usd: float, rub, note=None):
+    from .api import pay_invoice, pay_logistics
+    pay = PAY.pop(uid, None)
+    if not pay:
+        return
+    try:
+        r = pay_invoice(pay["id"], pay["topup"], usd, rub) if pay["type"] == "i" else \
+            pay_logistics(pay["id"], pay["topup"], usd, rub)
+    except ValueError as e:
+        await _send(uid, f"Не вышло: {e}", None, note)
+        return
+    who = r.get("farm") or r.get("provider")
+    await _send(uid, f"✅ {who}: оплачен из пополнения {r['topup']} — ${r['usd']:g} / {r['rub']:,.0f} ₽".replace(",", " ")
+                + (" (по курсу)" if rub is None else "") + ". Себестоимость теперь точная.", None, note)
+    _AUTO_EXPORT.add(pay["topup"])
+    await _flush_export(uid, "📊 Инвойс оплачен — лист пополнения обновлён.")
+
+
+# ---------- scheduler: arrivals + payment reminders (Tue 10:00 & Wed 10:00 MSK) ---------------
+def _msk_now():
+    from datetime import datetime, timedelta, timezone
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)
+
+
+def _money_people():
+    return [u["tg_id"] for u in roles.users() if u["role"] in ("sys", "super")]
+
+
+async def payment_reminder(uid_list=None):
+    from .api import unpaid_items
+    u = unpaid_items()
+    fmt = lambda x: f"{x:,.0f}".replace(",", " ")
+    if not u["invoices"] and not u["logistics"]:
+        text, kb = "💸 Платежи: неоплаченных инвойсов нет.", None
+    else:
+        rate = u["rate"] or 0
+        lines, rows, tot_usd, tot_rub = [], [], 0.0, 0.0
+        for x in u["invoices"]:
+            usd = x.get("est_usd") or 0
+            lines.append(f"• {x['farm']} · инв {x.get('invoice_no') or '—'} · MAWB {x.get('awb') or '?'} · ≈${usd:g} ≈ {fmt(usd * rate)} ₽")
+            rows.append([(f"✅ Оплачен: {x['farm']} ${usd:g}", f"pay:i:{x['id']}")])
+            tot_usd += usd; tot_rub += usd * rate
+        for x in u["logistics"]:
+            usd = x.get("usd") or 0
+            lines.append(f"• {x['provider'] or 'Фрахт'} · MAWB {x['awb']} · ${usd:g} ≈ {fmt(usd * rate)} ₽")
+            rows.append([(f"✅ Оплачен: {x['provider'] or 'фрахт'} ${usd:g}", f"pay:l:{x['id']}")])
+            tot_usd += usd; tot_rub += usd * rate
+        text = (f"💸 Платежи на среду ({len(lines)}):\n" + "\n".join(lines) +
+                f"\n\nИтого ≈ ${fmt(tot_usd)} ≈ {fmt(tot_rub)} ₽ (курс {rate:.2f}, последнее пополнение {u['topup']})")
+        kb = _kb(rows[:20])
+    for uid in uid_list or _money_people():
+        try:
+            await bot.send_message(uid, text, reply_markup=kb)
+        except Exception as e:
+            print(f"[lumen] reminder to {uid} failed: {e}", flush=True)
+
+
+@dp.message(pv, wr, Command("pay"))
+async def pay_cmd(m: Message):
+    """Show the payment list now (same as the Tue/Wed reminder)."""
+    await payment_reminder([m.from_user.id])
+
+
+REMINDER_SLOTS = [(1, 10), (2, 10)]   # (weekday Mon=0, hour MSK): Tuesday 10:00 and Wednesday 10:00
+
+
+async def scheduler_loop():
+    from .api import _settings, SETTINGS, arrive_due
+    while True:
+        try:
+            now = _msk_now()
+            done = arrive_due(now.strftime("%Y-%m-%dT%H:%M"))
+            if done:
+                txt = "📦 Прибыло на склад (по сообщению Floratrack +1 ч):\n" + "\n".join(
+                    f"• {d['farm']} · MAWB {d['awb']} · {'оплачен' if d['paid'] else 'НЕ оплачен'}" for d in done)
+                for uid in _money_people():
+                    try:
+                        await bot.send_message(uid, txt)
+                    except Exception:
+                        pass
+            slot = None
+            for wd, hh in REMINDER_SLOTS:
+                if now.weekday() == wd and now.hour == hh and now.minute < 15:
+                    slot = now.strftime(f"%Y-%m-%d-{hh}")
+            st = _settings()
+            if slot and st.get("last_reminder") != slot:
+                SETTINGS.write_text(json.dumps({**st, "last_reminder": slot}))
+                await payment_reminder()
+        except Exception as e:
+            print(f"[lumen] scheduler: {e}", flush=True)
+        await asyncio.sleep(30)
+
+
+# ---------- Floratrack group chat: truck on the way -> arrival = their time + 1 h ------------
+grp = Router()
+grp.message.filter(F.chat.type.in_({"group", "supergroup"}))
+dp.include_router(grp)
+_FT_PENDING: dict[int, str] = {}
+
+
+def _parse_truck(text: str, sent_msk):
+    """'…предварительное время прибытия на склад к 06:00…  • ( DILUNA ) → 34 BOG AWB 543-18688902'"""
+    from datetime import timedelta
+    awbs = re.findall(r"AWB\s*([0-9]{3}[\s\-]?[0-9]{4}\s?[0-9]{4})", text, re.I)
+    m = re.search(r"(?:прибыти[яе][^0-9]{0,40}?|к\s|в\s)(\d{1,2})[:.](\d{2})", text, re.I) or re.search(r"(\d{1,2}):(\d{2})", text)
+    if not awbs or not m:
+        return None, awbs
+    eta = sent_msk.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+    if eta < sent_msk - timedelta(hours=2):
+        eta += timedelta(days=1)                   # "к 06:00" written in the evening = tomorrow morning
+    return eta + timedelta(hours=1), awbs          # Arman's rule: +1 hour
+
+
+async def _handle_truck(chat_title: str, text: str, sent_msk):
+    from .api import set_eta
+    arrive, awbs = _parse_truck(text, sent_msk)
+    if not arrive:
+        return
+    matched, unknown = set_eta(awbs, arrive.strftime("%Y-%m-%dT%H:%M"))
+    truck = re.search(r"Машина\s+(\S+)", text)
+    msg = (f"🚛 Floratrack: машина {truck.group(1) if truck else ''} едет на склад, "
+           f"закрою как «прибыл» {arrive.strftime('%d.%m %H:%M')} МСК (их время +1 ч).\n")
+    msg += "\n".join(f"• MAWB {a}: {', '.join(f)}" for a, f in matched) or "Наших инвойсов с этими MAWB пока нет."
+    if unknown:
+        msg += "\nНет инвойсов с MAWB: " + ", ".join(unknown)
+    for uid in _money_people():
+        try:
+            await bot.send_message(uid, msg)
+        except Exception:
+            pass
+
+
+@grp.message(F.text)
+async def group_text(m: Message):
+    from .api import _settings
+    text = m.text or ""
+    if "AWB" not in text.upper():
+        return
+    from datetime import timedelta
+    sent = m.date.replace(tzinfo=None) + timedelta(hours=3)
+    if m.chat.id in (_settings().get("ft_chats") or []):
+        await _handle_truck(m.chat.title or "", text, sent)
+        return
+    if m.chat.id in _FT_PENDING:
+        return
+    _FT_PENDING[m.chat.id] = text
+    for uid in roles.sys_ids():
+        try:
+            await bot.send_message(uid, f"Вижу сообщение про AWB в чате «{m.chat.title}». Это чат Floratrack?",
+                                   reply_markup=_kb([[("Да, это Floratrack", f"ftc:{m.chat.id}:{int(sent.timestamp())}"),
+                                                      ("Нет", f"ftn:{m.chat.id}")]]))
+        except Exception:
+            pass
+
+
+@dp.callback_query(F.data.startswith("ftc:"), sysf)
+async def ft_chat_yes(c: CallbackQuery):
+    from datetime import datetime
+    from .api import _settings, SETTINGS
+    _, cid, ts = c.data.split(":")
+    cid = int(cid)
+    st = _settings()
+    SETTINGS.write_text(json.dumps({**st, "ft_chats": sorted(set((st.get("ft_chats") or []) + [cid]))}))
+    await c.message.edit_text("✅ Запомнил чат Floratrack — машины из него буду закрывать как «прибыл» сами.")
+    await c.answer()
+    text = _FT_PENDING.pop(cid, None)
+    if text:
+        await _handle_truck("", text, datetime.fromtimestamp(int(ts)))
+
+
+@dp.callback_query(F.data.startswith("ftn:"), sysf)
+async def ft_chat_no(c: CallbackQuery):
+    await c.message.edit_text("Ок, этот чат игнорирую.")
+    await c.answer()
+
+
+# catch-all goes LAST so /pay and other commands above get a chance first
+@dp.message(pv, ops)
 async def other(m: Message):
     await m.answer("Жду PDF/фото инвойса или .xlsx мастер-файла. Всё остальное — в «Учёт».")

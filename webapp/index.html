@@ -19,7 +19,7 @@
 }
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg2);color:var(--fg);font-size:15px;line-height:1.4}
-body{padding:env(safe-area-inset-top,0) 0 calc(env(safe-area-inset-bottom,0) + 90px)}
+body{padding:env(safe-area-inset-top,0) 0 calc(env(safe-area-inset-bottom,0) + 110px)}
 .num{font-variant-numeric:tabular-nums}
 h1{font-family:"Cormorant Garamond",Georgia,serif;font-weight:600;font-size:30px;line-height:1.1;margin:18px 16px 4px}
 h2{font-size:13px;font-weight:600;color:var(--muted);margin:22px 16px 8px}
@@ -71,6 +71,14 @@ form{margin:0}
 .x{color:var(--err);background:none;padding:4px 8px}
 .ro #farms,.ro #save,.ro #del,.ro .x,.ro .drop,.ro #addLine,.ro #new,.ro #addInv,.ro #addLog,.ro #addRow,.ro #edit,.ro #delTop,.ro #act,.ro #audit,.ro #drafts{display:none!important}
 .ro input,.ro select,.ro textarea{pointer-events:none;opacity:.85}
+.tabbar{position:fixed;left:0;right:0;bottom:0;display:flex;background:var(--bg);border-top:1px solid var(--line);
+  padding:6px 4px calc(6px + env(safe-area-inset-bottom,0));z-index:10}
+.tabbar button{flex:1;background:none;border-radius:10px;padding:6px 2px;font-size:11px;font-weight:600;color:var(--muted);display:flex;flex-direction:column;align-items:center;gap:2px}
+.tabbar button .i{font-size:20px;line-height:1}
+.tabbar button.on{color:var(--rose)}
+.big{font-family:"Cormorant Garamond",Georgia,serif;font-size:30px;font-weight:600;line-height:1.1}
+.pill.ok{background:color-mix(in srgb,var(--ok) 14%,transparent);color:var(--ok)}
+.pill.warn{background:color-mix(in srgb,var(--warn) 16%,transparent);color:var(--warn)}
 #toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom,0));transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:10px 16px;border-radius:12px;font-size:14px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:90%}
 #toast.on{opacity:1}
 @media (prefers-reduced-motion:reduce){#toast{transition:none}}
@@ -78,6 +86,7 @@ form{margin:0}
 </head>
 <body>
 <div id="app"></div>
+<nav class="tabbar" id="tabbar"></nav>
 <div id="toast"></div>
 <script>
 const tg = window.Telegram?.WebApp; tg?.ready(); tg?.expand();
@@ -101,10 +110,21 @@ const stack=[];
 function go(view, args={}, push=true){ if(push) stack.push([view,args]); render(view,args) }
 function back(){ stack.pop(); const [v,a]=stack[stack.length-1]||['home',{}]; render(v,a) }
 tg?.BackButton.onClick(back);
+const TABS=[['home','💐','Откупы'],['transit','🚚','В пути'],['stock','📦','Остатки'],['more','⋯','Ещё']];
+const TAB_OF={home:'home',topup:'home',topupForm:'home',draft:'home',invoice:null,logistics:null,weights:'home',
+  transit:'transit',transitInv:'transit',stock:'stock',more:'more',farms:'more',farm:'more',users:'more'};
+let CUR_TAB='home';
+function tab(v){ stack.length=0; go(v) }
+function drawTabs(){
+  const tabs=TABS.filter(([v])=>v!=='more'||ME?.can_write);
+  document.getElementById('tabbar').innerHTML=tabs.map(([v,i,t])=>`<button class="${CUR_TAB===v?'on':''}" data-tab="${v}"><span class="i">${i}</span>${t}</button>`).join('');
+  document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>tab(b.dataset.tab));
+}
 async function render(view,args){
+  if(TAB_OF[view]) CUR_TAB=TAB_OF[view];
   stack.length>1 ? tg?.BackButton.show() : tg?.BackButton.hide();
   window.scrollTo(0,0);
-  try{ await VIEWS[view](args) }catch(e){ $app.innerHTML=`<div class="empty">Не загрузилось: ${esc(e.message)}</div>` }
+  try{ await whoami(); drawTabs(); await VIEWS[view](args) }catch(e){ $app.innerHTML=`<div class="empty">Не загрузилось: ${esc(e.message)}</div>` }
 }
 
 let FARMS=[], ME=null, MONEY={};
@@ -130,9 +150,8 @@ async home(){
       <div class="s num">${fmt(t.rub)} ₽ → $${fmt(t.usd)} · курс ${fmt(t.rate,4)}</div></div>
       ${ME.sees_money&&MONEY[t.id]?`<div class="v"><div class="num">$${fmt(MONEY[t.id].usd_left,2)}</div><div class="s">остаток</div></div>`:''}</div>`).join('')
       :'<div class="empty">Пополнений пока нет. Начни с первого.</div>'}</div>
-    <div class="actions"><button class="primary" id="new">Новое пополнение</button>${ME.can_write?'<button id="farms">Плантации</button>':''}</div>
-    ${ME.role==='sys'?'<div class="actions"><button id="users">Пользователи и роли</button></div>':''}
-    <p class="hint" style="margin:8px 16px">Роль: ${esc(ME.role_name)}</p>`;
+    <div class="actions"><button class="primary" id="new">Новое пополнение</button></div>
+`;
   $app.querySelectorAll('[data-top]').forEach(e=>e.onclick=()=>go('topup',{id:+e.dataset.top}));
   $app.querySelectorAll('[data-draft]').forEach(e=>e.onclick=()=>{const d=drafts.find(x=>x.id===e.dataset.draft);
     if(d.doc_type==='kg_breakdown'){d._draftId=d.id;return go('weights',{t:null,draft:d})}   // weights don't belong to a top-up
@@ -233,8 +252,9 @@ async topup({id, snap}){
 // ======================= INVOICE =======================
 async invoice({t, inv, draft}){
   const TOPS = await api('/topups');
+  if(!t.id){ t={...t, rate:(TOPS[0]||{}).rate||0, date:t.date||'в пути'} }        // unpaid: ≈ at the last top-up rate
   inv = inv || {topup_id:t.id,country:'',client_code:'Люмен',invoice_no:'',invoice_date:'',awb:'',farm:'',weight_kg:null,
-    invoice_total_usd:null,usd_paid:'',rub_paid_override:null,alloc_mode:'value',paid:true,paid_date:t.date,note:'',lines:[]};
+    invoice_total_usd:null,usd_paid:'',rub_paid_override:null,alloc_mode:'value',paid:true,paid_date:t.id?t.date:'',note:'',lines:[]};
   if(draft) applyParsed(inv, draft);
   if(!inv.lines.length) inv.lines=[{name:'',boxes:null,stems:'',weight_kg:null,price_usd:''}];
   const farmOpts = FARMS.filter(f=>!f.is_forwarder).map(f=>`<option value="${esc(f.name)}">`).join('');
@@ -251,7 +271,7 @@ async invoice({t, inv, draft}){
     <div class="two"><div class="field"><label>MAWB</label><input name="awb" value="${esc(inv.awb)}"></div>
     <div class="field"><label>Вес плантации в MAWB, кг</label><input name="weight_kg" inputmode="decimal" value="${inv.weight_kg??''}"></div></div>
     <div class="two"><div class="field"><label>Код клиента</label><input name="client_code" value="${esc(inv.client_code)}"></div>
-    <div class="field"><label>Пополнение</label><select name="topup">${TOPS.map(x=>`<option value="${x.id}" ${x.id===(inv.topup_id||t.id)?'selected':''}>${esc(x.date)} · $${fmt(x.usd,0)}</option>`).join('')}</select></div></div>
+    <div class="field"><label>Пополнение</label><select name="topup"><option value="0" ${!(inv.topup_id??t.id)?'selected':''}>🚚 не оплачен — в пути</option>${TOPS.map(x=>`<option value="${x.id}" ${x.id===(inv.topup_id??t.id)?'selected':''}>${esc(x.date)} · $${fmt(x.usd,0)}</option>`).join('')}</select></div></div>
   </form>
   <h2>Номенклатура</h2>
   <div class="group scroll"><table class="lines"><thead><tr><th style="min-width:170px">Название</th><th>Кор.</th><th>Стебли</th><th>Кг</th><th>$ / ст</th><th>₽ / ст</th><th></th></tr></thead>
@@ -260,7 +280,7 @@ async invoice({t, inv, draft}){
   <h2>Оплата</h2>
   <form id="p" class="group">
     <div class="two"><div class="field"><label>Итог по инвойсу, $ (для справки)</label><input name="invoice_total_usd" inputmode="decimal" value="${inv.invoice_total_usd??''}"></div>
-    <div class="field"><label>Оплачено, $</label><input name="usd_paid" inputmode="decimal" value="${inv.usd_paid??''}"></div></div>
+    <div class="field"><label id="usdLbl">Оплачено, $</label><input name="usd_paid" inputmode="decimal" value="${inv.usd_paid??''}"></div></div>
     <div class="field"><label>Оплачено, ₽ <span id="rubMode" class="pill" style="margin-left:6px"></span></label><input name="rub_paid_override" inputmode="decimal" value="${inv.rub_paid_override??''}"></div>
     <div class="hint" style="padding:0 14px 8px">Цена стебля в ₽ = цена $ × (₽ / $ оплаты). Налог и сборы в стебель не идут.</div>
     <div class="field"><label>Как делить ₽ по строкам</label><select name="alloc_mode">
@@ -309,7 +329,13 @@ async invoice({t, inv, draft}){
     if(e.target.name==='rub_paid_override' && rubAuto) syncRub();
     sums()};
   p.onchange=p.oninput;
-  f.topup.addEventListener('change',()=>{syncRub();sums()});
+  const unpaidMode=()=>{const u=!+f.topup.value; document.getElementById('usdLbl').textContent=u?'Примерно $ (не оплачен)':'Оплачено, $';
+    p.rub_paid_override.closest('.field').style.display=u?'none':'';
+    p.paid.closest('.two').style.display=u?'none':'';
+    if(u) p.paid_date.value=''; else if(!p.paid_date.value) p.paid_date.value=new Date().toLocaleDateString('ru-RU')};
+  f.topup.addEventListener('change',()=>{unpaidMode();syncRub();sums()});
+  if(!inv.topup_id && inv.est_usd && !inv.usd_paid) p.usd_paid.value=inv.est_usd;
+  unpaidMode();
   f.farm.onchange=()=>{const m=FARMS.find(x=>x.name.toLowerCase()===f.farm.value.toLowerCase());if(m&&!f.country.value)f.country.value=m.country};
   document.getElementById('addLine').onclick=()=>{inv.lines.push({name:'',stems:'',price_usd:''});drawLines()};
   drawLines();
@@ -326,17 +352,20 @@ async invoice({t, inv, draft}){
     for(const k of ['farm','country','invoice_no','invoice_date','awb','client_code']) inv[k]=f[k].value.trim();
     inv.weight_kg=numOrNull(f.weight_kg.value);
     for(const k of ['invoice_total_usd','usd_paid','rub_paid_override']) inv[k]=numOrNull(p[k].value);
+    if(!+f.topup.value){ inv.est_usd=inv.usd_paid; inv.usd_paid=0; inv.rub_paid_override=null; inv.paid=false }
     inv.alloc_mode=p.alloc_mode.value; inv.paid=p.paid.value==='1'; inv.paid_date=p.paid_date.value; inv.note=p.note.value;
     inv.topup_id=+f.topup.value;
   }
   document.getElementById('save').onclick=async()=>{
     collect();
     if(!inv.farm) return toast('Укажи плантацию');
-    if(!inv.usd_paid||!inv.rub_paid_override) return toast('Впиши оплату: $ и ₽');
+    if(inv.topup_id && (!inv.usd_paid||!inv.rub_paid_override)) return toast('Впиши оплату: $ и ₽');
+    if(!inv.topup_id && !inv.est_usd) return toast('Впиши примерную сумму в $');
     const lines=inv.lines.filter(l=>l.name&&numOrNull(l.stems)).map(l=>({name:l.name.trim(),boxes:numOrNull(l.boxes),stems:numOrNull(l.stems),weight_kg:numOrNull(l.weight_kg),price_usd:numOrNull(l.price_usd)||0,mrc:numOrNull(l.mrc)}));
     const {id,_warnings,rub_paid,...body}=inv; body.lines=lines; body.usd_paid=inv.usd_paid;
     const snap=await api('/invoices'+(id?'?inv_id='+id:''),{method:'POST',body});
     if(draft?._draftId) await api('/drafts/'+draft._draftId,{method:'DELETE'});
+    if(!inv.topup_id){ toast('Сохранено в «В пути»'); return tab('transit') }
     const moved=inv.topup_id!==t.id;
     toast(moved?'Инвойс перенесён в пополнение '+(TOPS.find(x=>x.id===inv.topup_id)||{}).date:'Инвойс сохранён'); stack.pop();
     const sn=moved?undefined:snap;
@@ -467,6 +496,73 @@ async draft({d,tops}){
   document.getElementById('drop').onclick=async()=>{await api('/drafts/'+d.id,{method:'DELETE'});back()};
 },
 
+// ======================= В ПУТИ =======================
+async transit(){
+  const v=await api('/transit');
+  const by={}; v.invoices.forEach(i=>(by[i.awb||'без MAWB']??=[]).push(i));
+  const eta=i=>i.eta?`прибытие ${i.eta.slice(8,10)}.${i.eta.slice(5,7)} ${i.eta.slice(11,16)}`:'';
+  $app.innerHTML=`<h1>Груз в пути</h1>
+  <p class="sub">≈ по курсу ${fmt(v.est_rate,2)} (пополнение ${esc(v.est_topup||'—')}). Приблизительная себестоимость — отклонение до ±10%.</p>
+  ${Object.keys(by).length?Object.entries(by).map(([awb,list])=>`<h2>MAWB ${esc(awb)}${list.find(x=>x.eta)?' · '+eta(list.find(x=>x.eta)):''}</h2>
+    <div class="group">${list.map(i=>`<div class="row" data-ti="${i.id}"><div class="grow">
+      <div class="t">${esc(i.farm)}</div>
+      <div style="margin:3px 0"><span class="pill ${i.paid_state==='paid'?'ok':'warn'}">${i.paid_state==='paid'?'оплачен · '+esc(i.topup):'не оплачен'}</span></div>
+      <div class="s num">${fmt(i.stems)} ст · ${i.paid_state==='paid'?'':'≈$'+fmt(i.est_usd||0,0)+' · '}логистика: ${esc(i.logi_source)}</div></div>
+      <div class="v"><div class="num">${i.approx?'≈ ':''}${fmt(i.avg_rub,2)} ₽</div><div class="s">${i.approx?'±10% · ':''}за стебель</div></div></div>`).join('')}</div>`).join('')
+    :'<div class="empty">Всё прибыло — в пути ничего нет.</div>'}
+  ${v.unpaid_logistics.length?`<h2>Неоплаченная логистика</h2><div class="group">${v.unpaid_logistics.map(l=>`<div class="row"><div class="grow">
+      <div class="t">${esc(l.provider||'Фрахт')}</div><div style="margin:3px 0"><span class="pill warn">не оплачен</span></div><div class="s">MAWB ${esc(l.awb)}</div></div>
+      <div class="v"><div class="num">$${fmt(l.usd||0,2)}</div><div class="s">≈ ${fmt(l.rub_est)} ₽</div></div>
+      <button class="primary" data-pl="${l.id}" style="margin-left:6px;padding:8px 10px">Оплачен</button></div>`).join('')}</div>`:''}
+  <div class="actions"><button id="addT">+ Инвойс в пути</button></div>`;
+  $app.querySelectorAll('[data-ti]').forEach(e=>e.onclick=()=>go('transitInv',{i:v.invoices.find(x=>x.id==e.dataset.ti),v}));
+  $app.querySelectorAll('[data-pl]').forEach(b=>b.onclick=ev=>{ev.stopPropagation();payForm({kind:'logistics',id:+b.dataset.pl,usd:v.unpaid_logistics.find(x=>x.id==b.dataset.pl).usd})});
+  document.getElementById('addT').onclick=()=>go('invoice',{t:{id:0,date:'в пути'}});
+  if(!ME.can_write) document.getElementById('addT').style.display='none';
+},
+
+async transitInv({i,v}){
+  $app.innerHTML=`<h1>${esc(i.farm)}</h1>
+  <p class="sub">MAWB ${esc(i.awb||'?')} · ${i.paid_state==='paid'?'оплачен из пополнения '+esc(i.topup):'не оплачен · ≈$'+fmt(i.est_usd||0,2)}
+    ${i.eta?' · прибытие '+esc(i.eta.replace('T',' ')):''}<br>Логистика: ${esc(i.logi_source)}${i.approx?' · приблизительно, ±10%':''}</p>
+  <div class="group scroll"><table class="lines"><thead><tr><th>Номенклатура</th><th>Ст.</th><th>$</th><th>Цветок ₽</th><th>Лог. ₽</th><th>Итого ₽/ст</th></tr></thead>
+  <tbody>${i.lines.map(l=>`<tr><td style="padding:8px 4px">${esc(l.name)}</td><td class="calc">${fmt(l.stems)}</td><td class="calc">${l.price_usd}</td>
+    <td class="calc">${fmt(l.price_rub,2)}</td><td class="calc">${fmt(l.logi_rub,2)}</td><td class="calc"><b>${i.approx?'≈':''}${fmt(l.total_rub,2)}</b></td></tr>`).join('')}</tbody></table></div>
+  <div class="actions">${i.paid_state==='unpaid'?'<button class="primary" id="pay">Оплачен</button>':''}<button id="arr">Прибыл</button></div>
+  <div class="actions"><button id="edit">Редактировать инвойс</button></div>`;
+  document.getElementById('pay')?.addEventListener('click',()=>payForm({kind:'invoices',id:i.id,usd:i.est_usd}));
+  document.getElementById('arr').onclick=async()=>{ if(!confirm('Отметить как прибывший?'))return; await api(`/invoices/${i.id}/arrived`,{method:'POST'}); toast('Прибыл'); tab('transit') };
+  document.getElementById('edit').onclick=()=>go('invoice',{t:{id:i.topup_id||0,date:i.topup||'в пути'},inv:{...i}});
+  if(!ME.can_write) ['pay','arr','edit'].forEach(x=>{const b=document.getElementById(x); if(b) b.style.display='none'});
+},
+
+// ======================= ТОВАРНЫЕ ОСТАТКИ (по инвойсам в пути) =======================
+async stock(){
+  const v=await api('/transit');
+  const paid=v.invoices.filter(i=>i.paid_state==='paid'), unpaid=v.invoices.filter(i=>i.paid_state!=='paid');
+  const sum=(l,k)=>l.reduce((a,i)=>a+(i[k]||0),0);
+  const block=(title,list,approx)=>`<h2>${title}</h2>
+    <div class="group"><div class="row"><div class="grow"><div class="big num">${approx?'≈ ':''}${fmt(sum(list,'rub_goods')+sum(list,'rub_logi'))} ₽</div>
+      <div class="s num">товар ${fmt(sum(list,'rub_goods'))} ₽ · логистика ${fmt(sum(list,'rub_logi'))} ₽ · ${list.length} инв.</div></div></div>
+    ${list.map(i=>`<div class="row" data-ti="${i.id}"><div class="grow"><div class="t">${esc(i.farm)}</div><div class="s">MAWB ${esc(i.awb||'?')} · ${fmt(i.stems)} ст</div></div>
+      <div class="v"><div class="num">${i.approx?'≈ ':''}${fmt(i.rub_goods+i.rub_logi)} ₽</div><div class="s num">${fmt(i.rub_goods)} + ${fmt(i.rub_logi)}</div></div></div>`).join('')}</div>`;
+  $app.innerHTML=`<h1>Товарные остатки</h1>
+  <p class="sub">Рублёвые суммы груза в пути по инвойсам: товар + логистика. Неоплаченные — по курсу ${fmt(v.est_rate,2)} (пополнение ${esc(v.est_topup||'—')}).</p>
+  ${block('Оплаченные в пути',paid,paid.some(i=>i.approx))}
+  ${block('Неоплаченные в пути',unpaid,true)}`;
+  $app.querySelectorAll('[data-ti]').forEach(e=>e.onclick=()=>go('transitInv',{i:v.invoices.find(x=>x.id==e.dataset.ti),v}));
+},
+
+// ======================= ЕЩЁ =======================
+async more(){
+  $app.innerHTML=`<h1>Ещё</h1><div class="group">
+    <div class="row" id="m-farms"><div class="grow"><div class="t">Плантации</div><div class="s">справочник, правила коробок, нюансы для AI</div></div></div>
+    ${ME.role==='sys'?'<div class="row" id="m-users"><div class="grow"><div class="t">Пользователи и роли</div><div class="s">кто что видит</div></div></div>':''}
+  </div><p class="hint" style="margin:10px 16px">Роль: ${esc(ME.role_name)}. Список платежей — команда /pay в боте.</p>`;
+  document.getElementById('m-farms').onclick=()=>go('farms');
+  document.getElementById('m-users')?.addEventListener('click',()=>go('users'));
+},
+
 // ======================= USERS (system super-admin) =======================
 async users(){
   const list=await api('/users');
@@ -506,13 +602,37 @@ async farm({f}){
     <div class="field"><label>Как ещё пишется в инвойсах (через запятую)</label><input name="aliases" value="${esc(f.aliases)}"></div>
     <div class="field"><label>Это перевозчик / консолидатор</label><select name="fw"><option value="0">нет</option><option value="1" ${f.is_forwarder?'selected':''}>да</option></select></div>
     <div class="field"><label>Нюансы для AI</label><textarea name="notes" rows="4">${esc(f.notes)}</textarea></div>
+    <div class="field"><label>Коробки Expolanka (Д.Ш.В) — объёмный вес = Д×Ш×В / 6000</label>
+      <div class="s num" style="padding:4px 0">${Object.entries(JSON.parse(f.box_dims_json||'{}')).sort((a,b)=>b[1]-a[1]).map(([k,n])=>{const [l,w,h]=k.split('.').map(Number);return `${k} = ${fmt(l*w*h/6000,1)} кг · ${n} кор.`}).join('<br>')||'пока нет'}</div></div>
     <div class="field"><label>Фиксированный вес коробки: «номенклатура = кг», по строке</label><textarea name="boxkg" rows="3" placeholder="Spray Rose Reflex Bicolour 60cm = 25">${esc(Object.entries(JSON.parse(f.box_kg_json||'{}')).map(([k,v])=>k+' = '+v).join('\n'))}</textarea></div></form>
   <div class="actions"><button class="primary" id="save">Сохранить</button></div>`;
   const F=document.getElementById('f');
-  document.getElementById('save').onclick=async()=>{await api('/farms'+(f.id?'?farm_id='+f.id:''),{method:'POST',body:{name:F.name.value.trim(),country:F.country.value,aliases:F.aliases.value,is_forwarder:F.fw.value==='1',notes:F.notes.value,
+  document.getElementById('save').onclick=async()=>{await api('/farms'+(f.id?'?farm_id='+f.id:''),{method:'POST',body:{name:F.name.value.trim(),country:F.country.value,aliases:F.aliases.value,is_forwarder:F.fw.value==='1',notes:F.notes.value,box_dims_json:f.box_dims_json||'{}',
     box_kg_json:JSON.stringify(Object.fromEntries(F.boxkg.value.split('\n').map(x=>x.split('=')).filter(x=>x.length===2&&x[0].trim()&&numOrNull(x[1])).map(x=>[x[0].trim(),numOrNull(x[1])])))}});FARMS=[];toast('Сохранено');back()};
 },
 };
+
+// «Оплачен»: which top-up + $ (₽ by that top-up's rate unless typed)
+async function payForm({kind,id,usd}){
+  const tops=await api('/topups');
+  const wrap=document.createElement('div');
+  wrap.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:20;display:flex;align-items:flex-end';
+  wrap.innerHTML=`<div style="background:var(--bg2);width:100%;border-radius:18px 18px 0 0;padding:14px 0 calc(16px + env(safe-area-inset-bottom,0))">
+    <h2 style="margin-top:4px">Из какого пополнения оплачен?</h2>
+    <div class="group">${tops.slice(0,8).map((t,n)=>`<label class="row"><input type="radio" name="tp" value="${t.id}" ${n?'':'checked'}><div class="grow"><div class="t">${esc(t.date)}</div><div class="s num">курс ${fmt(t.rate,2)}</div></div></label>`).join('')}</div>
+    <form class="group" style="margin-top:10px"><div class="two"><div class="field"><label>Оплачено, $</label><input name="usd" inputmode="decimal" value="${usd??''}"></div>
+    <div class="field"><label>₽ (пусто = по курсу)</label><input name="rub" inputmode="decimal"></div></div></form>
+    <div class="actions"><button id="pcancel">Отмена</button><button class="primary" id="pok">Оплачен</button></div></div>`;
+  document.body.appendChild(wrap);
+  const close=()=>wrap.remove();
+  wrap.querySelector('#pcancel').onclick=close;
+  wrap.querySelector('#pok').onclick=async()=>{
+    const f=wrap.querySelector('form'); const tp=+wrap.querySelector('input[name=tp]:checked')?.value;
+    const body={topup_id:tp,usd:numOrNull(f.usd.value),rub:numOrNull(f.rub.value)};
+    if(!tp) return toast('Выбери пополнение'); if(kind==='invoices'&&!body.usd) return toast('Впиши $');
+    try{ await api(`/${kind}/${id}/pay`,{method:'POST',body}); close(); toast('Оплачено — себестоимость теперь точная'); tab('transit') }catch(e){toast(e.message)}
+  };
+}
 
 // "Excel в чат": this top-up or all of them — native Telegram popup, plain confirm as fallback
 function askExport(date){
