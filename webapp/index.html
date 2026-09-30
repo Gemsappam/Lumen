@@ -253,7 +253,7 @@ async invoice({t, inv, draft}){
   <form id="p" class="group">
     <div class="two"><div class="field"><label>Итог по инвойсу, $ (для справки)</label><input name="invoice_total_usd" inputmode="decimal" value="${inv.invoice_total_usd??''}"></div>
     <div class="field"><label>Оплачено, $</label><input name="usd_paid" inputmode="decimal" value="${inv.usd_paid??''}"></div></div>
-    <div class="field"><label>Оплачено, ₽</label><input name="rub_paid_override" inputmode="decimal" value="${inv.rub_paid_override??''}"></div>
+    <div class="field"><label>Оплачено, ₽ <span id="rubMode" class="pill" style="margin-left:6px"></span></label><input name="rub_paid_override" inputmode="decimal" value="${inv.rub_paid_override??''}"></div>
     <div class="hint" style="padding:0 14px 8px">Цена стебля в ₽ = цена $ × (₽ / $ оплаты). Налог и сборы в стебель не идут.</div>
     <div class="field"><label>Как делить ₽ по строкам</label><select name="alloc_mode">
       <option value="value" ${inv.alloc_mode==='value'?'selected':''}>По стоимости строк (разные цены)</option>
@@ -269,13 +269,39 @@ async invoice({t, inv, draft}){
     <td><input data-k="name" value="${esc(l.name)}"></td><td><input data-k="boxes" inputmode="decimal" size="3" value="${l.boxes??''}"></td>
     <td><input data-k="stems" inputmode="numeric" size="5" value="${l.stems??''}"></td><td><input data-k="weight_kg" inputmode="decimal" size="3" value="${l.weight_kg??''}"></td>
     <td><input data-k="price_usd" inputmode="decimal" size="4" value="${l.price_usd??''}"></td>
-    <td class="calc">${l.total_rub?fmt(l.total_rub,2):''}</td><td><button class="x" data-rm="${i}">×</button></td></tr>`).join(''); sums()};
-  const sums=()=>{const s=inv.lines.reduce((a,l)=>a+(numOrNull(l.stems)||0)*(numOrNull(l.price_usd)||0),0),st=inv.lines.reduce((a,l)=>a+(numOrNull(l.stems)||0),0);
-    document.getElementById('sumLines').textContent=`${fmt(st)} стеблей · строки $${fmt(s,2)}`;
-};
+    <td class="calc" data-c="${i}"></td><td><button class="x" data-rm="${i}">×</button></td></tr>`).join(''); sums()};
+  // ---- live money: $ → ₽ by the top-up rate, ₽/stem recalculated on every keystroke ----
+  const rateNow=()=>(TOPS.find(x=>x.id===+f.topup.value)||t).rate||t.rate;
+  let rubAuto = inv.rub_paid_override==null || inv.usd_paid==='' ||
+                Math.abs(inv.rub_paid_override - Math.round((inv.usd_paid||0)*rateNow()))<=1;
+  const showMode=()=>{const m=document.getElementById('rubMode');
+    m.innerHTML=rubAuto?`авто · $ × ${fmt(rateNow(),2)}`:'вручную · <u style="cursor:pointer">по курсу</u>';
+    m.onclick=rubAuto?null:()=>{rubAuto=true;syncRub();sums()}};
+  const syncRub=()=>{ if(!rubAuto) return; const u=numOrNull(p.usd_paid.value);
+    p.rub_paid_override.value = u ? Math.round(u*rateNow()) : '' };
+  const sums=()=>{
+    const st=inv.lines.reduce((a,l)=>a+(numOrNull(l.stems)||0),0);
+    const val=inv.lines.reduce((a,l)=>a+(numOrNull(l.stems)||0)*(numOrNull(l.price_usd)||0),0);
+    document.getElementById('sumLines').textContent=`${fmt(st)} стеблей · строки $${fmt(val,2)}`;
+    const usd=numOrNull(p.usd_paid.value), rub=numOrNull(p.rub_paid_override.value);
+    const perStem=p.alloc_mode.value==='stems';
+    inv.lines.forEach((l,i)=>{const c=tb.querySelector(`[data-c="${i}"]`); if(!c) return;
+      const flower = !rub ? null : perStem ? (st? rub/st : null) : (usd ? (numOrNull(l.price_usd)||0)*rub/usd : null);
+      const logi=(l.air_rub||0)+(l.msk_rub||0);
+      c.textContent = flower==null ? '' : fmt(flower+logi,2);
+      c.title = logi ? `цветок ${fmt(flower||0,2)} + логистика ${fmt(logi,2)}` : '';
+    });
+    showMode();
+  };
   tb.oninput=e=>{const tr=e.target.closest('tr'),k=e.target.dataset.k;inv.lines[tr.dataset.i][k]=e.target.value;sums()};
   tb.onclick=e=>{if(e.target.dataset.rm!=null){inv.lines.splice(+e.target.dataset.rm,1);drawLines()}};
-  p.oninput=sums;
+  p.oninput=e=>{
+    if(e.target.name==='usd_paid'){ rubAuto=true; syncRub(); }          // changed $ → ₽ follows the rate
+    if(e.target.name==='rub_paid_override') rubAuto = p.rub_paid_override.value.trim()==='';   // typed ₽ by hand → keep it
+    if(e.target.name==='rub_paid_override' && rubAuto) syncRub();
+    sums()};
+  p.onchange=p.oninput;
+  f.topup.addEventListener('change',()=>{syncRub();sums()});
   f.farm.onchange=()=>{const m=FARMS.find(x=>x.name.toLowerCase()===f.farm.value.toLowerCase());if(m&&!f.country.value)f.country.value=m.country};
   document.getElementById('addLine').onclick=()=>{inv.lines.push({name:'',stems:'',price_usd:''});drawLines()};
   drawLines();
