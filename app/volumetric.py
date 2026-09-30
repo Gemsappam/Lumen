@@ -13,6 +13,7 @@ import re
 from collections import Counter
 
 DIVISOR = 6000
+REGISTRY_ENABLED = False   # box-size registry is OFF for now (Arman will bring a better one later)
 
 DIM = r"(9\d|1[0-4]\d)\s*[.,x×*]\s*(\d{2})\s*[.,x×*]\s*(\d{2})(?!\d)"   # box length 90–149 cm (never a date)
 DIM_RE = re.compile(DIM)

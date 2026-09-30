@@ -11,11 +11,11 @@ from openpyxl.utils import get_column_letter as CL
 
 from .calc import compute, norm_awb, rate_of
 
-HEAD = ["Страна", "Код клиента", "Номер / Дата инвойса", "MAWB", "Плантация", "Номенклатура",
+HEAD = ["Страна", "Маркировка", "Номер / Дата инвойса", "MAWB", "Плантация", "Номенклатура",
         "Кол-во коробок", "Кол-во стеблей", "Вес (кг)", "Цена за цветок ($)", "Цена за цветок (Р)",
-        "Expolanka ($/стебель)", "Expolanka (Р/стебель)", "Floratrack (Р/стебель)",
+        "ТК Кения ($/стебель)", "ТК Кения (Р/стебель)", "ТК МСК (Р/стебель)",
         "Общая себестоимость стебля (Р)", "Сумма в $ (оплачено)", "Сумма в Р (оплачено)",
-        "Оплачено", "Дата оплаты", "МРЦ", "Доля Expolanka по MAWB", "Доля Floratrack по MAWB"]
+        "Оплачено", "Дата оплаты", "МРЦ", "Доля ТК Кения по MAWB", "Доля ТК МСК по MAWB"]
 MERGE_COLS = [1, 2, 3, 4, 5, 16, 17, 18, 19]          # merged down each invoice block, like the original
 
 F = "Arial"
@@ -29,8 +29,21 @@ thin = Side(style="thin", color="BFBFBF")
 BOX = Border(left=thin, right=thin, top=thin, bottom=thin)
 CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 RUB = '#,##0.00'
+RUB4 = '#,##0.0000'          # per-stem ₽: 4 decimals so 1С gets the exact number (cells hold full precision anyway)
 RUB0 = '#,##0'
 USD = '0.00##'
+ACC_COST = PatternFill("solid", fgColor="E2EFDA")     # себестоимость — зелёный акцент
+ACC_TOT = PatternFill("solid", fgColor="FCE4D6")      # итого коробки / вес — персиковый акцент
+ACC_GRAND = PatternFill("solid", fgColor="F8CBAD")
+TOTAL_FONT = Font(name=F, bold=True, size=11)
+
+
+def hide_carriers(text: str) -> str:
+    """Carrier names never appear in the export: Expolanka -> ТК Кения, Floratrack -> ТК МСК."""
+    for a, b in (("Expolanka Freight Limited", "ТК Кения"), ("EXPOLANKA", "ТК Кения"), ("Expolanka", "ТК Кения"),
+                 ("Floratrack", "ТК МСК"), ("FLORATRACK", "ТК МСК"), ("Флоратрак", "ТК МСК"), ("Floratrak", "ТК МСК")):
+        text = text.replace(a, b)
+    return text
 
 
 def _sheet_name(wb, topup):
@@ -68,7 +81,7 @@ def _topups_row(wb, topup):
     return row
 
 
-def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg=None):
+def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg=None, awb_breakdown=None):
     try:
         wb = load_workbook(path)
     except Exception:
@@ -103,8 +116,9 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
         lines_by[l.invoice_id].append(l)
 
     # logistics section goes after the blocks; we need its rows before writing line formulas
-    n_rows = sum(len(lines_by[i.id]) + 2 for i in own_invs)
-    leg_start = 4 + n_rows + 2
+    n_rows = sum(len(lines_by[i.id]) + 2 for i in own_invs if lines_by[i.id])
+    grand_row = 4 + n_rows
+    leg_start = grand_row + 3
     leg_keys = []
     for inv in own_invs:
         for leg in ("air", "msk"):
@@ -114,9 +128,19 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
     for (awb, leg), g in res.legs.items():   # freight paid in this top-up for AWBs of older top-ups
         if (awb, leg) not in leg_keys and any(lg.topup_id == topup.id for lg in logistics if lg.id in g["ids"]):
             leg_keys.append((awb, leg))
-    leg_row = {k: leg_start + 1 + n for n, k in enumerate(leg_keys)}
+    awb_breakdown = awb_breakdown or {}
+    leg_row, bd_rows, pos, shown = {}, {}, leg_start + 1, set()
+    for k in leg_keys:
+        leg_row[k] = pos
+        pos += 1
+        if k[0] not in shown and awb_breakdown.get(k[0]):        # farm breakdown once per MAWB
+            shown.add(k[0])
+            bd_rows[k] = (pos, awb_breakdown[k[0]])
+            pos += len(awb_breakdown[k[0]])
+    leg_end = pos
 
     usd_cells = []
+    block_tot = []
     r = 4
     for inv in own_invs:
         ls = lines_by[inv.id]
@@ -144,7 +168,8 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
                 ws.cell(rr, 22, round(lc.msk_share, 8)).font = GREY
                 ws.cell(rr, 14, f"=IFERROR($F${leg_row[km]}*V{rr}/H{rr},0)")
             ws.cell(rr, 15, f"=K{rr}+M{rr}+N{rr}")
-            for c, fmt in ((10, USD), (11, RUB), (12, USD), (13, RUB), (14, RUB), (15, RUB), (21, "0.0000%"), (22, "0.0000%")):
+            ws.cell(rr, 15).fill = ACC_COST
+            for c, fmt in ((10, USD), (11, RUB4), (12, "0.0000"), (13, RUB4), (14, RUB4), (15, RUB4), (21, "0.0000%"), (22, "0.0000%")):
                 ws.cell(rr, c).number_format = fmt
             ws.cell(rr, 15).font = BOLD
             for c in range(1, 23):
@@ -165,39 +190,74 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
             ws.cell(r0, 17).comment = Comment("₽ не внесены оператором — посчитано $ × курс пополнения", "bot")
         ws.cell(r0, 16).number_format = USD
         ws.cell(r0, 17).number_format = RUB0
-        if inv.weight_kg and not ls[0].weight_kg:
-            ws.cell(r0, 9, inv.weight_kg).font = BLUE
-            ws.cell(r0, 9).comment = Comment("Вес плантации в AWB (кг)", "bot")
         if inv.note:
-            ws.cell(r0, 6).comment = Comment(inv.note, "bot")
+            ws.cell(r0, 6).comment = Comment(hide_carriers(inv.note), "bot")
         if r1 > r0:
             for c in MERGE_COLS:
                 ws.merge_cells(start_row=r0, start_column=c, end_row=r1, end_column=c)
         for c in MERGE_COLS:
             ws.cell(r0, c).alignment = CENTER
         usd_cells.append(f"P{r0}")
-        # ИТОГО
+        # ИТОГО: коробки, стебли, вес плантации (весь её вес в MAWB), себестоимость партии
         t = r1 + 1
-        ws.cell(t, 6, "ИТОГО").font = BOLD
-        ws.cell(t, 8, f"=SUM(H{r0}:H{r1})").font = BOLD
+        ws.cell(t, 6, "ИТОГО").font = TOTAL_FONT
+        ws.cell(t, 7, f"=SUM(G{r0}:G{r1})").font = TOTAL_FONT
+        ws.cell(t, 7).fill = ACC_TOT
+        ws.cell(t, 8, f"=SUM(H{r0}:H{r1})").font = TOTAL_FONT
+        if inv.weight_kg:
+            ws.cell(t, 9, inv.weight_kg).font = Font(name=F, bold=True, color="0000FF")
+        elif any(l.weight_kg for l in ls):
+            ws.cell(t, 9, f"=SUM(I{r0}:I{r1})").font = TOTAL_FONT
+        ws.cell(t, 9).fill = ACC_TOT
+        ws.cell(t, 9).comment = Comment("Итого вес плантации в MAWB, кг", "bot")
+        ws.cell(t, 15, f"=SUMPRODUCT(O{r0}:O{r1},H{r0}:H{r1})").font = TOTAL_FONT
+        ws.cell(t, 15).fill = ACC_COST
+        ws.cell(t, 15).number_format = RUB0
+        ws.cell(t, 15).comment = Comment("Итого себестоимость партии, ₽ (себестоимость стебля × стебли)", "bot")
+        block_tot.append(t)
         ws.cell(t, 10, f"=SUMPRODUCT(J{r0}:J{r1},H{r0}:H{r1})").font = GREY
         ws.cell(t, 10).number_format = USD
         ws.cell(t, 10).comment = Comment("Сумма строк без налога и сборов", "bot")
         r = t + 2
 
-    # logistics section
-    ws.cell(leg_start, 1, "ЛОГИСТИКА").font = BOLD
-    for c, h in enumerate(["AWB", "Плечо", "Перевозчик", "", "Сумма $", "Сумма Р", "Откуда"], 1):
+    if block_tot:
+        g = grand_row
+        ws.cell(g, 6, "ИТОГО ПО ПОПОЛНЕНИЮ").font = TOTAL_FONT
+        for c, fmt in ((7, "0"), (8, "#,##0"), (9, "#,##0.0"), (15, RUB0)):
+            ws.cell(g, c, "=" + "+".join(f"{CL(c)}{t}" for t in block_tot)).font = TOTAL_FONT
+            ws.cell(g, c).number_format = fmt
+            ws.cell(g, c).fill = ACC_COST if c == 15 else ACC_GRAND
+        for c in range(6, 16):
+            ws.cell(g, c).border = Border(top=Side(style="medium"), bottom=Side(style="medium"))
+
+    # logistics section (carriers shown only as ТК Кения / ТК МСК)
+    ws.cell(leg_start - 1, 1, "ЛОГИСТИКА").font = BOLD
+    for c, h in enumerate(["MAWB", "ТК", "", "Вес ТК, кг", "Сумма $", "Сумма Р", "Откуда", "Доля"], 1):
         ws.cell(leg_start, c, h).font = BOLD
         ws.cell(leg_start, c).fill = HFILL
     log_usd_cells = []
     provisional = []
     for (awb, leg), rr in leg_row.items():
         g = res.legs[(awb, leg)]
-        ws.cell(rr, 1, awb)
-        ws.cell(rr, 2, "Expolanka" if leg == "air" else "Floratrack")
-        ws.cell(rr, 3, g["provider"])
+        ws.cell(rr, 1, f"{awb[:3]}-{awb[3:]}" if len(awb) == 11 and awb.isdigit() else awb)
+        ws.cell(rr, 2, "ТК Кения" if leg == "air" else "ТК МСК").font = BOLD
+        if g.get("kg_bill"):
+            ws.cell(rr, 4, g["kg_bill"]).font = Font(name=F, bold=True, color="0000FF")
+        elif g.get("kg_total"):
+            ws.cell(rr, 4, g["kg_total"]).font = TOTAL_FONT
+        ws.cell(rr, 4).fill = ACC_TOT
+        ws.cell(rr, 4).number_format = "#,##0.0"
         ws.cell(rr, 5, g["usd"] or None).font = BLUE
+        if (awb, leg) in bd_rows:                        # farm breakdown of this MAWB
+            start, bd = bd_rows[(awb, leg)]
+            tot = sum(bd.values()) or 1
+            for n, (farm, kg) in enumerate(sorted(bd.items(), key=lambda x: -x[1])):
+                br = start + n
+                ws.cell(br, 3, f"  {farm}").font = GREY
+                ws.cell(br, 4, kg).font = BLUE
+                ws.cell(br, 4).number_format = "#,##0.0"
+                ws.cell(br, 8, kg / tot).number_format = "0.0%"
+                ws.cell(br, 8).font = GREY
         own_usd = sum((lg.usd or 0) for lg in logistics if lg.id in g["ids"] and lg.topup_id == topup.id)
         if g["own"] and g["usd"] and not any(lg.rub is not None for lg in logistics if lg.id in g["ids"]):
             ws.cell(rr, 6, f"=ROUND(E{rr}*$B$2,0)")
@@ -208,12 +268,12 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
             ft = [lg for lg in recs if (lg.ext_key or "").startswith("ft:")]
             rate = g["rub"] / g["usd"] if g["usd"] else 0
             if any("предварительн" in (lg.note or "") for lg in ft):
-                ws.cell(rr, 7, f"Floratrack: курс {rate:.2f} ПРЕДВАРИТЕЛЬНЫЙ — оплаты в «Балансе» ещё нет, "
-                               f"взят курс последней оплаты; уточнится со следующим отчётом").font = Font(name=F, color="C00000")
+                ws.cell(rr, 7, f"курс {rate:.2f} ПРЕДВАРИТЕЛЬНЫЙ — оплаты ещё нет, (ЦБ + 3) / 0.96; "
+                               f"уточнится со следующим отчётом ТК").font = Font(name=F, color="C00000")
                 ws.cell(rr, 6).fill = YFILL
-                provisional.append(f"MAWB {awb}: Floratrack по предварительному курсу {rate:.2f} — перекинь боту следующий отчёт Floratrack")
+                provisional.append(f"MAWB {awb}: ТК МСК по предварительному курсу {rate:.2f} — перекинь боту следующий отчёт ТК МСК")
             elif ft:
-                ws.cell(rr, 7, f"Floratrack: курс {rate:.2f} по оплатам из «Баланса»").font = GREY
+                ws.cell(rr, 7, f"курс {rate:.2f} по оплатам из баланса ТК").font = GREY
             else:
                 ws.cell(rr, 7, f"оплачено, курс {rate:.2f}").font = GREY
         if own_usd:
@@ -224,14 +284,15 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
     # balance ("Остаток") intentionally not written: only the system super-admin sees it, in the app
 
     # warnings
-    wr = leg_start + len(leg_row) + 3
-    res.warnings = provisional + res.warnings
-    if res.warnings:
+    wr = leg_end + 2
+    import re as _re
+    warns = [_re.sub(r"MAWB (\d{3})(\d{8})", r"MAWB \1-\2", hide_carriers(w)) for w in provisional + res.warnings]
+    if warns:
         ws.cell(wr, 1, "ПРОВЕРИТЬ").font = Font(name=F, bold=True, color="C00000")
-        for n, w in enumerate(res.warnings, 1):
+        for n, w in enumerate(warns, 1):
             ws.cell(wr + n, 1, w).fill = YFILL
 
-    widths = [11, 11, 18, 16, 18, 34, 9, 10, 9, 11, 12, 12, 12, 12, 14, 12, 13, 10, 12, 10, 12, 12]
+    widths = [14, 11, 18, 16, 18, 34, 9, 10, 9, 11, 12, 12, 12, 12, 14, 12, 13, 10, 12, 10, 12, 12]
     for c, w in enumerate(widths, 1):
         ws.column_dimensions[CL(c)].width = w
     ws.freeze_panes = "G4"

@@ -88,7 +88,7 @@ class InvoiceIn(BaseModel):
     topup_id: int = 0                  # 0 = not paid yet (груз в пути)
     est_usd: float | None = None       # unpaid: approximate $
     country: str = ""
-    client_code: str = "Люмен"
+    client_code: str = ""              # empty -> default marking (LUMEN)
     invoice_no: str = ""
     invoice_date: str = ""
     awb: str = ""
@@ -405,6 +405,9 @@ def resolve_farm(s, name: str, create_country: str | None = None):
 
 def learn_dims(entries: list, create_country: str | None = "Кения"):
     """Remember which box sizes each farm ships (registry of usual boxes)."""
+    from .volumetric import REGISTRY_ENABLED
+    if not REGISTRY_ENABLED:
+        return
     with session() as s:
         for e in entries:
             f = resolve_farm(s, e["farm"], create_country)
@@ -430,7 +433,8 @@ def usual_dims(name: str):
 def volumetric_breakdown(text: str) -> list:
     """WhatsApp weights message -> [{farm (canonical), boxes, kg, dims}] by L×W×H/6000."""
     from .volumetric import parse_message
-    out = parse_message(text, usual_dims=usual_dims)
+    from .volumetric import REGISTRY_ENABLED
+    out = parse_message(text, usual_dims=usual_dims if REGISTRY_ENABLED else None)
     with session() as s:
         for e in out:
             f = resolve_farm(s, e["farm"])
@@ -538,6 +542,17 @@ def _apply_farm_kg(s, awb, farm_kg):
             if v:
                 inv.weight_kg = v
                 s.add(inv)
+
+
+def _awb_breakdown(s) -> dict:
+    """{MAWB digits: {farm: kg}} — for the Excel: ТК weight broken down by plantation."""
+    return {w.awb: {k: float(v) for k, v in json.loads(w.farm_kg_json or "{}").items() if v}
+            for w in s.exec(select(AwbWeights)).all()}
+
+
+def marking() -> str:
+    """Default marking (код клиента) for new invoices. LUMEN until client markings are sorted out."""
+    return (_settings().get("marking") or "LUMEN").strip()
 
 
 def _awb_kg(s) -> dict:
@@ -765,6 +780,7 @@ def get_topup(tid: int, uid: int = Depends(user_id)):
 @router.post("/invoices")
 def save_invoice(body: InvoiceIn, inv_id: int | None = None, uid: int = Depends(writer)):
     from .ai import find_mawb
+    body.client_code = (body.client_code or "").strip() or marking()
     body.awb = find_mawb(body.awb) or body.awb.strip()   # one spelling everywhere: 065-40538245
     _apply_box_rules(body)
     prices = {round(l.price_usd, 4) for l in body.lines if l.stems}
@@ -884,6 +900,35 @@ def save_weights(body: WeightsIn, uid: int = Depends(writer)):
     return get_weights(body.awb, uid)
 
 
+class MarkingIn(BaseModel):
+    marking: str
+
+
+@router.get("/settings/marking")
+def get_marking(uid: int = Depends(user_id)):
+    return {"marking": marking()}
+
+
+@router.post("/settings/marking")
+def set_marking(body: MarkingIn, uid: int = Depends(writer)):
+    m = body.marking.strip().upper()
+    if not m:
+        raise HTTPException(400, "пустая маркировка")
+    SETTINGS.write_text(json.dumps({**_settings(), "marking": m}))
+    from .backup import mark_dirty
+    mark_dirty()
+    return {"marking": m}
+
+
+@router.delete("/drafts")
+def drop_all_drafts(uid: int = Depends(writer)):
+    for p in DRAFTS.glob("*.json"):
+        p.unlink(missing_ok=True)
+    from .backup import mark_dirty
+    mark_dirty()
+    return {"ok": True}
+
+
 @router.get("/farms")
 def farms(uid: int = Depends(user_id)):
     with session() as s:
@@ -934,7 +979,7 @@ async def export(tid: int, uid: int = Depends(user_id)):
         tmp = DATA_DIR / f"export_{tid}.xlsx"
         if MASTER_XLSX.exists():
             shutil.copy(MASTER_XLSX, tmp)
-        name, _ = excel.build(tmp, t, tops, invs, lines, logs, awb_kg=_awb_kg(s))
+        name, _ = excel.build(tmp, t, tops, invs, lines, logs, awb_kg=_awb_kg(s), awb_breakdown=_awb_breakdown(s))
         shutil.copy(tmp, MASTER_XLSX)          # master always holds the latest version
         s.add(t); s.commit()
     if BOT:
@@ -982,7 +1027,7 @@ async def export_topups(ids: list[int], uid: int, caption: str):
             t = s.get(TopUp, tid)
             if not t:
                 continue
-            name, _ = excel.build(tmp, t, tops, invs, lines, logs, awb_kg=kg)
+            name, _ = excel.build(tmp, t, tops, invs, lines, logs, awb_kg=kg, awb_breakdown=_awb_breakdown(s))
             names.append(name)
             s.add(t)
         s.commit()

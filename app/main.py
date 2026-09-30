@@ -71,11 +71,30 @@ def seed():
     _seed_box_dims()
 
 
+SEED_CREATED = {"Bliss Flora", "Blooming Dale", "Dale Flora", "Equator", "Flora Delight", "Flora Ola",
+                "Molo River", "Pamoja", "Valentine", "Pj Flora", "Pj Flowers"}
+
+
 def _seed_box_dims():
-    """Box sizes Expolanka reported (WhatsApp, 09.2025–09.2026) -> registry, once."""
+    """Box sizes Expolanka reported (WhatsApp, 09.2025–09.2026) -> registry, once.
+    While the registry is OFF: undo an earlier seed (clear sizes, drop farms it created that have no invoices)."""
     from .api import _settings, SETTINGS, learn_dims
-    from .volumetric import SEED_TEXT, parse_message
+    from .volumetric import REGISTRY_ENABLED, SEED_TEXT, parse_message
+    from .models import Invoice
     st = _settings()
+    if not REGISTRY_ENABLED:
+        if st.get("box_dims_seeded"):
+            with session() as s:
+                used = {i.farm.lower() for i in s.exec(select(Invoice)).all()}
+                for f in s.exec(select(Farm)).all():
+                    if f.name in SEED_CREATED and f.name.lower() not in used:
+                        s.delete(f)
+                    elif (f.box_dims_json or "{}") != "{}":
+                        f.box_dims_json = "{}"
+                        s.add(f)
+                s.commit()
+            SETTINGS.write_text(json.dumps({**_settings(), "box_dims_seeded": False}))
+        return
     if st.get("box_dims_seeded"):
         return
     learn_dims(parse_message(SEED_TEXT))

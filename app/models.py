@@ -33,7 +33,7 @@ class Invoice(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     topup_id: int = Field(default=0, index=True)
     country: str = ""
-    client_code: str = "Люмен"
+    client_code: str = "LUMEN"            # маркировка
     invoice_no: str = ""
     invoice_date: str = ""
     awb: str = ""
@@ -128,6 +128,8 @@ def init_db():
         with engine.begin() as c:
             c.execute(text("ALTER TABLE logistics ADD COLUMN paid BOOLEAN DEFAULT 1"))
     icols = {c["name"] for c in inspect(engine).get_columns("invoice")}
+    with engine.begin() as c:
+        c.execute(text("UPDATE invoice SET client_code = 'LUMEN' WHERE client_code IN ('Люмен', 'люмен', '')"))
     for col, typ in (("est_usd", "FLOAT"), ("eta", "VARCHAR"), ("arrived_at", "VARCHAR")):
         if col not in icols:
             with engine.begin() as c:

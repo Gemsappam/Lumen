@@ -842,6 +842,21 @@ async def payment_reminder(uid_list=None):
             print(f"[lumen] reminder to {uid} failed: {e}", flush=True)
 
 
+@dp.message(pv, wr, Command("mark"))
+async def mark_cmd(m: Message):
+    """/mark — show the default marking; /mark ABC — set it for new invoices."""
+    from .api import SETTINGS, _settings, marking
+    arg = (m.text or "").split(maxsplit=1)[1:] 
+    if not arg:
+        await m.answer(f"Маркировка по умолчанию: {marking()}\nСменить: `/mark НОВАЯ`", parse_mode="Markdown")
+        return
+    new = arg[0].strip().upper()
+    SETTINGS.write_text(json.dumps({**_settings(), "marking": new}))
+    from .backup import mark_dirty
+    mark_dirty()
+    await m.answer(f"✅ Новые инвойсы идут с маркировкой {new}. У отдельного инвойса её можно поменять в приложении.")
+
+
 @dp.message(pv, wr, Command("pay"))
 async def pay_cmd(m: Message):
     """Show the payment list now (same as the Tue/Wed reminder)."""
