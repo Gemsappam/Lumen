@@ -69,7 +69,7 @@ form{margin:0}
 .empty{padding:22px 16px;text-align:center;color:var(--muted)}
 .hint{font-size:12px;color:var(--muted);margin:6px 16px 0}
 .x{color:var(--err);background:none;padding:4px 8px}
-.ro #save,.ro #del,.ro .x,.ro .drop,.ro #addLine,.ro #new,.ro #addInv,.ro #addLog,.ro #addRow,.ro #edit,.ro #delTop,.ro #act,.ro #audit,.ro #drafts{display:none!important}
+.ro #farms,.ro #save,.ro #del,.ro .x,.ro .drop,.ro #addLine,.ro #new,.ro #addInv,.ro #addLog,.ro #addRow,.ro #edit,.ro #delTop,.ro #act,.ro #audit,.ro #drafts{display:none!important}
 .ro input,.ro select,.ro textarea{pointer-events:none;opacity:.85}
 #toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom,0));transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:10px 16px;border-radius:12px;font-size:14px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:90%}
 #toast.on{opacity:1}
@@ -130,7 +130,7 @@ async home(){
       <div class="s num">${fmt(t.rub)} ₽ → $${fmt(t.usd)} · курс ${fmt(t.rate,4)}</div></div>
       ${ME.sees_money&&MONEY[t.id]?`<div class="v"><div class="num">$${fmt(MONEY[t.id].usd_left,2)}</div><div class="s">остаток</div></div>`:''}</div>`).join('')
       :'<div class="empty">Пополнений пока нет. Начни с первого.</div>'}</div>
-    <div class="actions"><button class="primary" id="new">Новое пополнение</button><button id="farms">Плантации</button></div>
+    <div class="actions"><button class="primary" id="new">Новое пополнение</button>${ME.can_write?'<button id="farms">Плантации</button>':''}</div>
     ${ME.role==='sys'?'<div class="actions"><button id="users">Пользователи и роли</button></div>':''}
     <p class="hint" style="margin:8px 16px">Роль: ${esc(ME.role_name)}</p>`;
   $app.querySelectorAll('[data-top]').forEach(e=>e.onclick=()=>go('topup',{id:+e.dataset.top}));
@@ -140,7 +140,7 @@ async home(){
     if(tt){d._draftId=d.id;return go(d.doc_type==='farm_invoice'?'invoice':'logistics',{t:tt,draft:d})}
     go('draft',{d,tops})});
   document.getElementById('new').onclick=()=>go('topupForm',{});
-  document.getElementById('farms').onclick=()=>go('farms');
+  document.getElementById('farms')?.addEventListener('click',()=>go('farms'));
   document.getElementById('users')?.addEventListener('click',()=>go('users'));
 },
 
