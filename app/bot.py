@@ -967,6 +967,35 @@ async def process_group_text(chat_id: int, chat_title: str, text: str, sent_msk)
             pass
 
 
+async def reader_joined(chat_id: int, title: str, chat_type: str, status: str, reads_all: bool, username: str):
+    """The reader bot was added to (or removed from) a chat: health check to the system admin."""
+    from .api import _settings
+    if status in ("left", "kicked"):
+        text, kb = f"⚠️ Читатель @{username} удалён из чата «{title}». Сообщения о машинах больше не приходят.", None
+    else:
+        ok_privacy = reads_all or chat_type == "channel"
+        ok_admin = chat_type != "channel" or status == "administrator"
+        approved = chat_id in (_settings().get("ft_chats") or [])
+        lines = [f"👀 Читатель @{username} добавлен в «{title}» ({'канал' if chat_type == 'channel' else 'группа'})",
+                 ("✅" if ok_privacy else "❌") + " видит все сообщения" +
+                 ("" if ok_privacy else " — в @BotFather: /setprivacy → Disable, потом удали и добавь бота заново"),
+                 ("✅" if ok_admin else "❌") + (" права есть" if ok_admin else " в канале бот должен быть админом")]
+        if approved:
+            lines.append("✅ этот чат уже отмечен как ТК МСК")
+            kb = None
+        else:
+            lines.append("Если это чат ТК МСК — подтверди, и сообщения о машинах пойдут сразу:")
+            kb = _kb([[("Да, это ТК МСК", f"ftc:{chat_id}:0"), ("Нет", f"ftn:{chat_id}")]])
+        if ok_privacy and ok_admin:
+            lines.append("\nВсё готово — теперь просто жди сообщений о машинах, я буду присылать сводки сюда.")
+        text = "\n".join(lines)
+    for uid in roles.sys_ids():
+        try:
+            await bot.send_message(uid, text, reply_markup=kb)
+        except Exception:
+            pass
+
+
 @grp.message(F.text)
 async def group_text(m: Message):
     from datetime import timedelta

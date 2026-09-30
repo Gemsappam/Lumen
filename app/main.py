@@ -178,7 +178,7 @@ async def lifespan(app):
             except Exception as e:
                 print(f"[lumen] бот-читатель: неверный READER_BOT_TOKEN? {e}", flush=True)
             tasks.append(asyncio.create_task(rdp.start_polling(rbot, handle_signals=False,
-                                                               allowed_updates=["message", "channel_post"])))
+                                                               allowed_updates=["message", "channel_post", "my_chat_member"])))
         from . import userbot
         if userbot.enabled():                          # invisible reader of the TK MSK chat
             from .bot import _handle_truck

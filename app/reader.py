@@ -13,7 +13,7 @@ import os
 from datetime import timedelta
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
+from aiogram.types import ChatMemberUpdated, Message
 
 READER_BOT_TOKEN = os.getenv("READER_BOT_TOKEN", "").strip()
 
@@ -38,6 +38,15 @@ def build():
     @rdp.channel_post()
     async def channel_msg(m: Message):
         await _take(m)
+
+    @rdp.my_chat_member()
+    async def added_or_removed(ev: ChatMemberUpdated):
+        """Reader added to / removed from a chat -> tell the system admin via the MAIN bot, with a health check."""
+        from .bot import reader_joined
+        me = await rbot.get_me()
+        status = ev.new_chat_member.status
+        await reader_joined(ev.chat.id, ev.chat.title or "", ev.chat.type, status,
+                            bool(getattr(me, "can_read_all_group_messages", False)), me.username)
 
     @rdp.message(F.chat.type == "private")
     async def private_msg(m: Message):
