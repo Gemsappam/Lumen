@@ -191,6 +191,7 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
         ws.cell(leg_start, c, h).font = BOLD
         ws.cell(leg_start, c).fill = HFILL
     log_usd_cells = []
+    provisional = []
     for (awb, leg), rr in leg_row.items():
         g = res.legs[(awb, leg)]
         ws.cell(rr, 1, awb)
@@ -203,7 +204,18 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
             ws.cell(rr, 7, "это пополнение")
         else:
             ws.cell(rr, 6, round(g["rub"], 2)).font = BLUE
-            ws.cell(rr, 7, "₽ внесены оператором").font = GREY
+            recs = [lg for lg in logistics if lg.id in g["ids"]]
+            ft = [lg for lg in recs if (lg.ext_key or "").startswith("ft:")]
+            rate = g["rub"] / g["usd"] if g["usd"] else 0
+            if any("предварительн" in (lg.note or "") for lg in ft):
+                ws.cell(rr, 7, f"Floratrack: курс {rate:.2f} ПРЕДВАРИТЕЛЬНЫЙ — оплаты в «Балансе» ещё нет, "
+                               f"взят курс последней оплаты; уточнится со следующим отчётом").font = Font(name=F, color="C00000")
+                ws.cell(rr, 6).fill = YFILL
+                provisional.append(f"MAWB {awb}: Floratrack по предварительному курсу {rate:.2f} — перекинь боту следующий отчёт Floratrack")
+            elif ft:
+                ws.cell(rr, 7, f"Floratrack: курс {rate:.2f} по оплатам из «Баланса»").font = GREY
+            else:
+                ws.cell(rr, 7, f"оплачено, курс {rate:.2f}").font = GREY
         if own_usd:
             log_usd_cells.append(f"E{rr}" if own_usd == g["usd"] else str(own_usd))
         ws.cell(rr, 5).number_format = USD
@@ -213,6 +225,7 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
 
     # warnings
     wr = leg_start + len(leg_row) + 3
+    res.warnings = provisional + res.warnings
     if res.warnings:
         ws.cell(wr, 1, "ПРОВЕРИТЬ").font = Font(name=F, bold=True, color="C00000")
         for n, w in enumerate(res.warnings, 1):

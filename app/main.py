@@ -150,6 +150,10 @@ app.include_router(api.router)
 @app.middleware("http")
 async def _changes_trigger_backup(request, call_next):
     resp = await call_next(request)
+    if not request.url.path.startswith("/api"):
+        # Telegram's webview caches the page hard — always serve the fresh Mini App
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
     if request.method != "GET" and request.url.path.startswith("/api") and resp.status_code < 400:
         from .backup import mark_dirty
         mark_dirty()

@@ -547,7 +547,8 @@ def snapshot(s, topup_id):
     for i in invs:
         goods.setdefault(norm_awb(i.awb), set()).add(tdate.get(i.topup_id, "?"))
     out_log = [{**lg.model_dump(), "kg_total": kg.get(norm_awb(lg.awb), 0), "rub_per_kg": rpk.get((norm_awb(lg.awb), lg.leg)),
-                "goods_topups": sorted(goods.get(norm_awb(lg.awb), set()))}
+                "goods_topups": sorted(goods.get(norm_awb(lg.awb), set())),
+                "provisional": "предварительн" in (lg.note or "")}
                for lg in logs if lg.topup_id == topup_id or norm_awb(lg.awb) in related]
     act = _settings().get("active_topup")
     return {"topup": {**t.model_dump(), "rate": rate_of(t), "active": t.id == act}, "invoices": out_inv, "logistics": out_log,
@@ -918,6 +919,21 @@ async def export_topups(ids: list[int], uid: int, caption: str):
         await BOT.send_document(uid, FSInputFile(MASTER_XLSX, filename="учет.xlsx"),
                                 caption=caption + "\nОбновлены листы: " + ", ".join(f"«{n}»" for n in names))
     return names
+
+
+@router.post("/export_all")
+async def export_all(uid: int = Depends(user_id)):
+    """Every top-up rebuilt into one учет.xlsx and sent to the chat."""
+    with session() as s:
+        ids = [t.id for t in s.exec(select(TopUp).order_by(TopUp.id)).all()]
+    names = await export_topups(ids, uid, "📊 Учёт: все пополнения")
+    if BOT and names:
+        from .backup import backup_now
+        try:
+            await backup_now(BOT, "выгрузка всех пополнений")
+        except Exception as e:
+            print(f"[lumen] backup after export failed: {e}", flush=True)
+    return {"ok": True, "sheets": names}
 
 
 # ---------- drafts: invoices sent straight into the bot chat, waiting for the operator ----

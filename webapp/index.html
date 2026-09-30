@@ -196,7 +196,7 @@ async topup({id, snap}){
   <h2>Логистика по MAWB этого пополнения</h2>
   <div class="group">${d.logistics.length?d.logistics.map(l=>`
     <div class="row" data-log="${l.id}"><div class="grow"><div class="t">${esc(l.provider||'Фрахт')} · ${l.leg==='air'?'Кения → Амстердам':'Floratrack'}${l.rub_per_kg?' · '+fmt(l.rub_per_kg,2)+' ₽/кг':''}</div>
-    <div class="s">MAWB ${esc(l.awb)} · ${l.kg_total?fmt(l.kg_total)+' кг ✓':'<span style="color:var(--warn)">нет разбивки кг</span>'}${l.topup_id!==t.id?' · оплачено не отсюда':''}${(l.goods_topups||[]).some(d=>d!==t.date)?' · товар из '+l.goods_topups.filter(d=>d!==t.date).join(', '):''}</div></div>
+    <div class="s">MAWB ${esc(l.awb)} · ${l.kg_total?fmt(l.kg_total)+' кг ✓':'<span style="color:var(--warn)">нет разбивки кг</span>'}${l.provisional?' · <span style="color:var(--warn)">курс предварительный</span>':''}${l.topup_id!==t.id?' · оплачено не отсюда':''}${(l.goods_topups||[]).some(d=>d!==t.date)?' · товар из '+l.goods_topups.filter(d=>d!==t.date).join(', '):''}</div></div>
     <div class="v">${l.usd?'$'+fmt(l.usd,2):''}${l.rub?'<div class="s">'+fmt(l.rub)+' ₽</div>':''}</div></div>`).join('')
     :'<div class="empty">Фрахт ещё не внесён — себестоимость пока без логистики.</div>'}</div>
   <div class="actions"><button id="addLog">Добавить логистику</button></div>
@@ -213,7 +213,15 @@ async topup({id, snap}){
     await api('/topups/'+t.id,{method:'DELETE'}); toast('Пополнение удалено'); stack.length=0; go('home');};
   document.getElementById('act')?.addEventListener('click',async()=>{await api(`/topups/${t.id}/activate`,{method:'POST'});toast('Теперь документы из чата идут в '+t.date);render('topup',{id:t.id})});
 
-  document.getElementById('xls').onclick=async e=>{e.target.disabled=true;try{const r=await api(`/topups/${t.id}/export`,{method:'POST'});toast(`Лист «${r.sheet}» отправлен в чат`)}catch(x){toast(x.message)}e.target.disabled=false};
+  document.getElementById('xls').onclick=async e=>{
+    const choice = await askExport(t.date);
+    if(!choice) return;
+    const b=e.target; b.disabled=true; b.textContent='Собираю…';
+    try{
+      if(choice==='all'){ const r=await api('/export_all',{method:'POST'}); toast(`Все пополнения (${r.sheets.length}) отправлены в чат`) }
+      else { const r=await api(`/topups/${t.id}/export`,{method:'POST'}); toast(`Лист «${r.sheet}» отправлен в чат`) }
+    }catch(x){toast(x.message)}
+    b.disabled=false; b.textContent='Excel в чат'};
   document.getElementById('audit').onclick=async e=>{
     e.target.disabled=true; e.target.textContent='Проверяю…';
     try{const a=await api(`/topups/${t.id}/audit`,{method:'POST'});
@@ -505,6 +513,19 @@ async farm({f}){
     box_kg_json:JSON.stringify(Object.fromEntries(F.boxkg.value.split('\n').map(x=>x.split('=')).filter(x=>x.length===2&&x[0].trim()&&numOrNull(x[1])).map(x=>[x[0].trim(),numOrNull(x[1])])))}});FARMS=[];toast('Сохранено');back()};
 },
 };
+
+// "Excel в чат": this top-up or all of them — native Telegram popup, plain confirm as fallback
+function askExport(date){
+  return new Promise(res=>{
+    if(tg?.showPopup && tg.isVersionAtLeast?.('6.2')){
+      tg.showPopup({title:'Excel в чат', message:'Какой учёт прислать?',
+        buttons:[{id:'one',type:'default',text:`Только ${date.slice(0,5)}`},{id:'all',type:'default',text:'Все пополнения'},{type:'cancel'}]},
+        id=>res(id==='one'||id==='all'?id:null));
+    } else {
+      res(confirm(`Прислать только пополнение ${date}?\nОК — только его, Отмена — все пополнения`)?'one':'all');
+    }
+  });
+}
 
 function applyParsed(inv, r){
   Object.assign(inv,{farm:r.farm||inv.farm,country:r.country||inv.country,invoice_no:r.invoice_no||inv.invoice_no,
