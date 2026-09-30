@@ -168,6 +168,8 @@ async def lifespan(app):
         from .bot import scheduler_loop
         tasks.append(asyncio.create_task(scheduler_loop()))
         from . import reader
+        if not reader.enabled():
+            print("[lumen] бот-читатель ВЫКЛЮЧЕН: в .env нет READER_BOT_TOKEN", flush=True)
         if reader.enabled():                           # neutral second bot in the TK MSK chat
             rbot, rdp = reader.build()
             try:
