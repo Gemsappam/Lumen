@@ -1266,6 +1266,19 @@ def set_eta(awbs: list[str], eta_iso: str) -> tuple[list, list]:
     return matched, unknown
 
 
+def set_truck(awb: str, truck: str) -> list[str]:
+    """MAWB loaded into a truck -> remember it on the invoices still in transit. Returns farms."""
+    k, farms = norm_awb(awb), []
+    with session() as s:
+        for i in s.exec(select(Invoice)).all():
+            if norm_awb(i.awb) == k and not i.arrived_at:
+                i.truck = truck
+                s.add(i)
+                farms.append(i.farm)
+        s.commit()
+    return farms
+
+
 def arrive_due(now_iso: str) -> list[dict]:
     """Scheduler: invoices whose eta has passed become arrived."""
     done = []

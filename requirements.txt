@@ -8,3 +8,4 @@ python-dotenv>=1.0
 python-multipart>=0.0.9
 pypdfium2>=4.30
 pillow>=10
+telethon>=1.36

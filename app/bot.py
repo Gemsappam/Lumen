@@ -51,6 +51,18 @@ async def on_error(event):
     return True
 
 
+TRUCK_TEXT = F.text.func(lambda t: bool(re.search(r"товар\s+забран|едет на склад|время прибытия|прошла границу", t or "", re.I)))
+
+
+@dp.message(pv, wr, TRUCK_TEXT)
+async def truck_forwarded(m: Message):
+    """Messages forwarded (or pasted) from the TK MSK chat: original date is used for «+1 hour»."""
+    from datetime import timedelta
+    origin = getattr(m, "forward_origin", None)
+    sent = (origin.date if origin else m.date).replace(tzinfo=None) + timedelta(hours=3)
+    await _truck_event(None, m.text, sent, notify_uid=m.from_user.id)
+
+
 @dp.message(pv, CommandStart(), ops)
 async def start(m: Message):
     r = roles.role_of(m.from_user.id)
@@ -897,62 +909,68 @@ async def scheduler_loop():
 grp = Router()
 grp.message.filter(F.chat.type.in_({"group", "supergroup"}))
 dp.include_router(grp)
-_FT_PENDING: dict[int, str] = {}
+_FT_PENDING: dict[int, list] = {}
 
 
-def _parse_truck(text: str, sent_msk):
-    """'…предварительное время прибытия на склад к 06:00…  • ( DILUNA ) → 34 BOG AWB 543-18688902'"""
-    from datetime import timedelta
-    awbs = re.findall(r"AWB\s*([0-9]{3}[\s\-]?[0-9]{4}\s?[0-9]{4})", text, re.I)
-    m = re.search(r"(?:прибыти[яе][^0-9]{0,40}?|к\s|в\s)(\d{1,2})[:.](\d{2})", text, re.I) or re.search(r"(\d{1,2}):(\d{2})", text)
-    if not awbs or not m:
-        return None, awbs
-    eta = sent_msk.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
-    if eta < sent_msk - timedelta(hours=2):
-        eta += timedelta(days=1)                   # "к 06:00" written in the evening = tomorrow morning
-    return eta + timedelta(hours=1), awbs          # Arman's rule: +1 hour
+_TRUCK_BUF: dict[int, list] = {}
+
+
+async def _truck_event(uid_list, text: str, sent_msk, notify_uid=None):
+    """Parse + apply one FLORA TRUCK message; collect summaries and send one message per batch."""
+    from . import truck
+    ev = truck.parse(text, sent_msk)
+    if not ev:
+        return False
+    line = truck.apply(ev, _msk_now())
+    targets = [notify_uid] if notify_uid else uid_list
+    for uid in targets:
+        buf = _TRUCK_BUF.setdefault(uid, [])
+        buf.append((sent_msk, line))
+        if len(buf) == 1:
+            asyncio.create_task(_flush_truck(uid))
+    return True
+
+
+async def _flush_truck(uid: int):
+    await asyncio.sleep(4)                       # forwarded messages arrive one by one — wait for the batch
+    items = sorted(_TRUCK_BUF.pop(uid, []), key=lambda x: x[0])
+    text = "\n\n".join(l for _d, l in items if l)
+    if text:
+        try:
+            await bot.send_message(uid, text[:4000])
+        except Exception:
+            pass
 
 
 async def _handle_truck(chat_title: str, text: str, sent_msk):
-    from .api import set_eta
-    arrive, awbs = _parse_truck(text, sent_msk)
-    if not arrive:
+    await _truck_event(_money_people(), text, sent_msk)
+
+
+async def process_group_text(chat_id: int, chat_title: str, text: str, sent_msk):
+    """A message from a group/channel (seen by the main bot OR by the reader bot).
+    Only an approved TK MSK chat is processed; the first time the system admin is asked in private."""
+    from .api import _settings
+    if not re.search(r"товар\s+забран|едет на склад|время прибытия|прошла границу", text or "", re.I):
         return
-    matched, unknown = set_eta(awbs, arrive.strftime("%Y-%m-%dT%H:%M"))
-    truck = re.search(r"Машина\s+(\S+)", text)
-    msg = (f"🚛 Floratrack: машина {truck.group(1) if truck else ''} едет на склад, "
-           f"закрою как «прибыл» {arrive.strftime('%d.%m %H:%M')} МСК (их время +1 ч).\n")
-    msg += "\n".join(f"• MAWB {a}: {', '.join(f)}" for a, f in matched) or "Наших инвойсов с этими MAWB пока нет."
-    if unknown:
-        msg += "\nНет инвойсов с MAWB: " + ", ".join(unknown)
-    for uid in _money_people():
+    if chat_id in (_settings().get("ft_chats") or []):
+        await _handle_truck(chat_title or "", text, sent_msk)
+        return
+    pending = _FT_PENDING.setdefault(chat_id, [])
+    pending.append((text, sent_msk))
+    if len(pending) > 1:
+        return                                   # already asked; keep collecting until approved
+    for uid in roles.sys_ids():
         try:
-            await bot.send_message(uid, msg)
+            await bot.send_message(uid, f"Вижу сообщения о машинах в чате «{chat_title}». Это чат ТК МСК (Floratrack)?",
+                                   reply_markup=_kb([[("Да, это ТК МСК", f"ftc:{chat_id}:0"), ("Нет", f"ftn:{chat_id}")]]))
         except Exception:
             pass
 
 
 @grp.message(F.text)
 async def group_text(m: Message):
-    from .api import _settings
-    text = m.text or ""
-    if "AWB" not in text.upper():
-        return
     from datetime import timedelta
-    sent = m.date.replace(tzinfo=None) + timedelta(hours=3)
-    if m.chat.id in (_settings().get("ft_chats") or []):
-        await _handle_truck(m.chat.title or "", text, sent)
-        return
-    if m.chat.id in _FT_PENDING:
-        return
-    _FT_PENDING[m.chat.id] = text
-    for uid in roles.sys_ids():
-        try:
-            await bot.send_message(uid, f"Вижу сообщение про AWB в чате «{m.chat.title}». Это чат Floratrack?",
-                                   reply_markup=_kb([[("Да, это Floratrack", f"ftc:{m.chat.id}:{int(sent.timestamp())}"),
-                                                      ("Нет", f"ftn:{m.chat.id}")]]))
-        except Exception:
-            pass
+    await process_group_text(m.chat.id, m.chat.title or "", m.text or "", m.date.replace(tzinfo=None) + timedelta(hours=3))
 
 
 @dp.callback_query(F.data.startswith("ftc:"), sysf)
@@ -965,9 +983,8 @@ async def ft_chat_yes(c: CallbackQuery):
     SETTINGS.write_text(json.dumps({**st, "ft_chats": sorted(set((st.get("ft_chats") or []) + [cid]))}))
     await c.message.edit_text("✅ Запомнил чат Floratrack — машины из него буду закрывать как «прибыл» сами.")
     await c.answer()
-    text = _FT_PENDING.pop(cid, None)
-    if text:
-        await _handle_truck("", text, datetime.fromtimestamp(int(ts)))
+    for text, sent in _FT_PENDING.pop(cid, []):
+        await _handle_truck("", text, sent)
 
 
 @dp.callback_query(F.data.startswith("ftn:"), sysf)

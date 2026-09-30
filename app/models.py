@@ -50,6 +50,7 @@ class Invoice(SQLModel, table=True):
     est_usd: Optional[float] = None        # unpaid: approximate $ Arman expects to pay (with costs)
     eta: Optional[str] = None              # ISO datetime (MSK) when the goods count as arrived
     arrived_at: Optional[str] = None       # set when arrived; None = в пути
+    truck: Optional[str] = None            # TK MSK truck the MAWB was loaded into
 
 
 class Line(SQLModel, table=True):
@@ -130,7 +131,7 @@ def init_db():
     icols = {c["name"] for c in inspect(engine).get_columns("invoice")}
     with engine.begin() as c:
         c.execute(text("UPDATE invoice SET client_code = 'LUMEN' WHERE client_code IN ('Люмен', 'люмен', '')"))
-    for col, typ in (("est_usd", "FLOAT"), ("eta", "VARCHAR"), ("arrived_at", "VARCHAR")):
+    for col, typ in (("est_usd", "FLOAT"), ("eta", "VARCHAR"), ("arrived_at", "VARCHAR"), ("truck", "VARCHAR")):
         if col not in icols:
             with engine.begin() as c:
                 c.execute(text(f"ALTER TABLE invoice ADD COLUMN {col} {typ}"))

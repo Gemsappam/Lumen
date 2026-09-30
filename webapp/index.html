@@ -296,7 +296,15 @@ async invoice({t, inv, draft}){
     <div class="field"><label>Дата оплаты</label><input name="paid_date" value="${esc(inv.paid_date)}"></div></div>
     <div class="field"><label>Комментарий</label><input name="note" value="${esc(inv.note)}"></div>
   </form>
+  ${inv.id?`<h2>Статус груза</h2><div class="group"><div class="row"><div class="grow">
+      <div class="t">${inv.arrived_at?'📦 Прибыл':'🚚 В пути'}</div><div class="s">${inv.arrived_at?esc(inv.arrived_at):(inv.eta?'прибытие '+esc(inv.eta.replace('T',' ')):'ждёт сообщения ТК МСК о машине')}</div></div>
+      <button id="arrToggle">${inv.arrived_at?'Вернуть в «В пути»':'Отметить прибывшим'}</button></div></div>`:''}
   <div class="actions">${inv.id?'<button id="del" class="x">Удалить</button>':''}<button class="primary" id="save">Сохранить</button></div>`;
+  document.getElementById('arrToggle')?.addEventListener('click',async()=>{
+    await api(`/invoices/${inv.id}/arrived${inv.arrived_at?'?back=true':''}`,{method:'POST'});
+    inv.arrived_at = inv.arrived_at ? null : 'только что (вручную)';
+    toast(inv.arrived_at?'Отмечен прибывшим':'Вернул в «В пути»'); render('invoice',{t,inv});
+  });
 
   const tb=document.getElementById('lines'), f=document.getElementById('f'), p=document.getElementById('p');
   const drawLines=()=>{tb.innerHTML=inv.lines.map((l,i)=>`<tr data-i="${i}">
@@ -513,7 +521,7 @@ async transit(){
     <div class="group">${list.map(i=>`<div class="row" data-ti="${i.id}"><div class="grow">
       <div class="t">${esc(i.farm)}</div>
       <div style="margin:3px 0"><span class="pill ${i.paid_state==='paid'?'ok':'warn'}">${i.paid_state==='paid'?'оплачен · '+esc(i.topup):'не оплачен'}</span></div>
-      <div class="s num">${fmt(i.stems)} ст${i.paid_state==='paid'?'':' · ≈$'+fmt(i.est_usd||0,0)}</div>
+      <div class="s num">${fmt(i.stems)} ст${i.paid_state==='paid'?'':' · ≈$'+fmt(i.est_usd||0,0)}${i.truck?' · 🚚 '+esc(i.truck):''}</div>
       <div class="s num">${legsOf(i).map(l=>`${l.name} ${fmt(l.per,2)}`).join(' + ')} ₽/ст</div></div>
       <div class="v"><div class="num">${i.approx?'≈ ':''}${fmt(i.avg_rub,2)} ₽</div><div class="s">${i.approx?'±10% · ':''}за стебель</div></div></div>`).join('')}</div>`).join('')
     :'<div class="empty">Всё прибыло — в пути ничего нет.</div>'}

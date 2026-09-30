@@ -167,6 +167,20 @@ async def lifespan(app):
         tasks.append(asyncio.create_task(backup.backup_loop(bot)))
         from .bot import scheduler_loop
         tasks.append(asyncio.create_task(scheduler_loop()))
+        from . import reader
+        if reader.enabled():                           # neutral second bot in the TK MSK chat
+            rbot, rdp = reader.build()
+            try:
+                me = await rbot.get_me()
+                print(f"[lumen] бот-читатель @{me.username} запущен (для чата ТК МСК)", flush=True)
+            except Exception as e:
+                print(f"[lumen] бот-читатель: неверный READER_BOT_TOKEN? {e}", flush=True)
+            tasks.append(asyncio.create_task(rdp.start_polling(rbot, handle_signals=False,
+                                                               allowed_updates=["message", "channel_post"])))
+        from . import userbot
+        if userbot.enabled():                          # invisible reader of the TK MSK chat
+            from .bot import _handle_truck
+            tasks.append(asyncio.create_task(userbot.run_forever(lambda text, sent: _handle_truck("", text, sent))))
     yield
     for t in tasks:
         t.cancel()
