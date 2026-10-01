@@ -51,6 +51,9 @@ class Invoice(SQLModel, table=True):
     eta: Optional[str] = None              # ISO datetime (MSK) when the goods count as arrived
     arrived_at: Optional[str] = None       # set when arrived; None = в пути
     truck: Optional[str] = None            # TK MSK truck the MAWB was loaded into
+    packing_sent: bool = False             # packing list already posted to the chats
+    client_eta: Optional[str] = None       # ISO MSK: when clients are told «прибыл» (TK time + 6 h)
+    client_done: bool = False              # «прибыл» already sent to client chats
 
 
 class Line(SQLModel, table=True):
@@ -131,6 +134,15 @@ def init_db():
     icols = {c["name"] for c in inspect(engine).get_columns("invoice")}
     with engine.begin() as c:
         c.execute(text("UPDATE invoice SET client_code = 'LUMEN' WHERE client_code IN ('Люмен', 'люмен', '')"))
+    if "packing_sent" not in icols:          # invoices booked before this feature: don't spam old packing lists
+        with engine.begin() as c:
+            c.execute(text("ALTER TABLE invoice ADD COLUMN packing_sent BOOLEAN DEFAULT 0"))
+            c.execute(text("UPDATE invoice SET packing_sent = 1"))
+    if "client_eta" not in icols:
+        with engine.begin() as c:
+            c.execute(text("ALTER TABLE invoice ADD COLUMN client_eta VARCHAR"))
+            c.execute(text("ALTER TABLE invoice ADD COLUMN client_done BOOLEAN DEFAULT 0"))
+            c.execute(text("UPDATE invoice SET client_done = 1"))      # nothing old goes to clients
     for col, typ in (("est_usd", "FLOAT"), ("eta", "VARCHAR"), ("arrived_at", "VARCHAR"), ("truck", "VARCHAR")):
         if col not in icols:
             with engine.begin() as c:

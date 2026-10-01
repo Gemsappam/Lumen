@@ -657,6 +657,10 @@ def history(s):
 # ---------- routes -------------------------------------------------------------------
 @router.get("/topups")
 def list_topups(uid: int = Depends(user_id)):
+    from .roles import can_write
+    if not can_write(role_of_(uid)):                 # 1С operator: only dates, no money
+        with session() as s:
+            return [{"id": t.id, "date": t.date} for t in s.exec(select(TopUp).order_by(TopUp.id.desc())).all()]
     active = active_topup()
     with session() as s:
         tops, invs, lines, logs = _all(s)
@@ -774,7 +778,13 @@ def update_topup(tid: int, body: TopUpIn, uid: int = Depends(writer)):
 
 @router.get("/topups/{tid}")
 def get_topup(tid: int, uid: int = Depends(user_id)):
+    from .roles import can_write
     with session() as s:
+        if not can_write(role_of_(uid)):             # 1С operator: date only, export is allowed
+            t = s.get(TopUp, tid)
+            if not t:
+                raise HTTPException(404)
+            return {"topup": {"id": t.id, "date": t.date}, "viewer": True}
         return snapshot(s, tid)
 
 
@@ -919,6 +929,59 @@ def set_marking(body: MarkingIn, uid: int = Depends(writer)):
     from .backup import mark_dirty
     mark_dirty()
     return {"marking": m}
+
+
+# ---------- client markings & chats ----------
+@router.get("/markings")
+def list_markings(uid: int = Depends(writer)):
+    from .clients import registry
+    return {"markings": registry(), "default": marking()}
+
+
+class MarkIn(BaseModel):
+    name: str
+
+
+@router.post("/markings")
+def add_marking(body: MarkIn, uid: int = Depends(writer)):
+    from .clients import registry, save_registry
+    reg = registry()
+    reg.setdefault(body.name.strip().upper(), [])
+    save_registry(reg)
+    return {"markings": reg}
+
+
+@router.delete("/markings/{name}")
+def drop_marking(name: str, chat_id: int | None = None, thread_id: int | None = None, uid: int = Depends(writer)):
+    from .clients import registry, save_registry
+    reg = registry()
+    n = name.strip().upper()
+    if chat_id is None:
+        reg.pop(n, None)
+    else:
+        reg[n] = [c for c in reg.get(n, []) if not (c["chat_id"] == chat_id and c.get("thread_id") == thread_id)]
+    save_registry(reg)
+    return {"markings": reg}
+
+
+class AwbMarksIn(BaseModel):
+    markings: list[str]
+
+
+@router.post("/awb/{awb}/markings")
+def set_awb_markings(awb: str, body: AwbMarksIn, uid: int = Depends(writer)):
+    """Markings present in a shipment: set on every invoice of this MAWB."""
+    k = norm_awb(awb)
+    val = ", ".join(dict.fromkeys(m.strip().upper() for m in body.markings if m.strip())) or marking()
+    with session() as s:
+        for i in s.exec(select(Invoice)).all():
+            if norm_awb(i.awb) == k:
+                i.client_code = val
+                s.add(i)
+        s.commit()
+    from .backup import mark_dirty
+    mark_dirty()
+    return transit_view()
 
 
 @router.delete("/drafts")
@@ -1300,6 +1363,31 @@ def set_eta(awbs: list[str], eta_iso: str) -> tuple[list, list]:
     from .backup import mark_dirty
     mark_dirty()
     return matched, unknown
+
+
+def set_client_eta(awbs: list[str], iso: str, done: bool = False):
+    """When clients are told «прибыл» (TK time + 6 h). done=True for old history: never notify clients."""
+    keys = {norm_awb(a) for a in awbs}
+    with session() as s:
+        for i in s.exec(select(Invoice)).all():
+            if norm_awb(i.awb) in keys and not i.client_done:
+                i.client_eta = iso
+                i.client_done = done
+                s.add(i)
+        s.commit()
+
+
+def client_arrivals_due(now_iso: str) -> list:
+    """Invoices whose client ETA has passed and clients weren't told yet -> mark and return them."""
+    out = []
+    with session() as s:
+        for i in s.exec(select(Invoice)).all():
+            if i.client_eta and not i.client_done and i.client_eta <= now_iso:
+                i.client_done = True
+                s.add(i)
+                out.append({"awb": i.awb})
+        s.commit()
+    return out
 
 
 def set_truck(awb: str, truck: str) -> list[str]:

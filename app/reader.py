@@ -16,6 +16,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import ChatMemberUpdated, Message
 
 READER_BOT_TOKEN = os.getenv("READER_BOT_TOKEN", "").strip()
+RBOT = None          # the reader Bot instance — it also posts statuses into client chats
 
 
 def enabled() -> bool:
@@ -23,8 +24,33 @@ def enabled() -> bool:
 
 
 def build():
+    global RBOT
+    from aiogram.filters import Command
+    from . import roles
     rbot = Bot(READER_BOT_TOKEN)
+    RBOT = rbot
     rdp = Dispatcher()
+    staff = F.from_user.id.func(lambda i: roles.can_write(roles.role_of(i)))
+
+    @rdp.message(Command("marking_here"), staff)
+    async def marking_here(m: Message):
+        """In a client's group: /marking_here ABC -> statuses of shipments with marking ABC go here."""
+        from . import clients
+        parts = (m.text or "").split(maxsplit=1)
+        if len(parts) < 2:
+            await m.reply("Напиши маркировку: /marking_here ABC")
+            return
+        mk = parts[1].strip().upper()
+        th = m.message_thread_id if m.is_topic_message else None
+        clients.add_chat(mk, m.chat.id, th, m.chat.title or "")
+        await m.reply(f"✅ Статусы грузов с маркировкой {mk} будут приходить сюда.")
+
+    @rdp.message(Command("marking_off"), staff)
+    async def marking_off(m: Message):
+        from . import clients
+        th = m.message_thread_id if m.is_topic_message else None
+        gone = clients.remove_chat(m.chat.id, th)
+        await m.reply("Статусы сюда больше не отправляю." + (f" ({', '.join(gone)})" if gone else ""))
 
     async def _take(m: Message):
         from .bot import process_group_text

@@ -303,7 +303,7 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
     wr = leg_end + 2
     import re as _re
     warns = [_re.sub(r"MAWB (\d{3})(\d{8})", r"MAWB \1-\2", hide_carriers(w)) for w in provisional + res.warnings]
-    if warns:
+    if warns and not operator:
         ws.cell(wr, 1, "ПРОВЕРИТЬ").font = Font(name=F, bold=True, color="C00000")
         for n, w in enumerate(warns, 1):
             ws.cell(wr + n, 1, w).fill = YFILL

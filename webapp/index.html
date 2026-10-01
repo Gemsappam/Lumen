@@ -111,7 +111,7 @@ function go(view, args={}, push=true){ if(push) stack.push([view,args]); render(
 function back(){ stack.pop(); const [v,a]=stack[stack.length-1]||['home',{}]; render(v,a) }
 tg?.BackButton.onClick(back);
 const TABS=[['home','💐','Откупы'],['transit','🚚','В пути'],['stock','📦','Остатки'],['more','⋯','Ещё']];
-const TAB_OF={home:'home',topup:'home',topupForm:'home',draft:'home',invoice:null,logistics:null,weights:'home',
+const TAB_OF={marks:'more',home:'home',topup:'home',topupForm:'home',draft:'home',invoice:null,logistics:null,weights:'home',
   transit:'transit',transitInv:'transit',stock:'stock',more:'more',farms:'more',farm:'more',users:'more'};
 let CUR_TAB='home';
 function tab(v){ stack.length=0; go(v) }
@@ -149,7 +149,7 @@ async home(){
     <h2>Пополнения</h2>
     <div class="group">${tops.length?tops.map(t=>`
       <div class="row" data-top="${t.id}"><div class="grow"><div class="t">${esc(t.date)}${t.active?' <span class="pill">сюда идут документы</span>':''}</div>
-      <div class="s num">${fmt(t.rub)} ₽ → $${fmt(t.usd)} · курс ${fmt(t.rate,4)}</div></div>
+      ${ME.can_write?`<div class="s num">${fmt(t.rub)} ₽ → $${fmt(t.usd)} · курс ${fmt(t.rate,4)}</div>`:''}</div>
       ${ME.sees_money&&MONEY[t.id]?`<div class="v"><div class="num">$${fmt(MONEY[t.id].usd_left,2)}</div><div class="s">остаток</div></div>`:''}</div>`).join('')
       :'<div class="empty">Пополнений пока нет. Начни с первого.</div>'}</div>
     <div class="actions"><button class="primary" id="new">Новое пополнение</button></div>
@@ -198,6 +198,18 @@ async topupForm({t}){
 async topup({id, snap}){
   await whoami();
   const d = snap || await api('/topups/'+id); const t=d.topup;
+  if(d.viewer){                                    // 1С operator: date + operator export only
+    $app.innerHTML=`<h1>Пополнение ${esc(t.date)}</h1><p class="sub">Выгрузка учёта для оператора.</p>
+      <div class="actions"><button class="primary" id="xls">Excel в чат</button></div>`;
+    document.getElementById('xls').onclick=async e=>{
+      const ch=await askExport(t.date); if(!ch) return;
+      const b=e.target; b.disabled=true; b.textContent='Собираю…';
+      try{ if(ch.scope==='all'){ const r=await api('/export_all?audience=operator',{method:'POST'}); toast(`Все пополнения (${r.sheets.length}) отправлены в чат`) }
+           else { const r=await api(`/topups/${t.id}/export?audience=operator`,{method:'POST'}); toast(`Лист «${r.sheet}» отправлен в чат`) } }
+      catch(x){toast(x.message)}
+      b.disabled=false; b.textContent='Excel в чат'};
+    return;
+  }
   const byAwb={}; d.invoices.forEach(i=>(byAwb[i.awb||'без MAWB']??=[]).push(i));
   $app.innerHTML=`
   <h1>Пополнение ${esc(t.date)}</h1>
@@ -277,7 +289,7 @@ async invoice({t, inv, draft}){
     <div class="field"><label>Дата инвойса</label><input name="invoice_date" value="${esc(inv.invoice_date)}"></div></div>
     <div class="two"><div class="field"><label>MAWB</label><input name="awb" value="${esc(inv.awb)}"></div>
     <div class="field"><label>Вес плантации в MAWB, кг</label><input name="weight_kg" inputmode="decimal" value="${inv.weight_kg??''}"></div></div>
-    <div class="two"><div class="field"><label>Маркировка</label><input name="client_code" value="${esc(inv.client_code)}" placeholder="${esc(MARK||'LUMEN')}"></div>
+    <div class="two"><div class="field"><label>Маркировка (несколько — через запятую)</label><input name="client_code" value="${esc(inv.client_code)}" placeholder="${esc(MARK||'LUMEN')}"></div>
     <div class="field"><label>Пополнение</label><select name="topup"><option value="0" ${!(inv.topup_id??t.id)?'selected':''}>🚚 не оплачен — в пути</option>${TOPS.map(x=>`<option value="${x.id}" ${x.id===(inv.topup_id??t.id)?'selected':''}>${esc(x.date)} · $${fmt(x.usd,0)}</option>`).join('')}</select></div></div>
   </form>
   <h2>Номенклатура</h2>
@@ -519,8 +531,9 @@ async transit(){
   const by={}; v.invoices.forEach(i=>(by[i.awb||'без MAWB']??=[]).push(i));
   const eta=i=>i.eta?`прибытие ${i.eta.slice(8,10)}.${i.eta.slice(5,7)} ${i.eta.slice(11,16)}`:'';
   $app.innerHTML=`<h1>Груз в пути</h1>
-  <p class="sub">≈ по курсу ${fmt(v.est_rate,2)} (пополнение ${esc(v.est_topup||'—')}). Приблизительная себестоимость — отклонение до ±10%.</p>
-  ${Object.keys(by).length?Object.entries(by).map(([awb,list])=>`<h2>${awb==='без MAWB'?'MAWB ещё не известен':'MAWB '+esc(awb)}${list.find(x=>x.eta)?' · '+eta(list.find(x=>x.eta)):''}</h2>
+  <p class="sub">${ME.can_write?`≈ по курсу ${fmt(v.est_rate,2)} (пополнение ${esc(v.est_topup||'—')}). `:''}Приблизительная себестоимость — отклонение до ±10%.</p>
+  ${Object.keys(by).length?Object.entries(by).map(([awb,list])=>`<h2>${awb==='без MAWB'?'MAWB ещё не известен':'MAWB '+esc(awb)}${list.find(x=>x.eta)?' · '+eta(list.find(x=>x.eta)):''}
+      ${awb!=='без MAWB'&&ME.can_write?`<span class="pill" data-mk="${esc(awb)}" style="cursor:pointer;margin-left:6px">🏷 ${esc([...new Set(list.flatMap(i=>(i.client_code||'').split(',').map(x=>x.trim()).filter(Boolean)))].join(', ')||'маркировки')}</span>`:''}</h2>
     <div class="group">${list.map(i=>`<div class="row" data-ti="${i.id}"><div class="grow">
       <div class="t">${esc(i.farm)}</div>
       <div style="margin:3px 0"><span class="pill ${i.paid_state==='paid'?'ok':'warn'}">${i.paid_state==='paid'?'оплачен · '+esc(i.topup):'не оплачен'}</span></div>
@@ -534,6 +547,10 @@ async transit(){
       <button class="primary" data-pl="${l.id}" style="margin-left:6px;padding:8px 10px">Оплачен</button></div>`).join('')}</div>`:''}
   <div class="actions"><button id="addT">+ Инвойс в пути</button></div>`;
   $app.querySelectorAll('[data-ti]').forEach(e=>e.onclick=()=>go('transitInv',{i:v.invoices.find(x=>x.id==e.dataset.ti),v}));
+  $app.querySelectorAll('[data-mk]').forEach(e=>e.onclick=async()=>{
+    const cur=[...new Set(v.invoices.filter(i=>i.awb===e.dataset.mk).flatMap(i=>(i.client_code||'').split(',').map(x=>x.trim()).filter(Boolean)))].join(', ');
+    const nv=prompt('Чьи маркировки в этой поставке? Через запятую, например: LUMEN, ABC',cur); if(nv===null) return;
+    await api('/awb/'+encodeURIComponent(e.dataset.mk)+'/markings',{method:'POST',body:{markings:nv.split(',')}}); toast('Маркировки сохранены'); render('transit',{})});
   $app.querySelectorAll('[data-pl]').forEach(b=>b.onclick=ev=>{ev.stopPropagation();payForm({kind:'logistics',id:+b.dataset.pl,usd:v.unpaid_logistics.find(x=>x.id==b.dataset.pl).usd})});
   document.getElementById('addT').onclick=()=>go('invoice',{t:{id:0,date:'в пути'}});
   if(!ME.can_write) document.getElementById('addT').style.display='none';
@@ -573,7 +590,7 @@ async stock(){
       <div class="v"><div class="num">${i.approx?'≈ ':''}${fmt(i.rub_goods+i.rub_logi)} ₽</div>
         <div class="s num">товар ${fmt(i.rub_goods)}</div>${legsOf(i).map(l=>`<div class="s num">${l.name} ${fmt(l.rub)}</div>`).join('')}</div></div>`).join('')}</div>`;
   $app.innerHTML=`<h1>Товарные остатки</h1>
-  <p class="sub">Рублёвые суммы груза в пути по инвойсам: товар + логистика. Неоплаченные — по курсу ${fmt(v.est_rate,2)} (пополнение ${esc(v.est_topup||'—')}).</p>
+  <p class="sub">Рублёвые суммы груза в пути по инвойсам: товар + логистика. ${ME.can_write?`Неоплаченные — по курсу ${fmt(v.est_rate,2)} (пополнение ${esc(v.est_topup||'—')}).`:''}</p>
   ${block('Оплаченные в пути',paid,paid.some(i=>i.approx))}
   ${block('Неоплаченные в пути',unpaid,true)}`;
   $app.querySelectorAll('[data-ti]').forEach(e=>e.onclick=()=>go('transitInv',{i:v.invoices.find(x=>x.id==e.dataset.ti),v}));
@@ -582,6 +599,7 @@ async stock(){
 // ======================= ЕЩЁ =======================
 async more(){
   $app.innerHTML=`<h1>Ещё</h1><div class="group">
+    <div class="row" id="m-marks"><div class="grow"><div class="t">Маркировки клиентов</div><div class="s">чаты клиентов для статусов грузов</div></div></div>
     <div class="row" id="m-farms"><div class="grow"><div class="t">Плантации</div><div class="s">справочник, правила коробок, нюансы для AI</div></div></div>
     ${ME.role==='sys'?'<div class="row" id="m-users"><div class="grow"><div class="t">Пользователи и роли</div><div class="s">кто что видит</div></div></div>':''}
   </div>
@@ -592,7 +610,26 @@ async more(){
   document.getElementById('mkSave').onclick=async()=>{const v=document.getElementById('mk').m.value.trim(); if(!v)return toast('Пусто');
     MARK=(await api('/settings/marking',{method:'POST',body:{marking:v}})).marking; toast('Маркировка: '+MARK)};
   document.getElementById('m-farms').onclick=()=>go('farms');
+  document.getElementById('m-marks').onclick=()=>go('marks');
   document.getElementById('m-users')?.addEventListener('click',()=>go('users'));
+},
+
+// ======================= МАРКИРОВКИ КЛИЕНТОВ =======================
+async marks(){
+  const r=await api('/markings'); const reg=r.markings||{};
+  $app.innerHTML=`<h1>Маркировки</h1>
+  <p class="sub">Статусы груза (загружен в машину, граница, едет на склад, прибыл) уходят в чат клиента, чья маркировка есть в поставке. Клиент видит только свой груз: без MAWB, номеров машин, мест, цен и названий ТК — «Ваш груз из Колумбии едет на склад…».</p>
+  <div class="group">${Object.keys(reg).length?Object.entries(reg).map(([m,chats])=>`<div class="row"><div class="grow"><div class="t">${esc(m)}${m===r.default?' <span class="pill">по умолчанию</span>':''}</div>
+      <div class="s">${chats.length?chats.map(c=>`${esc(c.title||c.chat_id)}${c.thread_id?' (тема)':''} <a href="#" data-rc="${esc(m)}|${c.chat_id}|${c.thread_id??''}">убрать</a>`).join('<br>'):'чат не привязан'}</div></div>
+      <button class="x" data-rm="${esc(m)}">×</button></div>`).join(''):'<div class="empty">Маркировок пока нет</div>'}</div>
+  <form id="f" class="group" style="margin-top:12px"><div class="field"><label>Новая маркировка</label><input name="n" placeholder="ABC"></div></form>
+  <div class="actions"><button class="primary" id="add">Добавить</button></div>
+  <p class="hint" style="margin:10px 16px">Как привязать чат клиента: добавь нейтрального бота-читателя в группу с клиентом и напиши там <b>/marking_here ABC</b> (в супергруппе — внутри нужной темы). Отвязать: <b>/marking_off</b> там же.<br>
+  Какие маркировки в поставке — «В пути» → 🏷 рядом с MAWB, или поле «Маркировка» в инвойсе (несколько через запятую).</p>`;
+  document.getElementById('add').onclick=async()=>{const n=document.getElementById('f').n.value.trim(); if(!n)return; await api('/markings',{method:'POST',body:{name:n}}); render('marks',{})};
+  $app.querySelectorAll('[data-rm]').forEach(b=>b.onclick=async()=>{ if(!confirm('Удалить маркировку '+b.dataset.rm+'?'))return; await api('/markings/'+encodeURIComponent(b.dataset.rm),{method:'DELETE'}); render('marks',{})});
+  $app.querySelectorAll('[data-rc]').forEach(a=>a.onclick=async ev=>{ev.preventDefault(); const [m,c,t]=a.dataset.rc.split('|');
+    await api(`/markings/${encodeURIComponent(m)}?chat_id=${c}${t?'&thread_id='+t:''}`,{method:'DELETE'}); render('marks',{})});
 },
 
 // ======================= USERS (system super-admin) =======================

@@ -13,6 +13,7 @@ import re
 from datetime import datetime, timedelta
 
 AWB = r"([0-9]{3}[\s\-]?[0-9]{4}\s?[0-9]{4})"
+CLIENT_SHIFT_H = 6        # clients always get TK time + 6 hours (our buffer)
 
 
 def _clean(text: str) -> str:
@@ -35,17 +36,29 @@ def parse(text: str, sent_msk: datetime) -> dict | None:
         if not rng:
             return {"kind": "eta", "truck": truck, "awbs": awbs, "arrive": None, "boxes": {}}
         hh, mm = (rng.group(3), rng.group(4)) if rng.group(3) else (rng.group(1), rng.group(2))   # later end of a range
+        window = f"{int(rng.group(1)):02d}:{rng.group(2)}" + (f"–{int(rng.group(3)):02d}:{rng.group(4)}" if rng.group(3) else "")
         eta = sent_msk.replace(hour=int(hh) % 24, minute=int(mm), second=0, microsecond=0)
         if eta < sent_msk - timedelta(hours=2):
             eta += timedelta(days=1)            # «к 06:00» written in the evening = next morning
         boxes = {a: int(n) for n, a in re.findall(r"(\d+)\s+[A-Z]{3}\s+AWB\s*" + AWB, t)}
-        return {"kind": "eta", "truck": truck, "awbs": awbs, "arrive": eta + timedelta(hours=1), "boxes": boxes}
+        start = eta.replace(hour=int(rng.group(1)) % 24, minute=int(rng.group(2)))
+        if start > eta:
+            start -= timedelta(days=1)
+        c1, c2 = start + timedelta(hours=CLIENT_SHIFT_H), eta + timedelta(hours=CLIENT_SHIFT_H)
+        if c1 == c2:
+            cw = c1.strftime("%d.%m %H:%M")
+        elif c1.date() == c2.date():
+            cw = f"{c1:%d.%m %H:%M}–{c2:%H:%M}"
+        else:
+            cw = f"{c1:%d.%m %H:%M} – {c2:%d.%m %H:%M}"
+        return {"kind": "eta", "truck": truck, "awbs": awbs, "arrive": eta + timedelta(hours=1), "boxes": boxes,
+                "window": cw, "client_eta": c2}
     if re.search(r"прошла границу", t, re.I):
         return {"kind": "border", "truck": truck, "awbs": [], "arrive": None, "boxes": {}}
     return None
 
 
-def apply(ev: dict, now_msk: datetime) -> str:
+def apply(ev: dict, now_msk: datetime, fresh: bool = True) -> str:
     """Write the event into the books and return a one-line summary (no carrier names)."""
     from .api import arrive_due, set_eta, set_truck
     if not ev:
@@ -65,6 +78,8 @@ def apply(ev: dict, now_msk: datetime) -> str:
             return f"Машина {tr}: не нашёл время прибытия"
         iso = ev["arrive"].strftime("%Y-%m-%dT%H:%M")
         matched, unknown = set_eta(ev["awbs"], iso)
+        from .api import set_client_eta
+        set_client_eta(ev["awbs"], ev["client_eta"].strftime("%Y-%m-%dT%H:%M"), done=not fresh)
         for a in ev["awbs"]:
             set_truck(a, tr)
         done = arrive_due(now_msk.strftime("%Y-%m-%dT%H:%M"))     # old message -> already arrived
