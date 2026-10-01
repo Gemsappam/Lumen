@@ -111,7 +111,7 @@ function go(view, args={}, push=true){ if(push) stack.push([view,args]); render(
 function back(){ stack.pop(); const [v,a]=stack[stack.length-1]||['home',{}]; render(v,a) }
 tg?.BackButton.onClick(back);
 const TABS=[['home','💐','Откупы'],['transit','🚚','В пути'],['stock','📦','Остатки'],['more','⋯','Ещё']];
-const TAB_OF={marks:'more',home:'home',topup:'home',topupForm:'home',draft:'home',invoice:null,logistics:null,weights:'home',
+const TAB_OF={ledger:'more',marks:'more',home:'home',topup:'home',topupForm:'home',draft:'home',invoice:null,logistics:null,weights:'home',
   transit:'transit',transitInv:'transit',stock:'stock',more:'more',farms:'more',farm:'more',users:'more'};
 let CUR_TAB='home';
 function tab(v){ stack.length=0; go(v) }
@@ -300,6 +300,7 @@ async invoice({t, inv, draft}){
   <form id="p" class="group">
     <div class="two"><div class="field"><label>Итог по инвойсу, $ (для справки)</label><input name="invoice_total_usd" inputmode="decimal" value="${inv.invoice_total_usd??''}"></div>
     <div class="field"><label id="usdLbl">Оплачено, $</label><input name="usd_paid" inputmode="decimal" value="${inv.usd_paid??''}"></div></div>
+    <div class="field" id="farmUsdF"><label>Дошло до фермы, $ (пусто = ровно по инвойсу; больше — аванс, меньше — долг)</label><input name="farm_usd" inputmode="decimal" value="${inv.farm_usd??''}"></div>
     <div class="field"><label>Оплачено, ₽ <span id="rubMode" class="pill" style="margin-left:6px"></span></label><input name="rub_paid_override" inputmode="decimal" value="${inv.rub_paid_override??''}"></div>
     <div class="hint" style="padding:0 14px 8px" id="trueRate">Истинный курс = все ₽ за инвойс ÷ $ строк цветов. Комиссия, налог и сборы ложатся на стебли пропорционально цене.</div>
     <div class="field"><label>Как делить ₽ по строкам</label><select name="alloc_mode">
@@ -361,6 +362,7 @@ async invoice({t, inv, draft}){
   const unpaidMode=()=>{const u=!+f.topup.value; document.getElementById('usdLbl').textContent=u?'Примерно $ (не оплачен)':'Оплачено, $';
     p.rub_paid_override.closest('.field').style.display=u?'none':'';
     p.paid.closest('.two').style.display=u?'none':'';
+    document.getElementById('farmUsdF').style.display=u?'none':'';
     if(u) p.paid_date.value=''; else if(!p.paid_date.value) p.paid_date.value=new Date().toLocaleDateString('ru-RU')};
   f.topup.addEventListener('change',()=>{unpaidMode();syncRub();sums()});
   if(!inv.topup_id && inv.est_usd && !inv.usd_paid) p.usd_paid.value=inv.est_usd;
@@ -380,7 +382,7 @@ async invoice({t, inv, draft}){
   function collect(){
     for(const k of ['farm','country','invoice_no','invoice_date','awb','client_code']) inv[k]=f[k].value.trim();
     inv.weight_kg=numOrNull(f.weight_kg.value);
-    for(const k of ['invoice_total_usd','usd_paid','rub_paid_override']) inv[k]=numOrNull(p[k].value);
+    for(const k of ['invoice_total_usd','usd_paid','rub_paid_override','farm_usd']) inv[k]=numOrNull(p[k].value);
     if(!+f.topup.value){ inv.est_usd=inv.usd_paid; inv.usd_paid=0; inv.rub_paid_override=null; inv.paid=false }
     inv.alloc_mode=p.alloc_mode.value; inv.paid=p.paid.value==='1'; inv.paid_date=p.paid_date.value; inv.note=p.note.value;
     inv.topup_id=+f.topup.value;
@@ -599,6 +601,7 @@ async stock(){
 // ======================= ЕЩЁ =======================
 async more(){
   $app.innerHTML=`<h1>Ещё</h1><div class="group">
+    <div class="row" id="m-led"><div class="grow"><div class="t">Расчёты с фермами</div><div class="s">авансы и долги в $</div></div></div>
     <div class="row" id="m-marks"><div class="grow"><div class="t">Маркировки клиентов</div><div class="s">чаты клиентов для статусов грузов</div></div></div>
     <div class="row" id="m-farms"><div class="grow"><div class="t">Плантации</div><div class="s">справочник, правила коробок, нюансы для AI</div></div></div>
     ${ME.role==='sys'?'<div class="row" id="m-users"><div class="grow"><div class="t">Пользователи и роли</div><div class="s">кто что видит</div></div></div>':''}
@@ -611,7 +614,19 @@ async more(){
     MARK=(await api('/settings/marking',{method:'POST',body:{marking:v}})).marking; toast('Маркировка: '+MARK)};
   document.getElementById('m-farms').onclick=()=>go('farms');
   document.getElementById('m-marks').onclick=()=>go('marks');
+  document.getElementById('m-led').onclick=()=>go('ledger');
   document.getElementById('m-users')?.addEventListener('click',()=>go('users'));
+},
+
+// ======================= РАСЧЁТЫ С ФЕРМАМИ =======================
+async ledger(){
+  const r=await api('/ledger');
+  $app.innerHTML=`<h1>Расчёты с фермами</h1>
+  <p class="sub">В $, по тому, что дошло до фермы. Аванс — деньги лежат у фермы и зачтутся в следующий инвойс по курсу той оплаты. Долг — мы должны; пока не оплачен, считается ≈ по курсу последнего пополнения.</p>
+  <div class="group">${r.farms.length?r.farms.map(f=>`<div class="row"><div class="grow"><div class="t">${esc(f.farm)}</div>
+      <div class="s num">${f.advances.map(a=>`аванс $${fmt(a.usd,2)} по ${fmt(a.rate,2)} ₽/$ (оплата ${esc(a.from)})`).join('<br>')}${f.debts.length?(f.advances.length?'<br>':'')+`долг $${fmt(f.debt_usd,2)}`:''}</div></div>
+      <div class="v"><div class="num" style="color:${f.balance_usd<0?'var(--err)':'var(--ok)'}"><b>${f.balance_usd<0?'долг ':'аванс '}$${fmt(Math.abs(f.balance_usd),2)}</b></div></div></div>`).join('')
+    :'<div class="empty">Со всеми фермами расчёты закрыты: ни авансов, ни долгов.</div>'}</div>`;
 },
 
 // ======================= МАРКИРОВКИ КЛИЕНТОВ =======================
@@ -693,14 +708,15 @@ async function payForm({kind,id,usd}){
     <h2 style="margin-top:4px">Из какого пополнения оплачен?</h2>
     <div class="group">${tops.slice(0,8).map((t,n)=>`<label class="row"><input type="radio" name="tp" value="${t.id}" ${n?'':'checked'}><div class="grow"><div class="t">${esc(t.date)}</div><div class="s num">курс ${fmt(t.rate,2)}</div></div></label>`).join('')}</div>
     <form class="group" style="margin-top:10px"><div class="two"><div class="field"><label>Оплачено, $</label><input name="usd" inputmode="decimal" value="${usd??''}"></div>
-    <div class="field"><label>₽ (пусто = по курсу)</label><input name="rub" inputmode="decimal"></div></div></form>
+    <div class="field"><label>₽ (пусто = по курсу)</label><input name="rub" inputmode="decimal"></div></div>
+    ${kind==='invoices'?'<div class="field"><label>Дошло до фермы, $ (пусто = ровно по инвойсу)</label><input name="farm" inputmode="decimal"></div>':''}</form>
     <div class="actions"><button id="pcancel">Отмена</button><button class="primary" id="pok">Оплачен</button></div></div>`;
   document.body.appendChild(wrap);
   const close=()=>wrap.remove();
   wrap.querySelector('#pcancel').onclick=close;
   wrap.querySelector('#pok').onclick=async()=>{
     const f=wrap.querySelector('form'); const tp=+wrap.querySelector('input[name=tp]:checked')?.value;
-    const body={topup_id:tp,usd:numOrNull(f.usd.value),rub:numOrNull(f.rub.value)};
+    const body={topup_id:tp,usd:numOrNull(f.usd.value),rub:numOrNull(f.rub.value),farm_usd:f.farm?numOrNull(f.farm.value):null};
     if(!tp) return toast('Выбери пополнение'); if(kind==='invoices'&&!body.usd) return toast('Впиши $');
     try{ await api(`/${kind}/${id}/pay`,{method:'POST',body}); close(); toast('Оплачено — себестоимость теперь точная'); tab('transit') }catch(e){toast(e.message)}
   };

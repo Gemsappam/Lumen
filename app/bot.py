@@ -285,6 +285,15 @@ async def _step(uid: int, head: str = ""):
         rows = [[(f"{x.date} · курс {x.rub / x.usd:.2f}", f"fl:tp:{x.id}")] for x in tops]
         await _send(uid, head + "Из какого пополнения оплачен?", _kb(rows), note)
         return
+    if not flow.get("awb_done"):
+        awbs = sorted({d.get("awb") for _p, d in docs if d.get("awb")})
+        if awbs:
+            await _send(uid, head + f"MAWB: {', '.join(awbs)}" + (" (из разбивки)" if any(d.get('mawb_note') for _p, d in docs) else "") + " — верно?",
+                        _kb([[("✅ Верно", "fl:awb:ok"), ("✏️ Другой", "fl:awb:edit")], [("Ещё не знаем", "fl:awb:none")]]), note)
+        else:
+            await _send(uid, head + "Номер MAWB уже известен?",
+                        _kb([[("✏️ Да, напишу", "fl:awb:edit"), ("Ещё не знаем", "fl:awb:none")]]), note)
+        return
     if freight and not flow["pays"]:
         usd = (docs[0][1].get("freight") or {}).get("total_usd")
         if usd:
@@ -304,6 +313,15 @@ async def _step(uid: int, head: str = ""):
             f"{round(docs[0][1].get('invoice_total_usd') or 1000)}$"
         await _send(uid, head + ask + f"\nНапример:\n{ex}", None, note)
         return
+    if flow["paid"] and not freight and flow.get("farm") is None:
+        from .api import farm_balance_text
+        tot = [round(d.get("invoice_total_usd") or sum((l.get("stems") or 0) * (l.get("price_usd") or 0) for l in d.get("lines", [])), 2)
+               for _p, d in docs]
+        bal = "\n".join(farm_balance_text(d.get("farm") or "") for _p, d in docs)
+        label = f"Ровно по инвойсу ${tot[0]:g}" if len(docs) == 1 else "Ровно по инвойсам"
+        await _send(uid, head + bal + "\n\nСколько дошло до фермы?",
+                    _kb([[(label, "fl:farm:exact")], [("Другая сумма (переплата / аванс / недоплата)", "fl:farm:other")]]), note)
+        return
     await _book_flow(uid, head, note)
 
 
@@ -316,18 +334,22 @@ async def _book_flow(uid: int, head: str, note):
         with session() as s:
             t = s.get(TopUp, flow["topup"])
     pays = flow["pays"] + [None] * (len(docs) - len(flow["pays"]))
+    farm_usd = (flow.get("farm") or []) + [None] * len(docs)
     out = []
-    for (p, d), pr in zip(docs, pays):
+    for n, ((p, d), pr) in enumerate(zip(docs, pays)):
         usd, rub = pr or (None, None)
         if d.get("doc_type") == "farm_invoice":
             fill_mawb(d, t.id if t else None)
-        snap, kind = book_document(d, t.id if t else 0, usd, rub, uid, paid=bool(flow["paid"]))
+        snap, kind = book_document(d, t.id if t else 0, usd, rub, uid, paid=bool(flow["paid"]), farm_usd=farm_usd[n])
         if not snap:
             out.append(f"❌ {d.get('farm') or ''}: не внёс — {kind}. Черновик в «Учёт».")
             continue
         p.unlink(missing_ok=True)
         pre = f"{d['farm']}: " if len(docs) > 1 else ""
         out.append(pre + (_booked_text(snap, d, kind, t, uid) if t else _transit_text(snap, d, kind)))
+        if d.get("doc_type") == "farm_invoice":
+            from .api import farm_balance_text
+            out[-1] += "\n" + farm_balance_text(d.get("farm") or "")
     await _send(uid, head + "\n\n".join(out), None, note)
     await _flush_export(uid, "📊 Логистика легла на товар из прошлого пополнения.")
 
@@ -358,6 +380,27 @@ async def flow_button(c: CallbackQuery):
         flow["paid"] = False
     elif part[1] == "tp":
         flow["topup"] = int(part[2])
+    elif part[1] == "awb" and part[2] in ("ok", "none"):
+        flow["awb_done"] = True
+        if part[2] == "none":
+            for p, d in _flow_docs(flow):                   # «ещё не знаем» -> no guessed MAWB either
+                d["awb"], d["mawb_note"], d["weight_kg"] = None, None, None
+                p.write_text(json.dumps(d, ensure_ascii=False))
+    elif part[1] == "awb" and part[2] == "edit":
+        flow["awb_wait"] = True
+        await c.answer()
+        await c.message.edit_text("Напиши номер MAWB, например `074-48014901`.", parse_mode="Markdown")
+        return
+    elif part[1] == "farm" and part[2] == "exact":
+        flow["farm"] = []                                   # [] = exactly the invoice for every farm
+    elif part[1] == "farm" and part[2] == "other":
+        flow["farm_wait"] = True
+        await c.answer()
+        many = len(flow["ids"]) > 1
+        await c.message.edit_text("Напиши, сколько $ дошло до фермы" + (" — по строке на ферму" if many else "") +
+                                  ", например `520$`. Остаток станет авансом у фермы, нехватка — долгом.",
+                                  parse_mode="Markdown")
+        return
     flow["note"] = c.message
     await c.answer()
     await _step(c.from_user.id)
@@ -655,6 +698,13 @@ async def money_followup(m: Message):
     if flow and time.time() - flow["ts"] < 60 * 60:
         docs = _flow_docs(flow)
         pays = payments_for(m.text, [d for _p, d in docs]) or []
+        if flow.get("farm_wait"):
+            if not any(pr and pr[0] for pr in pays):
+                await m.answer("Нужна сумма в $, например `520$`", parse_mode="Markdown")
+                return
+            flow["farm"], flow["farm_wait"] = [pr[0] if pr else None for pr in pays], False
+            await _step(m.from_user.id)
+            return
         if not any(pr and pr[0] for pr in pays):
             await m.answer("Не вижу суммы в $ — напиши, например, `1115$`", parse_mode="Markdown")
             return
@@ -738,6 +788,16 @@ async def set_topup(c: CallbackQuery):
 async def mawb_followup(m: Message):
     """MAWB sent as a separate message right after a document -> goes into that draft.
     MAWB + 'Farm kg' pairs in one message -> a kg breakdown for that MAWB."""
+    flow = FLOW.get(m.from_user.id)
+    if flow and flow.get("awb_wait"):
+        awb = ai.find_mawb(m.text)
+        for p, d in _flow_docs(flow):
+            d["awb"], d["mawb_note"] = awb, None
+            d["weight_kg"] = None
+            p.write_text(json.dumps(d, ensure_ascii=False))
+        flow["awb_wait"], flow["awb_done"] = False, True
+        await _step(m.from_user.id, head=f"MAWB {awb} ✓")
+        return
     awb_t, pairs = breakdown_from_text(m.text)
     if len(pairs) >= 1:
         w = store_breakdown(awb_t, pairs)
@@ -823,6 +883,9 @@ async def _finish_pay(uid: int, usd: float, rub, note=None):
     who = r.get("farm") or r.get("provider")
     await _send(uid, f"✅ {who}: оплачен из пополнения {r['topup']} — ${r['usd']:g} / {r['rub']:,.0f} ₽".replace(",", " ")
                 + (" (по курсу)" if rub is None else "") + ". Себестоимость теперь точная.", None, note)
+    if pay["type"] == "i":
+        from .api import farm_balance_text
+        await _send(uid, farm_balance_text(r.get("farm") or ""))
     _AUTO_EXPORT.add(pay["topup"])
     await _flush_export(uid, "📊 Инвойс оплачен — лист пополнения обновлён.")
 

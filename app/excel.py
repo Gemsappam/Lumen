@@ -163,10 +163,9 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
                 for c, v in ((11, lc.price_rub), (12, lc.air_usd_stem), (13, lc.air_rub_stem),
                              (14, lc.msk_rub_stem), (15, lc.total_rub_stem)):
                     ws.cell(rr, c, round(v, 6) if v else (0 if c in (11, 15) else None))
-            elif inv.alloc_mode == "stems":
-                ws.cell(rr, 11, f"=IFERROR($Q${r0}/SUM($H${r0}:$H${r1}),0)")
             else:
-                ws.cell(rr, 11, f"=IFERROR(J{rr}*$Q${r0}/SUMPRODUCT($J${r0}:$J${r1},$H${r0}:$H${r1}),0)")
+                # flower ₽ comes from the farm ledger (advances / debts / costs) — written as a number
+                ws.cell(rr, 11, round(lc.price_rub, 6))
             if operator:
                 pass
             elif ka in leg_row:
@@ -227,11 +226,11 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
         ws.cell(t, 10).number_format = USD
         ws.cell(t, 10).comment = Comment("Сумма строк цветов, $", "bot")
         # истинный курс партии и косты оплаты
-        ws.cell(t, 11, f"=IFERROR(Q{r0}/J{t},0)").number_format = "0.0000"
+        ws.cell(t, 11, round(res.true_rate.get(inv.id, 0), 4)).number_format = "0.0000"
         ws.cell(t, 11).font = TOTAL_FONT
         ws.cell(t, 11).fill = ACC_TOT
         ws.cell(t, 11).comment = Comment("Истинный курс: все ₽ за инвойс ÷ $ строк цветов (с комиссией, налогом, сборами)", "bot")
-        ws.cell(t, 12, f'=IFERROR(P{r0}/J{t}-1,0)').number_format = "0.0%"
+        ws.cell(t, 12, round(res.cost_pct.get(inv.id, 0) / 100, 4)).number_format = "0.0%"
         ws.cell(t, 12).font = GREY
         ws.cell(t, 12).comment = Comment("Косты оплаты сверх строк цветов (комиссия, налог, doc fee), %", "bot")
         r = t + 2

@@ -71,11 +71,98 @@ class Result:
     usd_spent: float = 0.0
     est_rate: float = 0.0
     true_rate: dict = field(default_factory=dict)       # inv_id -> ₽ per $ of flowers incl. all costs
+    invoice_cost: dict = field(default_factory=dict)    # inv_id -> ₽ cost of the goods (from the farm ledger)
+    inv_ledger: dict = field(default_factory=dict)      # inv_id -> how it was covered (advance / payment / debt)
+    ledger: dict = field(default_factory=dict)          # farm -> balance, advances, debts
     cost_pct: dict = field(default_factory=dict)        # inv_id -> payment costs, % over the flower lines
     estimated_inv: set = field(default_factory=set)     # unpaid invoices (≈)
     estimated_legs: set = field(default_factory=set)    # (awb, leg) with ≈ ₽
     rub_spent: float = 0.0
     warnings: list = field(default_factory=list)
+
+
+def invoice_total(inv, ls) -> float:
+    """What the farm charges for the invoice (its Grand Total incl. doc fee / tax); fallback: flower lines."""
+    v = sum(l.price_usd * l.stems for l in ls)
+    t = getattr(inv, "invoice_total_usd", None)
+    return float(t) if t and t >= v - 0.01 else v
+
+
+def farm_ledger(topups, invoices, lines_by_inv, est_rate) -> dict:
+    """Settlements with each farm in farm-$ (what actually reached the farm).
+    payment:  +farm_usd at «₽ per farm-$» = ₽ paid ÷ farm_usd  (agent/bank costs sit in this rate)
+    invoice:  −Grand Total, covered first-in-first-out: old advance first (at ITS rate), then new money.
+    Not enough money -> debt: valued at the latest top-up rate (≈) until a later payment covers it.
+    -> {"inv": {id: {rub_cost, farm_usd, from_advance, debt_usd, parts}}, "farms": {farm: {...}}}"""
+    from collections import deque
+    tmap = {t.id: t for t in topups}
+    tdate = {t.id: t.date for t in topups}
+    by_farm = defaultdict(list)
+    for inv in invoices:
+        by_farm[(inv.farm or "").strip().lower()].append(inv)
+    out_inv, farms = {}, {}
+    for key, invs in by_farm.items():
+        credits = deque()          # [usd_left, rub_per_usd, label]
+        debts = deque()            # [inv_id, usd_left]
+        cost_factor = []           # typical ₽/farm-$ ÷ top-up rate of this farm (to value debts)
+        for inv in sorted(invs, key=lambda x: x.id):
+            ls = lines_by_inv[inv.id]
+            total = invoice_total(inv, ls)
+            rec = {"rub_cost": 0.0, "farm_usd": 0.0, "from_advance": 0.0, "debt_usd": 0.0, "parts": [], "total": total}
+            out_inv[inv.id] = rec
+            if inv.topup_id:                                   # this invoice brought money to the farm
+                r = rate_of(tmap.get(inv.topup_id))
+                rub = inv.rub_paid_override if inv.rub_paid_override is not None else round(inv.usd_paid * r)
+                f = getattr(inv, "farm_usd", None)
+                f = float(f) if f else total                   # default: exactly the invoice reached the farm
+                rec["farm_usd"] = f
+                if f > 0:
+                    rpu = rub / f
+                    credits.append([f, rpu, tdate.get(inv.topup_id, "")])
+                    if r:
+                        cost_factor.append(rpu / r)
+                    while debts and credits:                   # new money pays old debts first
+                        d = debts[0]
+                        c = credits[0]
+                        take = min(d[1], c[0])
+                        old = out_inv[d[0]]
+                        old["rub_cost"] += take * c[1]
+                        old["debt_usd"] -= take
+                        old["parts"].append({"usd": take, "rate": c[1], "src": f"оплата {c[2]}"})
+                        d[1] -= take; c[0] -= take
+                        if d[1] <= 1e-6: debts.popleft()
+                        if c[0] <= 1e-6: credits.popleft()
+            need = total
+            while need > 1e-6 and credits:
+                c = credits[0]
+                take = min(need, c[0])
+                rec["rub_cost"] += take * c[1]
+                rec["parts"].append({"usd": take, "rate": c[1], "src": f"оплата {c[2]}"})
+                need -= take; c[0] -= take
+                if c[0] <= 1e-6:
+                    credits.popleft()
+            if need > 1e-6:
+                rec["debt_usd"] = need
+                debts.append([inv.id, need])
+        # advance used by an invoice = what it consumed beyond its own payment
+        for inv in invs:
+            rec = out_inv[inv.id]
+            rec["from_advance"] = max(0.0, min(rec["total"], rec["total"] - rec["farm_usd"] - rec["debt_usd"])) if rec["farm_usd"] < rec["total"] else 0.0
+        factor = (sum(cost_factor) / len(cost_factor)) if cost_factor else 1.0
+        for inv in invs:                                      # uncovered debt: ≈ latest rate × this farm's usual costs
+            rec = out_inv[inv.id]
+            if rec["debt_usd"] > 1e-6:
+                est_usd = getattr(inv, "est_usd", None)
+                f = (est_usd / rec["total"]) if (not inv.topup_id and est_usd and rec["total"]) else factor
+                rec["rub_cost"] += rec["debt_usd"] * est_rate * f
+        adv = sum(c[0] for c in credits)
+        debt = sum(d[1] for d in debts)
+        name = invs[0].farm
+        farms[name] = {"farm": name, "advance_usd": round(adv, 2), "debt_usd": round(debt, 2),
+                       "balance_usd": round(adv - debt, 2),
+                       "advances": [{"usd": round(c[0], 2), "rate": round(c[1], 4), "from": c[2]} for c in credits],
+                       "debts": [{"invoice_id": d[0], "usd": round(d[1], 2)} for d in debts]}
+    return {"inv": out_inv, "farms": farms}
 
 
 def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result:
@@ -91,27 +178,33 @@ def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result
     for l in lines:
         lines_by_inv[l.invoice_id].append(l)
 
-    # ---- flowers -------------------------------------------------------------
+    # ---- flowers: farm ledger (advances / debts) -------------------------------
+    led = farm_ledger(topups, invoices, lines_by_inv, est_rate)
+    res.ledger = led["farms"]
     for inv in invoices:
         unpaid = not inv.topup_id
         r = est_rate if unpaid else rate_of(tmap.get(inv.topup_id))
         usd = (inv.usd_paid or getattr(inv, "est_usd", None) or 0) if unpaid else inv.usd_paid
         rub = inv.rub_paid_override if (inv.rub_paid_override is not None and not unpaid) else round(usd * r)
-        if unpaid:
+        if unpaid or led["inv"][inv.id]["debt_usd"] > 0.005:
             res.estimated_inv.add(inv.id)
-        res.invoice_rub[inv.id] = rub
+        res.invoice_rub[inv.id] = rub                       # cash that left (for the top-up)
+        cost = led["inv"][inv.id]["rub_cost"]               # what the goods really cost (ledger)
+        res.invoice_cost[inv.id] = cost
+        res.inv_ledger[inv.id] = led["inv"][inv.id]
         ls = lines_by_inv[inv.id]
         stems = sum(l.stems for l in ls)
         value = sum(l.price_usd * l.stems for l in ls)
-        res.true_rate[inv.id] = (rub / value) if value else 0
-        res.cost_pct[inv.id] = ((usd / value - 1) * 100) if value and usd else 0
+        res.true_rate[inv.id] = (cost / value) if value else 0
+        f_usd = led["inv"][inv.id]["farm_usd"]
+        res.cost_pct[inv.id] = ((usd / f_usd - 1) * 100) if f_usd and usd and not unpaid else 0
         for l in ls:
             lc = LineCalc(line_id=l.id, stems=l.stems)
             if inv.alloc_mode == "stems" or value == 0:
-                lc.price_rub = rub / stems if stems else 0
+                lc.price_rub = cost / stems if stems else 0
             else:
-                # «истинный курс» партии = все ₽ за инвойс (с комиссией, налогом, doc fee) ÷ $ строк цветов
-                lc.price_rub = l.price_usd * rub / value
+                # «истинный курс» = ₽ себестоимости инвойса ÷ $ строк цветов
+                lc.price_rub = l.price_usd * cost / value
             res.lines[l.id] = lc
         if inv.topup_id == topup_id:
             res.usd_spent += inv.usd_paid

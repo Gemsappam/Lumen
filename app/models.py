@@ -53,6 +53,7 @@ class Invoice(SQLModel, table=True):
     truck: Optional[str] = None            # TK MSK truck the MAWB was loaded into
     packing_sent: bool = False             # packing list already posted to the chats
     client_eta: Optional[str] = None       # ISO MSK: when clients are told «прибыл» (TK time + 6 h)
+    farm_usd: Optional[float] = None       # $ that actually reached the farm with this payment (None = exactly the invoice)
     client_done: bool = False              # «прибыл» already sent to client chats
 
 
@@ -138,6 +139,9 @@ def init_db():
         with engine.begin() as c:
             c.execute(text("ALTER TABLE invoice ADD COLUMN packing_sent BOOLEAN DEFAULT 0"))
             c.execute(text("UPDATE invoice SET packing_sent = 1"))
+    if "farm_usd" not in icols:
+        with engine.begin() as c:
+            c.execute(text("ALTER TABLE invoice ADD COLUMN farm_usd FLOAT"))
     if "client_eta" not in icols:
         with engine.begin() as c:
             c.execute(text("ALTER TABLE invoice ADD COLUMN client_eta VARCHAR"))

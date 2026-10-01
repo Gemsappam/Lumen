@@ -87,6 +87,7 @@ class LineIn(BaseModel):
 class InvoiceIn(BaseModel):
     topup_id: int = 0                  # 0 = not paid yet (груз в пути)
     est_usd: float | None = None       # unpaid: approximate $
+    farm_usd: float | None = None      # $ that reached the farm (None = exactly the invoice total)
     country: str = ""
     client_code: str = ""              # empty -> default marking (LUMEN)
     invoice_no: str = ""
@@ -324,7 +325,7 @@ def payments_for(text: str, subs: list[dict]):
     return out
 
 
-def book_document(out: dict, topup_id: int, usd, rub, uid: int, paid: bool = True):
+def book_document(out: dict, topup_id: int, usd, rub, uid: int, paid: bool = True, farm_usd: float | None = None):
     """Farm invoice / freight bill -> straight into the books, no Mini App.
     paid=True: into top-up `topup_id` with the $ (and ₽, else $ × rate) actually paid.
     paid=False: груз в пути — farm invoice with ≈$ (usd), freight bill with its own $.
@@ -351,7 +352,7 @@ def book_document(out: dict, topup_id: int, usd, rub, uid: int, paid: bool = Tru
                          weight_kg=out.get("weight_kg") if out.get("mawb_note") else None,   # only from a breakdown
                          invoice_total_usd=out.get("invoice_total_usd"),
                          usd_paid=usd if paid else 0, rub_paid_override=rub, paid_date=today if paid else "",
-                         paid=paid, est_usd=None if paid else usd,
+                         paid=paid, est_usd=None if paid else usd, farm_usd=farm_usd if paid else None,
                          note=out.get("mawb_note") or "", source_file=out.get("source_file"), lines=lines)
         return save_invoice(body, None, uid), "invoice"
     if out.get("doc_type") == "freight_invoice":
@@ -623,7 +624,8 @@ def snapshot(s, topup_id):
             ls.append({**l.model_dump(), "price_rub": round(c.price_rub, 2), "air_rub": round(c.air_rub_stem, 2),
                        "msk_rub": round(c.msk_rub_stem, 2), "total_rub": round(c.total_rub_stem, 2)})
         out_inv.append({**inv.model_dump(), "rub_paid": res.invoice_rub[inv.id], "lines": ls,
-                        "true_rate": round(res.true_rate.get(inv.id, 0), 4), "cost_pct": round(res.cost_pct.get(inv.id, 0), 1)})
+                        "true_rate": round(res.true_rate.get(inv.id, 0), 4), "cost_pct": round(res.cost_pct.get(inv.id, 0), 1),
+                        "rub_cost": round(res.invoice_cost.get(inv.id, 0)), "ledger": res.inv_ledger.get(inv.id)})
     related = {norm_awb(i.awb) for i in invs if i.topup_id == topup_id}
     kg = _awb_kg(s)
     rpk = {k: g.get("rub_per_kg") for k, g in res.legs.items()}
@@ -931,6 +933,37 @@ def set_marking(body: MarkingIn, uid: int = Depends(writer)):
     return {"marking": m}
 
 
+# ---------- settlements with farms (advances / debts) ----------
+def ledger_view() -> dict:
+    with session() as s:
+        tops, invs, lines, logs = _all(s)
+        res = compute(0, tops, invs, lines, logs, _awb_kg(s))
+    farms = sorted(res.ledger.values(), key=lambda f: (-abs(f["balance_usd"]), f["farm"]))
+    return {"farms": [f for f in farms if abs(f["balance_usd"]) > 0.01 or f["advances"] or f["debts"]]}
+
+
+def farm_balance_text(farm: str) -> str:
+    """«Kikwetu: аванс $100 (по 95.34 ₽/$, оплата 23.09)» / «долг $150» / «расчёты закрыты»."""
+    with session() as s:
+        tops, invs, lines, logs = _all(s)
+        res = compute(0, tops, invs, lines, logs, _awb_kg(s))
+    f = next((v for k, v in res.ledger.items() if k.lower() == (farm or "").lower()), None)
+    if not f or (abs(f["balance_usd"]) < 0.01 and not f["debts"]):
+        return f"⚖️ {farm}: расчёты закрыты, аванса и долга нет"
+    parts = []
+    if f["advance_usd"] > 0.01:
+        parts.append(f"аванс ${f['advance_usd']:,.2f}".replace(",", " ") + " (" + ", ".join(
+            f"${a['usd']:g} по {a['rate']:.2f} ₽/$ от {a['from']}" for a in f["advances"]) + ")")
+    if f["debt_usd"] > 0.01:
+        parts.append(f"долг ${f['debt_usd']:,.2f}".replace(",", " ") + " — ≈ по последнему курсу, уточнится после оплаты")
+    return f"⚖️ {farm}: " + "; ".join(parts)
+
+
+@router.get("/ledger")
+def get_ledger(uid: int = Depends(writer)):
+    return ledger_view()
+
+
 # ---------- client markings & chats ----------
 @router.get("/markings")
 def list_markings(uid: int = Depends(writer)):
@@ -1073,6 +1106,30 @@ def awb_spread(awb: str) -> list[dict]:
         return out
 
 
+def _ledger_sheet(path):
+    """Owner file: a sheet with advances / debts per farm (never in the operator version)."""
+    from openpyxl import load_workbook
+    from openpyxl.styles import Font, PatternFill
+    try:
+        wb = load_workbook(path)
+    except Exception:
+        return
+    name = "Расчёты с фермами"
+    if name in wb.sheetnames:
+        del wb[name]
+    ws = wb.create_sheet(name)
+    hdr = ["Ферма", "Аванс у фермы, $", "Долг ферме, $", "Баланс, $", "Аванс: курс ₽/$ и откуда"]
+    for c, h in enumerate(hdr, 1):
+        x = ws.cell(1, c, h); x.font = Font(name="Arial", bold=True); x.fill = PatternFill("solid", fgColor="D9E1F2")
+    for r, f in enumerate(ledger_view()["farms"], 2):
+        ws.cell(r, 1, f["farm"]); ws.cell(r, 2, f["advance_usd"] or None); ws.cell(r, 3, f["debt_usd"] or None)
+        ws.cell(r, 4, f["balance_usd"]).font = Font(name="Arial", bold=True, color="C00000" if f["balance_usd"] < 0 else "008000")
+        ws.cell(r, 5, "; ".join(f"${a['usd']:g} по {a['rate']:.2f} от {a['from']}" for a in f["advances"]))
+    for col, w in zip("ABCDE", (24, 16, 16, 14, 50)):
+        ws.column_dimensions[col].width = w
+    wb.save(path)
+
+
 async def export_topups(ids: list[int], uid: int, caption: str, audience: str = "owner", only: bool = False):
     """Rebuild sheets and send ONE file.
     owner: sheets are rebuilt inside the master учет.xlsx (formulas live); if only=True the file sent
@@ -1099,6 +1156,7 @@ async def export_topups(ids: list[int], uid: int, caption: str, audience: str = 
             names.append(name)
             s.add(t)
         s.commit()
+        _ledger_sheet(tmp)
         shutil.copy(tmp, MASTER_XLSX)
         out = tmp
         if audience == "operator":
@@ -1115,7 +1173,7 @@ async def export_topups(ids: list[int], uid: int, caption: str, audience: str = 
         elif only:
             out = DATA_DIR / f"export_only_{uuid.uuid4().hex[:6]}.xlsx"
             wb = load_workbook(tmp)
-            keep = set(names) | {"Пополнения"}
+            keep = set(names) | {"Пополнения", "Расчёты с фермами"}
             for n in list(wb.sheetnames):
                 if n not in keep:
                     del wb[n]
@@ -1278,15 +1336,17 @@ class PayIn(BaseModel):
     topup_id: int
     usd: float | None = None
     rub: float | None = None
+    farm_usd: float | None = None      # reached the farm (None = exactly the invoice)
 
 
-def pay_invoice(inv_id: int, topup_id: int, usd: float, rub: float | None = None) -> dict:
+def pay_invoice(inv_id: int, topup_id: int, usd: float, rub: float | None = None, farm_usd: float | None = None) -> dict:
     from datetime import date
     with session() as s:
         inv, t = s.get(Invoice, inv_id), s.get(TopUp, topup_id)
         if not inv or not t:
             raise ValueError("нет такого инвойса или пополнения")
         inv.topup_id, inv.usd_paid, inv.paid = topup_id, usd, True
+        inv.farm_usd = farm_usd
         inv.rub_paid_override = rub if rub else round(usd * rate_of(t))
         inv.paid_date = date.today().strftime("%d.%m.%Y")
         s.add(inv); s.commit()
@@ -1316,7 +1376,7 @@ def pay_logistics(log_id: int, topup_id: int, usd: float | None = None, rub: flo
 @router.post("/invoices/{inv_id}/pay")
 def api_pay_invoice(inv_id: int, body: PayIn, uid: int = Depends(writer)):
     try:
-        pay_invoice(inv_id, body.topup_id, body.usd, body.rub)
+        pay_invoice(inv_id, body.topup_id, body.usd, body.rub, body.farm_usd)
     except ValueError as e:
         raise HTTPException(400, str(e))
     return transit_view()
