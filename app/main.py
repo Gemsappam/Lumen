@@ -167,6 +167,7 @@ async def lifespan(app):
         tasks.append(asyncio.create_task(backup.backup_loop(bot)))
         from .bot import scheduler_loop
         tasks.append(asyncio.create_task(scheduler_loop()))
+        tasks.append(asyncio.create_task(_once_recalc_true_rate()))
         from . import reader
         if not reader.enabled():
             print("[lumen] бот-читатель ВЫКЛЮЧЕН: в .env нет READER_BOT_TOKEN", flush=True)
@@ -191,6 +192,27 @@ async def lifespan(app):
             await asyncio.wait_for(backup.flush(bot), timeout=20)
         except Exception as e:
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
+
+
+async def _once_recalc_true_rate():
+    """After switching to «истинный курс»: rebuild every top-up sheet once and send it to the system admins."""
+    from .api import SETTINGS, _settings, export_topups
+    from .models import TopUp
+    from . import roles
+    if _settings().get("true_rate_v1"):
+        return
+    await asyncio.sleep(10)
+    with session() as s:
+        ids = [t.id for t in s.exec(select(TopUp).order_by(TopUp.id)).all()]
+    SETTINGS.write_text(json.dumps({**_settings(), "true_rate_v1": True}))
+    if not ids:
+        return
+    for uid in roles.sys_ids():
+        try:
+            await export_topups(ids, uid, "📊 Пересчёт по истинному курсу: все ₽ за инвойс (комиссия, налог, сборы) "
+                                          "теперь в цене стебля. В строке ИТОГО у каждой фермы — истинный курс и косты, %.")
+        except Exception as e:
+            print(f"[lumen] recalc export failed: {e}", flush=True)
 
 
 app = FastAPI(lifespan=lifespan)

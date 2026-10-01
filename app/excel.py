@@ -158,7 +158,7 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
             if inv.alloc_mode == "stems":
                 ws.cell(rr, 11, f"=IFERROR($Q${r0}/SUM($H${r0}:$H${r1}),0)")
             else:
-                ws.cell(rr, 11, f"=IFERROR(J{rr}*$Q${r0}/$P${r0},0)")
+                ws.cell(rr, 11, f"=IFERROR(J{rr}*$Q${r0}/SUMPRODUCT($J${r0}:$J${r1},$H${r0}:$H${r1}),0)")
             ka, km = (norm_awb(inv.awb), "air"), (norm_awb(inv.awb), "msk")
             if ka in leg_row:
                 ws.cell(rr, 21, round(lc.air_share, 8)).font = GREY
@@ -217,7 +217,15 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
         block_tot.append(t)
         ws.cell(t, 10, f"=SUMPRODUCT(J{r0}:J{r1},H{r0}:H{r1})").font = GREY
         ws.cell(t, 10).number_format = USD
-        ws.cell(t, 10).comment = Comment("Сумма строк без налога и сборов", "bot")
+        ws.cell(t, 10).comment = Comment("Сумма строк цветов, $", "bot")
+        # истинный курс партии и косты оплаты
+        ws.cell(t, 11, f"=IFERROR(Q{r0}/J{t},0)").number_format = "0.0000"
+        ws.cell(t, 11).font = TOTAL_FONT
+        ws.cell(t, 11).fill = ACC_TOT
+        ws.cell(t, 11).comment = Comment("Истинный курс: все ₽ за инвойс ÷ $ строк цветов (с комиссией, налогом, сборами)", "bot")
+        ws.cell(t, 12, f'=IFERROR(P{r0}/J{t}-1,0)').number_format = "0.0%"
+        ws.cell(t, 12).font = GREY
+        ws.cell(t, 12).comment = Comment("Косты оплаты сверх строк цветов (комиссия, налог, doc fee), %", "bot")
         r = t + 2
 
     if block_tot:

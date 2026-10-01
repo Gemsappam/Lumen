@@ -288,7 +288,7 @@ async invoice({t, inv, draft}){
     <div class="two"><div class="field"><label>Итог по инвойсу, $ (для справки)</label><input name="invoice_total_usd" inputmode="decimal" value="${inv.invoice_total_usd??''}"></div>
     <div class="field"><label id="usdLbl">Оплачено, $</label><input name="usd_paid" inputmode="decimal" value="${inv.usd_paid??''}"></div></div>
     <div class="field"><label>Оплачено, ₽ <span id="rubMode" class="pill" style="margin-left:6px"></span></label><input name="rub_paid_override" inputmode="decimal" value="${inv.rub_paid_override??''}"></div>
-    <div class="hint" style="padding:0 14px 8px">Цена стебля в ₽ = цена $ × (₽ / $ оплаты). Налог и сборы в стебель не идут.</div>
+    <div class="hint" style="padding:0 14px 8px" id="trueRate">Истинный курс = все ₽ за инвойс ÷ $ строк цветов. Комиссия, налог и сборы ложатся на стебли пропорционально цене.</div>
     <div class="field"><label>Как делить ₽ по строкам</label><select name="alloc_mode">
       <option value="value" ${inv.alloc_mode==='value'?'selected':''}>По стоимости строк (разные цены)</option>
       <option value="stems" ${inv.alloc_mode==='stems'?'selected':''}>Поровну на стебель (одна цена)</option></select></div>
@@ -327,8 +327,10 @@ async invoice({t, inv, draft}){
     document.getElementById('sumLines').textContent=`${fmt(st)} стеблей · строки $${fmt(val,2)}`;
     const usd=numOrNull(p.usd_paid.value), rub=numOrNull(p.rub_paid_override.value);
     const perStem=p.alloc_mode.value==='stems';
+    const tr=document.getElementById('trueRate');
+    if(tr && rub && val && !perStem) tr.textContent=`Истинный курс ${fmt(rub/val,4)} ₽/$ (курс ${fmt(rateNow(),2)} + косты ${fmt(((usd||0)/val-1)*100,1)}%). Все ₽ за инвойс разложены по стеблям пропорционально цене.`;
     inv.lines.forEach((l,i)=>{const c=tb.querySelector(`[data-c="${i}"]`); if(!c) return;
-      const flower = !rub ? null : perStem ? (st? rub/st : null) : (usd ? (numOrNull(l.price_usd)||0)*rub/usd : null);
+      const flower = !rub ? null : perStem ? (st? rub/st : null) : (val ? (numOrNull(l.price_usd)||0)*rub/val : null);
       const logi=(l.air_rub||0)+(l.msk_rub||0);
       c.textContent = flower==null ? '' : fmt(flower+logi,2);
       c.title = logi ? `цветок ${fmt(flower||0,2)} + логистика ${fmt(logi,2)}` : '';

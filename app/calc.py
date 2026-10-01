@@ -5,9 +5,11 @@ Rules (reverse-engineered from учет.xlsx, then made consistent):
 
 1. Rate of a top-up = RUB sent / USD received.
 2. Invoice RUB = what the operator entered. Only if it's empty: round(USD * top-up rate).
-3. Flower price in RUB per stem:
-     value mode (default): price_usd * RUB_paid / USD_paid   (invoice's own rate;
-        tax / doc fees above the line sum are NOT pushed into the stem price)
+3. Flower price in RUB per stem («истинный курс»):
+     value mode (default): price_usd * RUB_paid / Σ(price_usd * stems)
+        RUB_paid = $ paid with all costs × top-up rate (or the ₽ Arman typed).
+        Every rouble paid for the invoice — commission, tax, doc fee — lands on the stems,
+        each line in proportion to its price. Σ(stem cost × stems) = RUB_paid exactly.
      stems mode: RUB_paid / Σ stems   (hydrangea style — one price for everything)
    RUB_paid and USD_paid are entered by the operator and are taken as-is.
 4. Logistics: ₽ per kg = bill ₽ / bill kg (or breakdown total if the bill has no weight);
@@ -68,6 +70,8 @@ class Result:
     legs: dict = field(default_factory=dict)              # (awb, leg) -> {"usd","rub","ids","own"}
     usd_spent: float = 0.0
     est_rate: float = 0.0
+    true_rate: dict = field(default_factory=dict)       # inv_id -> ₽ per $ of flowers incl. all costs
+    cost_pct: dict = field(default_factory=dict)        # inv_id -> payment costs, % over the flower lines
     estimated_inv: set = field(default_factory=set)     # unpaid invoices (≈)
     estimated_legs: set = field(default_factory=set)    # (awb, leg) with ≈ ₽
     rub_spent: float = 0.0
@@ -99,12 +103,15 @@ def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result
         ls = lines_by_inv[inv.id]
         stems = sum(l.stems for l in ls)
         value = sum(l.price_usd * l.stems for l in ls)
+        res.true_rate[inv.id] = (rub / value) if value else 0
+        res.cost_pct[inv.id] = ((usd / value - 1) * 100) if value and usd else 0
         for l in ls:
             lc = LineCalc(line_id=l.id, stems=l.stems)
             if inv.alloc_mode == "stems" or value == 0:
                 lc.price_rub = rub / stems if stems else 0
             else:
-                lc.price_rub = l.price_usd * rub / usd if usd else (l.price_usd * r if unpaid else 0)
+                # «истинный курс» партии = все ₽ за инвойс (с комиссией, налогом, doc fee) ÷ $ строк цветов
+                lc.price_rub = l.price_usd * rub / value
             res.lines[l.id] = lc
         if inv.topup_id == topup_id:
             res.usd_spent += inv.usd_paid

@@ -622,7 +622,8 @@ def snapshot(s, topup_id):
             c = res.lines[l.id]
             ls.append({**l.model_dump(), "price_rub": round(c.price_rub, 2), "air_rub": round(c.air_rub_stem, 2),
                        "msk_rub": round(c.msk_rub_stem, 2), "total_rub": round(c.total_rub_stem, 2)})
-        out_inv.append({**inv.model_dump(), "rub_paid": res.invoice_rub[inv.id], "lines": ls})
+        out_inv.append({**inv.model_dump(), "rub_paid": res.invoice_rub[inv.id], "lines": ls,
+                        "true_rate": round(res.true_rate.get(inv.id, 0), 4), "cost_pct": round(res.cost_pct.get(inv.id, 0), 1)})
     related = {norm_awb(i.awb) for i in invs if i.topup_id == topup_id}
     kg = _awb_kg(s)
     rpk = {k: g.get("rub_per_kg") for k, g in res.legs.items()}
