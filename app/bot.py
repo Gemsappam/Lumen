@@ -108,6 +108,23 @@ async def excel_xls(m: Message):
     await _parse_and_reply(m, text.encode(), "text/plain")
 
 
+@dp.message(pv, wr, F.document.file_name.lower().regexp(r"\.docx?$"))
+async def word_doc(m: Message):
+    """Word invoice (.docx reliable, old .doc best effort) -> text -> AI."""
+    from .xltext import doc_to_text, docx_to_text
+    f = await bot.download(m.document)
+    data = f.read()
+    name = m.document.file_name.lower()
+    try:
+        text = docx_to_text(data) if name.endswith(".docx") else doc_to_text(data)
+    except Exception:
+        text = ""
+    if len(text.strip()) < 20:
+        await m.answer("Не смог прочитать Word-файл. Пересохрани его как .docx или PDF и пришли ещё раз.")
+        return
+    await _parse_and_reply(m, text.encode(), "text/plain")
+
+
 @dp.message(pv, wr, F.document.file_name.lower().endswith(".xlsx"))
 async def master(m: Message):
     f = await bot.download(m.document)
@@ -676,7 +693,7 @@ async def excel_cmd(m: Message):
 
 @dp.message(pv, wr, F.document)
 async def unknown_file(m: Message):
-    await m.answer("Этот формат не читаю. Пришли инвойс как PDF, фото (jpg/png) или Excel (.xlsx/.xls).")
+    await m.answer("Этот формат не читаю. Пришли инвойс как PDF, фото (jpg/png), Excel (.xlsx/.xls) или Word (.docx/.doc).")
 
 
 @dp.message(pv, ops, F.document | F.photo)

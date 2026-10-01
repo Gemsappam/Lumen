@@ -54,3 +54,48 @@ def looks_like_master(data: bytes) -> bool:
     except Exception:
         return False
     return "Пополнения" in names or any(n.startswith("Пополнение ") or n.startswith("Поставка ") for n in names)
+
+
+def docx_to_text(data: bytes) -> str:
+    """Word .docx -> paragraphs + tables as «a | b | c» rows (in document order)."""
+    from docx import Document
+    doc = Document(io.BytesIO(data))
+    out = []
+    body = doc.element.body
+    for el in body.iterchildren():
+        tag = el.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            t = "".join(n.text or "" for n in el.iter() if n.tag.endswith("}t")).strip()
+            if t:
+                out.append(t)
+        elif tag == "tbl":
+            for tr in el.iter():
+                if tr.tag.endswith("}tr"):
+                    cells = []
+                    for tc in tr.iterchildren():
+                        if tc.tag.endswith("}tc"):
+                            cells.append(" ".join("".join(n.text or "" for n in p.iter() if n.tag.endswith("}t"))
+                                                  for p in tc.iter() if p.tag.endswith("}p")).strip())
+                    if any(cells):
+                        out.append(" | ".join(cells))
+    return "\n".join(out)
+
+
+def doc_to_text(data: bytes) -> str:
+    """Old binary Word .doc: best effort — pull readable text runs (UTF-16 and 8-bit)."""
+    if data[:4] == b"PK\x03\x04":                      # actually a .docx renamed to .doc
+        return docx_to_text(data)
+    runs = []
+    try:
+        u = data.decode("utf-16le", errors="ignore")
+        runs += re.findall(r"[\w\s.,:;$%()/#&+\-\u0400-\u04FF]{4,}", u)
+    except Exception:
+        pass
+    a = data.decode("cp1252", errors="ignore")
+    runs += re.findall(r"[A-Za-z0-9 .,:;$%()/#&+\-]{6,}", a)
+    seen, out = set(), []
+    for r in runs:
+        r = re.sub(r"\s+", " ", r).strip()
+        if len(r) >= 4 and r not in seen and sum(ch.isalnum() for ch in r) >= 3:
+            seen.add(r); out.append(r)
+    return "\n".join(out[:2000])
