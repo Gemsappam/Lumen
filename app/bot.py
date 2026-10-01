@@ -610,7 +610,8 @@ async def excel_cmd(m: Message):
         await m.answer("Пока нет ни одного пополнения.")
         return
     await m.answer("Собираю учёт…")
-    await export_topups(ids, m.from_user.id, "📊 Актуальный учёт")
+    aud = "owner" if roles.can_write(roles.role_of(m.from_user.id)) else "operator"
+    await export_topups(ids, m.from_user.id, "📊 Актуальный учёт", audience=aud)
 
 
 @dp.message(pv, ops, F.document | F.photo)
@@ -978,9 +979,16 @@ async def process_group_text(chat_id: int, chat_title: str, text: str, sent_msk)
             pass
 
 
+_READER_SEEN: dict = {}
+
+
 async def reader_joined(chat_id: int, title: str, chat_type: str, status: str, reads_all: bool, username: str):
     """The reader bot was added to (or removed from) a chat: health check to the system admin."""
     from .api import _settings
+    key = (chat_id, "out" if status in ("left", "kicked") else "in")
+    if _READER_SEEN.get(chat_id) == key[1]:
+        return                                   # same state already reported
+    _READER_SEEN[chat_id] = key[1]
     if status in ("left", "kicked"):
         text, kb = f"⚠️ Читатель @{username} удалён из чата «{title}». Сообщения о машинах больше не приходят.", None
     else:

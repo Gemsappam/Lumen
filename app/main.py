@@ -199,20 +199,24 @@ async def _once_recalc_true_rate():
     from .api import SETTINGS, _settings, export_topups
     from .models import TopUp
     from . import roles
-    if _settings().get("true_rate_v1"):
+    if _settings().get("true_rate_v2"):
         return
     await asyncio.sleep(10)
     with session() as s:
         ids = [t.id for t in s.exec(select(TopUp).order_by(TopUp.id)).all()]
-    SETTINGS.write_text(json.dumps({**_settings(), "true_rate_v1": True}))
     if not ids:
         return
+    sent = False
     for uid in roles.sys_ids():
         try:
             await export_topups(ids, uid, "📊 Пересчёт по истинному курсу: все ₽ за инвойс (комиссия, налог, сборы) "
                                           "теперь в цене стебля. В строке ИТОГО у каждой фермы — истинный курс и косты, %.")
+            sent = True
         except Exception as e:
-            print(f"[lumen] recalc export failed: {e}", flush=True)
+            print(f"[lumen] recalc export to {uid} failed: {e}", flush=True)
+    print(f"[lumen] пересчёт по истинному курсу: {'отправлен' if sent else 'НЕ отправлен'} ({len(ids)} пополнений)", flush=True)
+    if sent:
+        SETTINGS.write_text(json.dumps({**_settings(), "true_rate_v2": True}))
 
 
 app = FastAPI(lifespan=lifespan)

@@ -971,27 +971,23 @@ async def audit(tid: int, uid: int = Depends(writer)):
     return await ai.audit_topup(snap, hist)
 
 
+def _audience(uid: int, wanted: str | None) -> str:
+    """viewer (1С) always gets the operator version; others choose."""
+    from .roles import can_write
+    if not can_write(role_of_(uid)):
+        return "operator"
+    return "operator" if wanted == "operator" else "owner"
+
+
 @router.post("/topups/{tid}/export")
-async def export(tid: int, uid: int = Depends(user_id)):
-    from aiogram.types import FSInputFile
+async def export(tid: int, audience: str | None = None, uid: int = Depends(user_id)):
+    """Only this top-up: the file contains just its sheet."""
     with session() as s:
-        tops, invs, lines, logs = _all(s)
         t = s.get(TopUp, tid)
-        tmp = DATA_DIR / f"export_{tid}.xlsx"
-        if MASTER_XLSX.exists():
-            shutil.copy(MASTER_XLSX, tmp)
-        name, _ = excel.build(tmp, t, tops, invs, lines, logs, awb_kg=_awb_kg(s), awb_breakdown=_awb_breakdown(s))
-        shutil.copy(tmp, MASTER_XLSX)          # master always holds the latest version
-        s.add(t); s.commit()
-    if BOT:
-        await BOT.send_document(uid, FSInputFile(MASTER_XLSX, filename="учет.xlsx"),
-                                caption=f"Готово: лист «{name}» обновлён")
-        from .backup import backup_now
-        try:
-            await backup_now(BOT, f"выгрузка «{name}»")
-        except Exception as e:
-            print(f"[lumen] backup after export failed: {e}", flush=True)
-    return {"ok": True, "sheet": name}
+        if not t:
+            raise HTTPException(404)
+    names = await export_topups([tid], uid, "", audience=_audience(uid, audience), only=True)
+    return {"ok": True, "sheet": names[0] if names else None}
 
 
 def awb_spread(awb: str) -> list[dict]:
@@ -1014,37 +1010,76 @@ def awb_spread(awb: str) -> list[dict]:
         return out
 
 
-async def export_topups(ids: list[int], uid: int, caption: str):
-    """Rebuild the sheets of several top-ups in the master file and send it once."""
+async def export_topups(ids: list[int], uid: int, caption: str, audience: str = "owner", only: bool = False):
+    """Rebuild sheets and send ONE file.
+    owner: sheets are rebuilt inside the master учет.xlsx (formulas live); if only=True the file sent
+           contains just these sheets (+ «Пополнения», which their formulas use).
+    operator: a separate file with plain numbers — no «Пополнения», no ТК share columns."""
     from aiogram.types import FSInputFile
+    from openpyxl import load_workbook
     names = []
     with session() as s:
         tops, invs, lines, logs = _all(s)
-        kg = _awb_kg(s)
+        kg, bd = _awb_kg(s), _awb_breakdown(s)
+        tmap = {t.id: t for t in tops}
+        # master always gets the fresh formulas version
         tmp = DATA_DIR / "export_multi.xlsx"
         if MASTER_XLSX.exists():
             shutil.copy(MASTER_XLSX, tmp)
+        else:
+            tmp.unlink(missing_ok=True)
         for tid in ids:
             t = s.get(TopUp, tid)
             if not t:
                 continue
-            name, _ = excel.build(tmp, t, tops, invs, lines, logs, awb_kg=kg, awb_breakdown=_awb_breakdown(s))
+            name, _ = excel.build(tmp, t, tops, invs, lines, logs, awb_kg=kg, awb_breakdown=bd)
             names.append(name)
             s.add(t)
         s.commit()
         shutil.copy(tmp, MASTER_XLSX)
+        out = tmp
+        if audience == "operator":
+            out = DATA_DIR / f"export_operator_{uuid.uuid4().hex[:6]}.xlsx"
+            out.unlink(missing_ok=True)
+            for tid in ids:
+                if tid in tmap:
+                    t = s.get(TopUp, tid)
+                    sheet = t.sheet_name
+                    excel.build(out, t, tops, invs, lines, logs, awb_kg=kg, awb_breakdown=bd, operator=True)
+                    t.sheet_name = sheet               # don't let the operator copy rename the master sheet
+                    s.add(t)
+            s.commit()
+        elif only:
+            out = DATA_DIR / f"export_only_{uuid.uuid4().hex[:6]}.xlsx"
+            wb = load_workbook(tmp)
+            keep = set(names) | {"Пополнения"}
+            for n in list(wb.sheetnames):
+                if n not in keep:
+                    del wb[n]
+            wb.save(out)
     if BOT and names:
-        await BOT.send_document(uid, FSInputFile(MASTER_XLSX, filename="учет.xlsx"),
-                                caption=caption + "\nОбновлены листы: " + ", ".join(f"«{n}»" for n in names))
+        fname = f"учет_{names[0].replace('Пополнение ', '')}.xlsx" if len(names) == 1 else "учет.xlsx"
+        if audience == "operator":
+            fname = fname.replace("учет", "учет_оператор")
+        cap = caption or (f"Лист «{names[0]}»" if len(names) == 1 else f"Пополнений: {len(names)}")
+        if audience == "operator":
+            cap += "\n👤 Версия для оператора: без пополнений и долей ТК"
+        await BOT.send_document(uid, FSInputFile(out, filename=fname),
+                                caption=cap + ("" if len(names) == 1 else "\nЛисты: " + ", ".join(f"«{n}»" for n in names)))
+    if out != tmp:
+        try:
+            out.unlink()
+        except Exception:
+            pass
     return names
 
 
 @router.post("/export_all")
-async def export_all(uid: int = Depends(user_id)):
-    """Every top-up rebuilt into one учет.xlsx and sent to the chat."""
+async def export_all(audience: str | None = None, uid: int = Depends(user_id)):
+    """Every top-up rebuilt into one file and sent to the chat."""
     with session() as s:
         ids = [t.id for t in s.exec(select(TopUp).order_by(TopUp.id)).all()]
-    names = await export_topups(ids, uid, "📊 Учёт: все пополнения")
+    names = await export_topups(ids, uid, "📊 Учёт: все пополнения", audience=_audience(uid, audience))
     if BOT and names:
         from .backup import backup_now
         try:

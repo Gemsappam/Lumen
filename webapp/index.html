@@ -239,12 +239,13 @@ async topup({id, snap}){
   document.getElementById('act')?.addEventListener('click',async()=>{await api(`/topups/${t.id}/activate`,{method:'POST'});toast('Теперь документы из чата идут в '+t.date);render('topup',{id:t.id})});
 
   document.getElementById('xls').onclick=async e=>{
-    const choice = await askExport(t.date);
-    if(!choice) return;
+    const ch = await askExport(t.date);
+    if(!ch) return;
     const b=e.target; b.disabled=true; b.textContent='Собираю…';
+    const who = ch.audience==='operator' ? ' (для оператора)' : '';
     try{
-      if(choice==='all'){ const r=await api('/export_all',{method:'POST'}); toast(`Все пополнения (${r.sheets.length}) отправлены в чат`) }
-      else { const r=await api(`/topups/${t.id}/export`,{method:'POST'}); toast(`Лист «${r.sheet}» отправлен в чат`) }
+      if(ch.scope==='all'){ const r=await api(`/export_all?audience=${ch.audience}`,{method:'POST'}); toast(`Все пополнения (${r.sheets.length}) отправлены в чат${who}`) }
+      else { const r=await api(`/topups/${t.id}/export?audience=${ch.audience}`,{method:'POST'}); toast(`Лист «${r.sheet}» отправлен в чат${who}`) }
     }catch(x){toast(x.message)}
     b.disabled=false; b.textContent='Excel в чат'};
   document.getElementById('audit').onclick=async e=>{
@@ -668,17 +669,21 @@ async function payForm({kind,id,usd}){
   };
 }
 
-// "Excel в чат": this top-up or all of them — native Telegram popup, plain confirm as fallback
-function askExport(date){
+// "Excel в чат": for whom (me / operator) and which (this top-up / all) — native Telegram popups
+function popup(title, message, buttons){
   return new Promise(res=>{
-    if(tg?.showPopup && tg.isVersionAtLeast?.('6.2')){
-      tg.showPopup({title:'Excel в чат', message:'Какой учёт прислать?',
-        buttons:[{id:'one',type:'default',text:`Только ${date.slice(0,5)}`},{id:'all',type:'default',text:'Все пополнения'},{type:'cancel'}]},
-        id=>res(id==='one'||id==='all'?id:null));
-    } else {
-      res(confirm(`Прислать только пополнение ${date}?\nОК — только его, Отмена — все пополнения`)?'one':'all');
-    }
+    if(tg?.showPopup && tg.isVersionAtLeast?.('6.2')) tg.showPopup({title,message,buttons:[...buttons,{type:'cancel'}]},id=>res(id||null));
+    else { const n=prompt(message+'\n'+buttons.map((b,i)=>`${i+1} — ${b.text}`).join('\n'),'1'); res(buttons[+n-1]?.id||null) }
   });
+}
+async function askExport(date){
+  let audience='operator';
+  if(ME?.can_write){
+    audience = await popup('Excel в чат','Для кого выгрузка?',[{id:'owner',type:'default',text:'Для меня'},{id:'operator',type:'default',text:'Для оператора'}]);
+    if(!audience) return null;
+  }
+  const scope = await popup('Excel в чат','Какие пополнения?',[{id:'one',type:'default',text:`Только ${date.slice(0,5)}`},{id:'all',type:'default',text:'Все'}]);
+  return scope ? {scope, audience} : null;
 }
 
 function applyParsed(inv, r){

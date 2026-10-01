@@ -81,7 +81,10 @@ def _topups_row(wb, topup):
     return row
 
 
-def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg=None, awb_breakdown=None):
+def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg=None, awb_breakdown=None,
+          operator=False):
+    """operator=True: version for the 1С operator — plain numbers instead of formulas, no «Пополнения» sheet,
+    no ТК share columns."""
     try:
         wb = load_workbook(path)
     except Exception:
@@ -89,7 +92,7 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
         wb.remove(wb.active)
 
     res = compute(topup.id, topups, invoices, lines, logistics, awb_kg)
-    trow = _topups_row(wb, topup)
+    trow = None if operator else _topups_row(wb, topup)
     name = _sheet_name(wb, topup)
     if name in wb.sheetnames:
         idx = wb.sheetnames.index(name)
@@ -101,11 +104,11 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
     topup.sheet_name = name
 
     # header
-    for c, h in enumerate(HEAD, 1):
+    for c, h in enumerate(HEAD[:20] if operator else HEAD, 1):
         cell = ws.cell(1, c, h)
         cell.font, cell.fill, cell.alignment, cell.border = BOLD, HFILL, CENTER, BOX
     ws.row_dimensions[1].height = 45
-    ws["A2"], ws["B2"] = "Курс пополнения", f"='Пополнения'!E{trow}"
+    ws["A2"], ws["B2"] = "Курс пополнения", (round(res.rate, 4) if operator else f"='Пополнения'!E{trow}")
     ws["B2"].number_format = "0.0000"
     ws["A2"].font = BOLD
     ws["B2"].font = Font(name=F, color="008000")
@@ -155,24 +158,33 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
             for c, v in vals.items():
                 if v not in (None, ""):
                     ws.cell(rr, c, v).font = BLUE
-            if inv.alloc_mode == "stems":
+            ka, km = (norm_awb(inv.awb), "air"), (norm_awb(inv.awb), "msk")
+            if operator:                          # plain numbers, no shares
+                for c, v in ((11, lc.price_rub), (12, lc.air_usd_stem), (13, lc.air_rub_stem),
+                             (14, lc.msk_rub_stem), (15, lc.total_rub_stem)):
+                    ws.cell(rr, c, round(v, 6) if v else (0 if c in (11, 15) else None))
+            elif inv.alloc_mode == "stems":
                 ws.cell(rr, 11, f"=IFERROR($Q${r0}/SUM($H${r0}:$H${r1}),0)")
             else:
                 ws.cell(rr, 11, f"=IFERROR(J{rr}*$Q${r0}/SUMPRODUCT($J${r0}:$J${r1},$H${r0}:$H${r1}),0)")
-            ka, km = (norm_awb(inv.awb), "air"), (norm_awb(inv.awb), "msk")
-            if ka in leg_row:
+            if operator:
+                pass
+            elif ka in leg_row:
                 ws.cell(rr, 21, round(lc.air_share, 8)).font = GREY
                 ws.cell(rr, 12, f"=IFERROR($E${leg_row[ka]}*U{rr}/H{rr},0)")
                 ws.cell(rr, 13, f"=IFERROR($F${leg_row[ka]}*U{rr}/H{rr},0)")
-            if km in leg_row:
+            if km in leg_row and not operator:
                 ws.cell(rr, 22, round(lc.msk_share, 8)).font = GREY
                 ws.cell(rr, 14, f"=IFERROR($F${leg_row[km]}*V{rr}/H{rr},0)")
-            ws.cell(rr, 15, f"=K{rr}+M{rr}+N{rr}")
+            if not operator:
+                ws.cell(rr, 15, f"=K{rr}+M{rr}+N{rr}")
             ws.cell(rr, 15).fill = ACC_COST
             for c, fmt in ((10, USD), (11, RUB4), (12, "0.0000"), (13, RUB4), (14, RUB4), (15, RUB4), (21, "0.0000%"), (22, "0.0000%")):
+                if operator and c > 20:
+                    continue
                 ws.cell(rr, c).number_format = fmt
             ws.cell(rr, 15).font = BOLD
-            for c in range(1, 23):
+            for c in range(1, 21 if operator else 23):
                 ws.cell(rr, c).border = BOX
                 if not ws.cell(rr, c).font or ws.cell(rr, c).font.name != F:
                     ws.cell(rr, c).font = BLACK
@@ -186,7 +198,7 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
         if inv.rub_paid_override is not None:
             ws.cell(r0, 17, inv.rub_paid_override).font = BLUE
         else:
-            ws.cell(r0, 17, f"=ROUND(P{r0}*$B$2,0)")
+            ws.cell(r0, 17, rub_paid if operator else f"=ROUND(P{r0}*$B$2,0)")
             ws.cell(r0, 17).comment = Comment("₽ не внесены оператором — посчитано $ × курс пополнения", "bot")
         ws.cell(r0, 16).number_format = USD
         ws.cell(r0, 17).number_format = RUB0
@@ -210,10 +222,6 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
             ws.cell(t, 9, f"=SUM(I{r0}:I{r1})").font = TOTAL_FONT
         ws.cell(t, 9).fill = ACC_TOT
         ws.cell(t, 9).comment = Comment("Итого вес плантации в MAWB, кг", "bot")
-        ws.cell(t, 15, f"=SUMPRODUCT(O{r0}:O{r1},H{r0}:H{r1})").font = TOTAL_FONT
-        ws.cell(t, 15).fill = ACC_COST
-        ws.cell(t, 15).number_format = RUB0
-        ws.cell(t, 15).comment = Comment("Итого себестоимость партии, ₽ (себестоимость стебля × стебли)", "bot")
         block_tot.append(t)
         ws.cell(t, 10, f"=SUMPRODUCT(J{r0}:J{r1},H{r0}:H{r1})").font = GREY
         ws.cell(t, 10).number_format = USD
@@ -231,7 +239,7 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
     if block_tot:
         g = grand_row
         ws.cell(g, 6, "ИТОГО ПО ПОПОЛНЕНИЮ").font = TOTAL_FONT
-        for c, fmt in ((7, "0"), (8, "#,##0"), (9, "#,##0.0"), (15, RUB0)):
+        for c, fmt in ((7, "0"), (8, "#,##0"), (9, "#,##0.0")):
             ws.cell(g, c, "=" + "+".join(f"{CL(c)}{t}" for t in block_tot)).font = TOTAL_FONT
             ws.cell(g, c).number_format = fmt
             ws.cell(g, c).fill = ACC_COST if c == 15 else ACC_GRAND
@@ -305,5 +313,9 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
         ws.column_dimensions[CL(c)].width = w
     ws.freeze_panes = "G4"
 
+    for row in ws.iter_rows():                  # no cell notes (red corners / popups) in the export
+        for c in row:
+            if c.comment:
+                c.comment = None
     wb.save(out_path or path)
     return name, res
