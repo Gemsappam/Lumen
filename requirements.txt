@@ -9,3 +9,4 @@ python-multipart>=0.0.9
 pypdfium2>=4.30
 pillow>=10
 telethon>=1.36
+xlrd>=2.0

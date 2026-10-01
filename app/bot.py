@@ -96,6 +96,18 @@ async def start(m: Message):
                    reply_markup=kb)
 
 
+@dp.message(pv, wr, F.document.file_name.lower().endswith(".xls"))
+async def excel_xls(m: Message):
+    """Old-format Excel = a farm invoice / freight bill."""
+    from .xltext import excel_to_text
+    f = await bot.download(m.document)
+    text = excel_to_text(f.read(), m.document.file_name)
+    if not text.strip():
+        await m.answer("Файл пустой или не читается. Пришли PDF или фото инвойса.")
+        return
+    await _parse_and_reply(m, text.encode(), "text/plain")
+
+
 @dp.message(pv, wr, F.document.file_name.lower().endswith(".xlsx"))
 async def master(m: Message):
     f = await bot.download(m.document)
@@ -109,6 +121,11 @@ async def master(m: Message):
         is_ft = False
     if is_ft:
         await _floratrack(m, data)
+        return
+    from .xltext import excel_to_text, looks_like_master
+    if not looks_like_master(data):                    # not our учёт file -> it's an invoice in Excel
+        text = excel_to_text(data, m.document.file_name)
+        await _parse_and_reply(m, text.encode(), "text/plain")
         return
     if MASTER_XLSX.exists():
         shutil.copy(MASTER_XLSX, DATA_DIR / f"учет_backup_{datetime.now():%Y%m%d_%H%M}.xlsx")
@@ -655,6 +672,11 @@ async def excel_cmd(m: Message):
     await m.answer("Собираю учёт…")
     aud = "owner" if roles.can_write(roles.role_of(m.from_user.id)) else "operator"
     await export_topups(ids, m.from_user.id, "📊 Актуальный учёт", audience=aud)
+
+
+@dp.message(pv, wr, F.document)
+async def unknown_file(m: Message):
+    await m.answer("Этот формат не читаю. Пришли инвойс как PDF, фото (jpg/png) или Excel (.xlsx/.xls).")
 
 
 @dp.message(pv, ops, F.document | F.photo)

@@ -171,6 +171,8 @@ def _pdf_to_pngs(data: bytes, max_pages: int = 5) -> list[bytes]:
 
 
 def _blocks(data: bytes, mime: str) -> list:
+    if mime.startswith("text/"):                       # Excel invoice converted to a text table
+        return [{"type": "text", "text": "Документ (таблица из Excel):\n" + data.decode("utf-8", errors="ignore")[:60000]}]
     if mime == "application/pdf" and AI_PROVIDER == "openrouter":
         try:
             return [_block(p, "image/png") for p in _pdf_to_pngs(data)]
