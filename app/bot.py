@@ -139,6 +139,10 @@ async def master(m: Message):
     if is_ft:
         await _floratrack(m, data)
         return
+    from . import kbreak
+    if kbreak.is_breakdown(data):
+        await _kenya_breakdown(m, data)
+        return
     from .xltext import excel_to_text, looks_like_master
     if not looks_like_master(data):                    # not our учёт file -> it's an invoice in Excel
         text = excel_to_text(data, m.document.file_name)
@@ -150,6 +154,35 @@ async def master(m: Message):
     from .backup import mark_dirty
     mark_dirty()
     await m.answer("Мастер-файл обновлён ✅ (старый сохранён в бэкап)")
+
+
+async def _kenya_breakdown(m: Message, data: bytes):
+    """TK Kenya box breakdown: kg per farm for the MAWB + the file goes to packing chats before the packings."""
+    from . import kbreak
+    from .ai import find_mawb
+    from .calc import norm_awb
+    from .api import resolve_farm
+    info = kbreak.parse(data)
+    awb = find_mawb(info["awb"] or "") or info["awb"]
+    if not awb or not info["rows"]:
+        await m.answer("Не нашёл в файле AWB и строки по фермам.")
+        return
+    with session() as s:
+        for r in info["rows"]:
+            f = resolve_farm(s, r["farm_raw"])
+            r["farm"] = f.name if f else r["farm_raw"].title()
+    col = info["use"]
+    per = [{"farm": r["farm"], "kg": round(r[col], 2), "boxes": r["packs"]} for r in info["rows"]]
+    w = store_breakdown(awb, per)
+    kbreak.store(data, info, norm_awb(awb), [{"farm": r["farm"], "packs": r["packs"], "kg": r[col]} for r in info["rows"]])
+    lines = "\n".join(f"• {r['farm']}: {r['packs']} кор. · {r[col]:g} кг" for r in info["rows"])
+    txt = (f"📋 Детализация MAWB {awb}: {info['packs']} кор., {info[col]:g} кг "
+           f"({'реальный вес' if col == 'weight' else 'объёмный вес'} — он больше: {info['weight']:g} / VW {info['vw']:g})\n"
+           + lines + "\n\n" + _applied_text(w)
+           + "\n\n📦 В чаты пакингов уйдёт ОДНИМ файлом: детализация (без ETD/ETA) + пакинг-листы кенийских инвойсов этого MAWB."
+           + (f"\n🛬 Прибытие ориентировочно {kbreak._state().get(norm_awb(awb), {}).get('arrive')}" if info.get("eta") else ""))
+    await m.answer(txt)
+    await send_packing_lists()
 
 
 async def _floratrack(m: Message, data: bytes):
@@ -1087,21 +1120,11 @@ async def push_packing_all() -> dict:
     if not tg:
         return {"error": "нет чатов для пакингов — добавь @бота-читателя в чат и напиши там /packing_here"}
     items, skipped = packing.in_transit_all()
-    sent = 0
-    for inv_id, data, farm, awb in items:
-        safe = re.sub(r"[^\w\-]+", "_", f"{farm}_{awb}")
-        ok = False
-        for t in tg:
-            try:
-                await sender.send_document(t["chat_id"], BufferedInputFile(data, f"Packing_{safe}.xlsx"),
-                                           caption=f"📦 Packing list · {farm} · MAWB {awb}",
-                                           message_thread_id=t.get("thread_id"))
-                ok = True
-            except Exception as e:
-                print(f"[lumen] push packing to {t.get('title')}: {e}", flush=True)
-        if ok:
-            packing.mark_sent(inv_id)
-            sent += 1
+    from . import kbreak
+    held = [it for it in items if it[3] and not kbreak.has(it[3])]
+    items = [it for it in items if not (it[3] and not kbreak.has(it[3]))]
+    skipped += [f"{it[1]} (Кения, нет детализации {it[2]})" for it in held]
+    sent = await _send_items(items, sender, tg, resend_breakdown=True)
     return {"sent": sent, "chats": len(tg), "skipped": skipped}
 
 
@@ -1119,27 +1142,58 @@ async def push_packing_cmd(m: Message):
     await m.answer(push_text(await push_packing_all()))
 
 
-async def send_packing_lists():
-    """Every invoice that got a MAWB -> its packing list (.xlsx, no prices) to every registered chat/topic."""
+async def _post(sender, tg, data: bytes, fname: str, caption: str) -> bool:
     from aiogram.types import BufferedInputFile
+    ok = False
+    for t in tg:
+        try:
+            await sender.send_document(t["chat_id"], BufferedInputFile(data, fname), caption=caption,
+                                       message_thread_id=t.get("thread_id"))
+            ok = True
+        except Exception as e:
+            print(f"[lumen] packing chat {t.get('title')}: {e}", flush=True)
+    return ok
+
+
+async def _send_items(items, sender, tg, resend_breakdown=False) -> int:
+    """One message per MAWB: Kenya — [детализация + all packing lists] in ONE file with the breakdown as text;
+    others — all packing lists of the MAWB in one file."""
+    from collections import OrderedDict
+    from . import kbreak, packing
+    groups = OrderedDict()
+    for inv_id, farm, awb, kkey in sorted(items, key=lambda x: (x[2] or "", x[0])):
+        groups.setdefault((awb, kkey), []).append((inv_id, farm))
+    sent = 0
+    for (awb, kkey), invs in groups.items():
+        ids, farms = [i for i, _f in invs], [f for _i, f in invs]
+        safe = re.sub(r"[^\w\-]+", "_", awb)
+        with_bd = bool(kkey) and (resend_breakdown or not kbreak.is_sent(kkey))
+        if with_bd:
+            data = packing.bundle(ids, kbreak.breakdown_bytes(kkey))
+            ok = await _post(sender, tg, data, f"Kenya_{safe}.xlsx", kbreak.caption(kkey, farms))
+            if ok:
+                kbreak.mark_sent(kkey)
+        else:
+            data = packing.bundle(ids)
+            cap = f"📦 Packing list{'s' if len(ids) > 1 else ''} · MAWB {awb}\n" + "\n".join(f"• {f}" for f in farms)
+            ok = await _post(sender, tg, data, f"Packing_{safe}.xlsx", cap)
+        if ok:
+            for i in ids:
+                packing.mark_sent(i)
+            sent += len(ids)
+    return sent
+
+
+async def send_packing_lists():
+    """Every invoice that got a MAWB -> its packing list (.xlsx, no prices) to every packing chat.
+    Kenya: only after the MAWB box breakdown, which is posted right before."""
     from . import packing, reader
-    tg = packing.targets()
-    sender = reader.RBOT                      # the neutral bot posts; the finance bot never shows in chats
+    tg, sender = packing.targets(), reader.RBOT          # the neutral bot posts; the finance bot never shows
     if not tg or not sender:
         return
-    for inv_id, data, farm, awb in packing.pending():
-        ok = False
-        safe = re.sub(r"[^\w\-]+", "_", f"{farm}_{awb}")
-        for t in tg:
-            try:
-                await sender.send_document(t["chat_id"], BufferedInputFile(data, f"Packing_{safe}.xlsx"),
-                                        caption=f"📦 Packing list · {farm} · MAWB {awb}",
-                                        message_thread_id=t.get("thread_id"))
-                ok = True
-            except Exception as e:
-                print(f"[lumen] packing to {t.get('title')}: {e}", flush=True)
-        if ok:
-            packing.mark_sent(inv_id)
+    items = packing.pending()
+    if items:
+        await _send_items(items, sender, tg)
 
 
 async def scheduler_loop():
@@ -1244,37 +1298,76 @@ async def process_group_text(chat_id: int, chat_title: str, text: str, sent_msk)
 _READER_SEEN: dict = {}
 
 
+_JOIN: dict = {}     # chat_id -> (title, type) for the «what is this chat for?» buttons
+
+
 async def reader_joined(chat_id: int, title: str, chat_type: str, status: str, reads_all: bool, username: str):
-    """The reader bot was added to (or removed from) a chat: health check to the system admin."""
+    """The reader bot was added to (or removed from) a chat: ask what the chat is for (TK MSK / packing / client)."""
     from .api import _settings
     key = (chat_id, "out" if status in ("left", "kicked") else "in")
     if _READER_SEEN.get(chat_id) == key[1]:
         return                                   # same state already reported
     _READER_SEEN[chat_id] = key[1]
     if status in ("left", "kicked"):
-        text, kb = f"⚠️ Читатель @{username} удалён из чата «{title}». Сообщения о машинах больше не приходят.", None
+        text, kb = f"⚠️ Читатель @{username} удалён из чата «{title}».", None
     else:
+        _JOIN[chat_id] = (title, chat_type)
         ok_privacy = reads_all or chat_type == "channel"
         ok_admin = chat_type != "channel" or status == "administrator"
-        approved = chat_id in (_settings().get("ft_chats") or [])
-        lines = [f"👀 Читатель @{username} добавлен в «{title}» ({'канал' if chat_type == 'channel' else 'группа'})",
-                 ("✅" if ok_privacy else "❌") + " видит все сообщения" +
-                 ("" if ok_privacy else " — в @BotFather: /setprivacy → Disable, потом удали и добавь бота заново"),
-                 ("✅" if ok_admin else "❌") + (" права есть" if ok_admin else " в канале бот должен быть админом")]
-        if approved:
-            lines.append("✅ этот чат уже отмечен как ТК МСК")
-            kb = None
-        else:
-            lines.append("Если это чат ТК МСК — подтверди, и сообщения о машинах пойдут сразу:")
-            kb = _kb([[("Да, это ТК МСК", f"ftc:{chat_id}:0"), ("Нет", f"ftn:{chat_id}")]])
-        if ok_privacy and ok_admin:
-            lines.append("\nВсё готово — теперь просто жди сообщений о машинах, я буду присылать сводки сюда.")
-        text = "\n".join(lines)
+        warn = ([] if ok_privacy else ["❌ не видит обычные сообщения — в @BotFather: /setprivacy → Disable, потом удали и добавь бота заново"]) + \
+               ([] if ok_admin else ["❌ в канале бот должен быть админом"])
+        text = "\n".join([f"👀 Читатель @{username} добавлен в «{title}»."] + warn + ["Для чего этот чат?"])
+        kb = _kb([[("🚛 Чат ТК МСК (машины)", f"rj:ft:{chat_id}")],
+                  [("📦 Сюда пакинг-листы", f"rj:pk:{chat_id}")],
+                  [("👥 Чат клиента (статусы груза)", f"rj:cl:{chat_id}")],
+                  [("Ничего, просто так", f"rj:no:{chat_id}")]])
     for uid in roles.sys_ids():
         try:
             await bot.send_message(uid, text, reply_markup=kb)
         except Exception:
             pass
+
+
+@dp.callback_query(F.data.startswith("rj:"), sysf)
+async def reader_join_choice(c: CallbackQuery):
+    from .api import _settings, SETTINGS
+    from . import packing, clients
+    _, what, cid = c.data.split(":", 2)
+    cid = int(cid)
+    title, ctype = _JOIN.get(cid, ("", ""))
+    await c.answer()
+    if what == "ft":
+        st = _settings()
+        SETTINGS.write_text(json.dumps({**st, "ft_chats": sorted(set((st.get("ft_chats") or []) + [cid]))}))
+        txt = f"✅ «{title}» — чат ТК МСК. Сообщения о машинах буду разбирать сами."
+    elif what == "pk":
+        ts = [x for x in packing.targets() if not (x["chat_id"] == cid and x.get("thread_id") is None)]
+        packing.set_targets(ts + [{"chat_id": cid, "thread_id": None, "title": title}])
+        txt = f"✅ В «{title}» будут приходить пакинг-листы."
+        if ctype == "supergroup":
+            txt += "\nЕсли нужна конкретная тема супергруппы — напиши /packing_here внутри этой темы."
+    elif what == "cl":
+        marks = sorted(clients.registry().keys())
+        rows = [[(m, f"rjm:{cid}:{m}")] for m in marks[:20]]
+        await c.message.edit_text(f"«{title}» — чат какого клиента? Выбери маркировку"
+                                  + ("" if marks else " (маркировок пока нет)") +
+                                  ".\nНовой нет в списке — добавь её в «Ещё» → «Маркировки клиентов» "
+                                  "или напиши в том чате /marking_here КОД.",
+                                  reply_markup=_kb(rows) if rows else None)
+        return
+    else:
+        txt = f"Ок, «{title}» ни для чего не использую."
+    await c.message.edit_text(txt)
+
+
+@dp.callback_query(F.data.startswith("rjm:"), sysf)
+async def reader_join_marking(c: CallbackQuery):
+    from . import clients
+    _, cid, mk = c.data.split(":", 2)
+    title, _t = _JOIN.get(int(cid), ("", ""))
+    clients.add_chat(mk, int(cid), None, title)
+    await c.answer()
+    await c.message.edit_text(f"✅ «{title}» — чат клиента {mk}. Статусы его грузов будут приходить туда.")
 
 
 @grp.message(F.text)

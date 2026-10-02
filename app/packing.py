@@ -4,6 +4,7 @@ Sent as .xlsx to the chats registered with /packing_here, but ONLY once the invo
 """
 import io
 import json
+import re
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -16,10 +17,8 @@ thin = Side(style="thin", color="BFBFBF")
 BOX = Border(left=thin, right=thin, top=thin, bottom=thin)
 
 
-def build_xlsx(inv, lines) -> bytes:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Packing list"
+def write_sheet(ws, inv, lines):
+    """One packing list on a worksheet: farm, MAWB, items and quantities — no prices."""
     ws["A1"] = "PACKING LIST"
     ws["A1"].font = Font(name=F, bold=True, size=14)
     ws["A3"], ws["B3"] = "Ферма", inv.farm
@@ -27,8 +26,7 @@ def build_xlsx(inv, lines) -> bytes:
     for r in (3, 4):
         ws.cell(r, 1).font = Font(name=F, bold=True)
         ws.cell(r, 2).font = Font(name=F, bold=True, size=12)
-    head = ["Номенклатура", "Количество, шт"]
-    for c, h in enumerate(head, 1):
+    for c, h in enumerate(["Номенклатура", "Количество, шт"], 1):
         x = ws.cell(6, c, h)
         x.font = Font(name=F, bold=True)
         x.fill = PatternFill("solid", fgColor="D9E1F2")
@@ -50,6 +48,42 @@ def build_xlsx(inv, lines) -> bytes:
         ws.cell(r, c).fill = PatternFill("solid", fgColor="FCE4D6")
     ws.column_dimensions["A"].width = 44
     ws.column_dimensions["B"].width = 18
+
+
+def _sheet_title(name: str, used: set) -> str:
+    t = re.sub(r"[\\/*?:\[\]]", " ", name)[:28] or "Ферма"
+    base, n = t, 2
+    while t in used:
+        t, n = f"{base[:25]} {n}", n + 1
+    used.add(t)
+    return t
+
+
+def build_xlsx(inv, lines) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Packing list"
+    write_sheet(ws, inv, lines)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def bundle(inv_ids: list[int], breakdown_bytes: bytes | None = None) -> bytes:
+    """ONE file for a MAWB: [Детализация (без ETD/ETA)] + a sheet per farm packing list."""
+    from openpyxl import load_workbook
+    if breakdown_bytes:
+        wb = load_workbook(io.BytesIO(breakdown_bytes))
+        wb.worksheets[0].title = "Детализация"
+    else:
+        wb = Workbook()
+        wb.remove(wb.active)
+    used = set(wb.sheetnames)
+    with session() as s:
+        for iid in inv_ids:
+            inv = s.get(Invoice, iid)
+            ls = s.exec(select(Line).where(Line.invoice_id == iid)).all()
+            write_sheet(wb.create_sheet(_sheet_title(inv.farm, used)), inv, ls)
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -67,15 +101,26 @@ def set_targets(t: list[dict]):
     mark_dirty()
 
 
+def _is_kenya(s, inv) -> bool:
+    from .api import _country_of
+    return _country_of(s, inv) == "Кения"
+
+
 def pending() -> list:
-    """Invoices that have a MAWB and whose packing list hasn't been sent yet."""
+    """Invoices that have a MAWB and whose packing list hasn't been sent yet.
+    Kenyan ones wait until the box breakdown of their MAWB has been sent (kbreak)."""
+    from .calc import norm_awb
+    from . import kbreak
     with session() as s:
         out = []
         for i in s.exec(select(Invoice).where(Invoice.packing_sent == False)).all():  # noqa: E712
             if i.awb and i.awb.strip():
-                ls = s.exec(select(Line).where(Line.invoice_id == i.id)).all()
-                if ls:
-                    out.append((i.id, build_xlsx(i, ls), i.farm, i.awb))
+                k = norm_awb(i.awb)
+                kenya = _is_kenya(s, i)
+                if kenya and not kbreak.has(k):
+                    continue                       # hold: no breakdown for this Kenyan MAWB yet
+                if s.exec(select(Line).where(Line.invoice_id == i.id)).first():
+                    out.append((i.id, i.farm, i.awb, k if kenya else None))
         return out
 
 
@@ -89,9 +134,9 @@ def in_transit_all() -> tuple[list, list]:
             if not (i.awb and i.awb.strip()):
                 skipped.append(i.farm)
                 continue
-            ls = s.exec(select(Line).where(Line.invoice_id == i.id)).all()
-            if ls:
-                out.append((i.id, build_xlsx(i, ls), i.farm, i.awb))
+            if s.exec(select(Line).where(Line.invoice_id == i.id)).first():
+                from .calc import norm_awb
+                out.append((i.id, i.farm, i.awb, norm_awb(i.awb) if _is_kenya(s, i) else None))
         return out, skipped
 
 
