@@ -50,7 +50,7 @@ def parse(data: bytes) -> dict:
             "use": "weight" if tw >= tv else "vw", "eta": eta}
 
 
-def clean(data: bytes) -> bytes:
+def clean(data: bytes, names: dict | None = None) -> bytes:
     """For the chats: AWB | Ферма | Коробки (+ «Общее»). No consignee, origin, dest, house bill, weights, dates."""
     from openpyxl import load_workbook
     wb = load_workbook(io.BytesIO(data))
@@ -61,6 +61,14 @@ def clean(data: bytes) -> bytes:
         if name in head:
             ws.delete_cols(head.index(name) + 1)
             head = [str(c.value or "").strip().lower() for c in ws[1]]
+    if names:                                            # TK names -> ours: ZEEFLORA LTD -> Zeeflora
+        hf = [str(c.value or "").strip().lower() for c in ws[1]]
+        if "shipper full name" in hf:
+            fc = hf.index("shipper full name") + 1
+            for r in range(2, ws.max_row + 1):
+                v = ws.cell(r, fc).value
+                if isinstance(v, str) and v.strip() in names:
+                    ws.cell(r, fc).value = names[v.strip()]
     rename = {"shipper full name": "Ферма", "packs": "Коробки"}
     for c in ws[1]:
         k = str(c.value or "").strip().lower()
@@ -107,7 +115,8 @@ def _save_state(st: dict):
 def store(data: bytes, info: dict, awb_key: str, farms: list[dict]):
     """farms: [{"farm", "packs", "kg"}] with OUR farm names."""
     from datetime import timedelta
-    (DIR / f"{awb_key}.xlsx").write_bytes(clean(data))
+    names = {r["farm_raw"]: f["farm"] for r, f in zip(info["rows"], farms)}
+    (DIR / f"{awb_key}.xlsx").write_bytes(clean(data, names))
     st = _state()
     eta = info.get("eta")
     st[awb_key] = {"sent": False, "packs": info["packs"], "kg": info[info["use"]], "farms": farms,
