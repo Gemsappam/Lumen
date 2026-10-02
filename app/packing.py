@@ -90,8 +90,14 @@ def bundle(inv_ids: list[int], breakdown_bytes: bytes | None = None) -> bytes:
 
 
 def targets() -> list[dict]:
+    """Packing chats. If a chat has a topic registered, the same chat without a topic (= General) is dropped."""
     from .api import _settings
-    return _settings().get("packing_targets") or []
+    ts = _settings().get("packing_targets") or []
+    with_topic = {t["chat_id"] for t in ts if t.get("thread_id")}
+    clean = [t for t in ts if t.get("thread_id") or t["chat_id"] not in with_topic]
+    if len(clean) != len(ts):
+        set_targets(clean)
+    return clean
 
 
 def set_targets(t: list[dict]):

@@ -1407,11 +1407,13 @@ async def reader_join_choice(c: CallbackQuery):
         SETTINGS.write_text(json.dumps({**st, "ft_chats": sorted(set((st.get("ft_chats") or []) + [cid]))}))
         txt = f"✅ «{title}» — чат ТК МСК. Сообщения о машинах буду разбирать сами."
     elif what == "pk":
-        ts = [x for x in packing.targets() if not (x["chat_id"] == cid and x.get("thread_id") is None)]
-        packing.set_targets(ts + [{"chat_id": cid, "thread_id": None, "title": title}])
-        txt = f"✅ В «{title}» будут приходить пакинг-листы."
         if ctype == "supergroup":
-            txt += "\nЕсли нужна конкретная тема супергруппы — напиши /packing_here внутри этой темы."
+            txt = (f"«{title}» — супергруппа с темами. Открой нужную тему (например «Packing листы») "
+                   "и напиши там /packing_here — пакинги будут приходить только в неё, не в General.")
+        else:
+            ts = [x for x in packing.targets() if not (x["chat_id"] == cid and x.get("thread_id") is None)]
+            packing.set_targets(ts + [{"chat_id": cid, "thread_id": None, "title": title}])
+            txt = f"✅ В «{title}» будут приходить пакинг-листы."
     elif what == "cl":
         marks = sorted(clients.registry().keys())
         rows = [[(m, f"rjm:{cid}:{m}")] for m in marks[:20]]
