@@ -430,6 +430,12 @@ async def _step(uid: int, head: str = ""):
                for _p, d in docs]
         bal = "\n".join(farm_balance_text(d.get("farm") or "") for _p, d in docs)
         label = f"Ровно по инвойсу ${tot[0]:g}" if len(docs) == 1 else "Ровно по инвойсам"
+        from . import calc
+        rule = calc.RULES.get((docs[0][1].get("farm") or "").strip().lower(), {})
+        if rule.get("in_fee") and len(docs) == 1:          # broker: 97 % of the dollars reach the exchange
+            paid_usd = (flow["pays"][0] or (0, 0))[0] if flow.get("pays") else 0
+            label = f"Как обычно: на биржу ${paid_usd:g} − {rule['in_fee']:g}% = ${paid_usd * (1 - rule['in_fee'] / 100):,.2f}".replace(",", " ")
+            bal += f"\nℹ️ {docs[0][1].get('farm')}: закупка через брокера — к инвойсу +{rule.get('markup', 0):g}%, на биржу заходит {100 - rule['in_fee']:g}% долларов."
         await _send(uid, head + bal + "\n\nСколько дошло до фермы?",
                     _kbb([[(label, "fl:farm:exact")], [("Другая сумма (переплата / аванс / недоплата)", "fl:farm:other")],
                           [("✏️ У фермы был другой баланс", "fl:bal:edit")]]), note)

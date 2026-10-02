@@ -137,8 +137,12 @@ class FarmIn(BaseModel):
 # ---------- helpers ------------------------------------------------------------------
 def _all(s):
     from . import calc
-    calc.OPENINGS = {f.name.strip().lower(): (f.opening_usd or 0, f.opening_rate, f.name)
-                     for f in s.exec(select(Farm)).all() if f.opening_usd}
+    farms = s.exec(select(Farm)).all()
+    calc.RULES = {f.name.strip().lower(): {"account": (getattr(f, "account", "") or "").strip(),
+                                           "in_fee": getattr(f, "in_fee_pct", 0) or 0, "markup": getattr(f, "markup_pct", 0) or 0}
+                  for f in farms if (getattr(f, "account", "") or getattr(f, "in_fee_pct", 0) or getattr(f, "markup_pct", 0))}
+    calc.OPENINGS = {((getattr(f, "account", "") or f.name).strip().lower()): (f.opening_usd or 0, f.opening_rate, f.name)
+                     for f in farms if f.opening_usd}
     return (s.exec(select(TopUp)).all(), s.exec(select(Invoice)).all(),
             s.exec(select(Line)).all(), s.exec(select(Logistics)).all())
 
@@ -798,6 +802,10 @@ def get_topup(tid: int, uid: int = Depends(user_id)):
 def save_invoice(body: InvoiceIn, inv_id: int | None = None, uid: int = Depends(writer)):
     from .ai import find_mawb
     body.client_code = (body.client_code or "").strip() or marking()
+    with session() as s0:                                # one name per farm: «Positano» -> «Tessa», «ZEEFLORA LTD» -> «Zeeflora»
+        fm = resolve_farm(s0, body.farm)
+        if fm:
+            body.farm = fm.name
     body.awb = find_mawb(body.awb) or body.awb.strip()   # one spelling everywhere: 065-40538245
     _apply_box_rules(body)
     prices = {round(l.price_usd, 4) for l in body.lines if l.stems}
@@ -946,12 +954,21 @@ def ledger_view() -> dict:
     return {"farms": [f for f in farms if abs(f["balance_usd"]) > 0.01 or f["advances"] or f["debts"]]}
 
 
+def calc_rule_account(farm: str) -> str:
+    from . import calc
+    return (calc.RULES.get((farm or "").strip().lower()) or {}).get("account") or ""
+
+
 def farm_balance_text(farm: str) -> str:
     """«Kikwetu: аванс $100 (по 95.34 ₽/$, оплата 23.09)» / «долг $150» / «расчёты закрыты»."""
     with session() as s:
         tops, invs, lines, logs = _all(s)
         res = compute(0, tops, invs, lines, logs, _awb_kg(s))
-    f = next((v for k, v in res.ledger.items() if k.lower() == (farm or "").lower()), None)
+    acc = calc_rule_account(farm)
+    f = next((v for k, v in res.ledger.items() if k.lower() == (farm or "").lower()
+              or (acc and k.lower().startswith(acc.lower()))), None)
+    if acc and f:
+        farm = f["farm"]
     if not f or (abs(f["balance_usd"]) < 0.01 and not f["debts"]):
         return f"⚖️ {farm}: расчёты закрыты, аванса и долга нет"
     parts = []
@@ -965,7 +982,9 @@ def farm_balance_text(farm: str) -> str:
 
 def _farm_now(farm: str):
     v = ledger_view()
-    return next((f for f in v["farms"] if f["farm"].lower() == (farm or "").lower()), None)
+    acc = calc_rule_account(farm)
+    return next((f for f in v["farms"] if f["farm"].lower() == (farm or "").lower()
+                 or (acc and f["farm"].lower().startswith(acc.lower()))), None)
 
 
 def farm_balance_projection(farm: str, total: float) -> str:

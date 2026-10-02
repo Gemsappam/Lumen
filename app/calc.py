@@ -88,7 +88,12 @@ def invoice_total(inv, ls) -> float:
     return float(t) if t and t >= v - 0.01 else v
 
 
-OPENINGS: dict = {}   # farm (lower) -> (usd, rate): balance BEFORE the bot (+ advance at the farm / − our debt)
+OPENINGS: dict = {}   # farm/account (lower) -> (usd, rate, name): balance BEFORE the bot
+RULES: dict = {}      # farm (lower) -> {"account", "in_fee", "markup"} (brokers: Tessa / Plazoleta)
+
+
+def _rule(farm: str) -> dict:
+    return RULES.get((farm or "").strip().lower(), {})
 
 
 def farm_ledger(topups, invoices, lines_by_inv, est_rate) -> dict:
@@ -102,7 +107,8 @@ def farm_ledger(topups, invoices, lines_by_inv, est_rate) -> dict:
     tdate = {t.id: t.date for t in topups}
     by_farm = defaultdict(list)
     for inv in invoices:
-        by_farm[(inv.farm or "").strip().lower()].append(inv)
+        r = _rule(inv.farm)
+        by_farm[(r.get("account") or inv.farm or "").strip().lower()].append(inv)
     names = {k: k for k in by_farm}
     for k in OPENINGS:
         by_farm.setdefault(k, [])
@@ -118,14 +124,20 @@ def farm_ledger(topups, invoices, lines_by_inv, est_rate) -> dict:
             debts.append([None, -o_usd])
         for inv in sorted(invs, key=lambda x: x.id):
             ls = lines_by_inv[inv.id]
-            total = invoice_total(inv, ls)
+            rule = _rule(inv.farm)
+            total = invoice_total(inv, ls) * (1 + rule.get("markup", 0) / 100)   # broker: +7 % on the invoice
             rec = {"rub_cost": 0.0, "farm_usd": 0.0, "from_advance": 0.0, "debt_usd": 0.0, "parts": [], "total": total}
             out_inv[inv.id] = rec
             if inv.topup_id:                                   # this invoice brought money to the farm
                 r = rate_of(tmap.get(inv.topup_id))
                 rub = inv.rub_paid_override if inv.rub_paid_override is not None else round(inv.usd_paid * r)
                 f = getattr(inv, "farm_usd", None)
-                f = float(f) if f else total                   # default: exactly the invoice reached the farm
+                if f:
+                    f = float(f)
+                elif rule.get("in_fee"):                       # broker: only 97 % of the dollars arrive (3 % in)
+                    f = inv.usd_paid * (1 - rule["in_fee"] / 100)
+                else:
+                    f = total                                  # default: exactly the invoice reached the farm
                 rec["farm_usd"] = f
                 if f > 0:
                     rpu = rub / f
@@ -165,12 +177,18 @@ def farm_ledger(topups, invoices, lines_by_inv, est_rate) -> dict:
             rec = out_inv[inv.id]
             if rec["debt_usd"] > 1e-6:
                 est_usd = getattr(inv, "est_usd", None)
-                f = (est_usd / rec["total"]) if (not inv.topup_id and est_usd and rec["total"]) else factor
+                rule = _rule(inv.farm)
+                if rule.get("in_fee"):                         # broker: each exchange-$ costs rate ÷ 0.97
+                    f = 1 / (1 - rule["in_fee"] / 100)
+                else:
+                    f = (est_usd / rec["total"]) if (not inv.topup_id and est_usd and rec["total"]) else factor
                 rec["rub_cost"] += rec["debt_usd"] * est_rate * f
         adv = sum(c[0] for c in credits)
         debt = sum(d[1] for d in debts)
         op = OPENINGS.get(key)
-        name = invs[0].farm if invs else (op[2] if op and len(op) > 2 else key)
+        acc = _rule(invs[0].farm).get("account") if invs else None
+        name = (f"{acc} ({', '.join(sorted({i.farm for i in invs}))})" if acc else invs[0].farm) if invs else \
+            (op[2] if op and len(op) > 2 else key)
         farms[name] = {"farm": name, "advance_usd": round(adv, 2), "debt_usd": round(debt, 2),
                        "balance_usd": round(adv - debt, 2),
                        "advances": [{"usd": round(c[0], 2), "rate": round(c[1], 4), "from": c[2]} for c in credits],

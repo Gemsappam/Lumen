@@ -27,6 +27,9 @@ class Farm(SQLModel, table=True):
     box_kg_json: str = "{}"                # {"Spray Rose Reflex Bicolour 60cm": 25} — fixed kg per box of these items
     box_dims_json: str = "{}"
     opening_usd: float = 0                 # balance before the bot: + advance at the farm / − our debt, in $
+    in_fee_pct: float = 0                  # broker: incoming commission on dollars sent (Tessa/Plazoleta: 3 %)
+    markup_pct: float = 0                  # broker: commission on the farm invoice (Tessa/Plazoleta: 7 %)
+    account: str = ""                      # shared balance name (e.g. «Брокер»); empty = the farm's own
     opening_rate: Optional[float] = None   # ₽ per $ of that advance (None = rate of the latest top-up)              # Expolanka box sizes seen: {"100.48.25": 40} -> volumetric kg = L*W*H/6000
 
 
@@ -133,6 +136,10 @@ def init_db():
         with engine.begin() as c:
             c.execute(text("ALTER TABLE logistics ADD COLUMN farm_kg_json VARCHAR DEFAULT '{}'"))
     fcols = {c["name"] for c in inspect(engine).get_columns("farm")}
+    for col, typ in (("in_fee_pct", "FLOAT DEFAULT 0"), ("markup_pct", "FLOAT DEFAULT 0"), ("account", "VARCHAR DEFAULT ''")):
+        if col not in fcols:
+            with engine.begin() as c:
+                c.execute(text(f"ALTER TABLE farm ADD COLUMN {col} {typ}"))
     if "opening_usd" not in fcols:
         with engine.begin() as c:
             c.execute(text("ALTER TABLE farm ADD COLUMN opening_usd FLOAT DEFAULT 0"))

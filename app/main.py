@@ -17,9 +17,9 @@ from .models import Farm, init_db, session
 SEED = {
     "Кения": ["Zeeflora", "Tambuzi", "Heritage", "Agriflora", "Massai", "Mzurrie (Winchester farm)", "Subati",
               "Kikwetu", "Karen Roses", "Batian", "Black Tulip", "PjDave", "Primarosa", "Red Lands"],
-    "Эквадор": ["Nintanga", "Agroterranorte", "Josar Flor", "Tikan", "EC Blooms (Starroses)", "Sand Flowers",
+    "Эквадор": ["Tessa", "Nintanga", "Agroterranorte", "Josar Flor", "Tikan", "EC Blooms (Starroses)", "Sand Flowers",
                 "Allegro Farms", "Dayka", "Guaisa (Sunrite)", "Meral Flowers", "Monterosas", "Rosaprima", "Rosas Del Vento"],
-    "Колумбия": ["Кондор (Гортензия)", "American Flowers", "Plazoleta", "Tessa", "La Conejera", "Serrezuela Flowers"],
+    "Колумбия": ["Кондор (Гортензия)", "American Flowers", "Plazoleta", "La Conejera", "Serrezuela Flowers"],
 }
 
 # Bothost's proxy sends traffic to the port set in the panel. We open all the usual ones,
@@ -45,8 +45,25 @@ FARM_ALIASES = {"PjDave": "PJ FLORA,PJ FLOWERS,PJ",
 BOX_RULES = {"Zeeflora": {"Spray Rose Reflex Bicolour 60cm": 25, "Spray Rose Fire Works Bi-Pink 60cm": 25}}
 
 
+BROKER = {"Tessa": ("Эквадор", "POSITANO,Позитано"), "Plazoleta": ("Колумбия", "")}
+
+
 def upsert_forwarders():
     with session() as s:
+        for name, (country, aliases) in BROKER.items():   # bought through a broker: 3 % in, 7 % on the invoice
+            f = s.exec(select(Farm).where(Farm.name == name)).first() or Farm(name=name, country=country)
+            f.country = country
+            if aliases and "POSITANO" not in (f.aliases or ""):
+                f.aliases = ",".join(x for x in [f.aliases, aliases] if x)
+            if not f.in_fee_pct and not f.markup_pct:
+                f.in_fee_pct, f.markup_pct, f.account = 3, 7, "Брокер"
+                f.notes = ((f.notes or "") + " Закупка через брокера: на биржу заходит 97% долларов (3% входящая комиссия), "
+                           "к инвойсу фермы +7% комиссии брокера.").strip()
+            s.add(f)
+        from .models import Invoice
+        for inv in s.exec(select(Invoice)).all():           # Positano is the old name of Tessa
+            if (inv.farm or "").strip().lower() == "positano":
+                inv.farm = "Tessa"; s.add(inv)
         for name, rules in BOX_RULES.items():
             f = s.exec(select(Farm).where(Farm.name == name)).first()
             if f and (f.box_kg_json or "{}") == "{}":

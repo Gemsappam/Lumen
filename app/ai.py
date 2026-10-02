@@ -81,6 +81,7 @@ DOMAIN = """Ты — бухгалтер-логист оптовой компан
 - Коробки: FB=1, HB=0.5, QB=0.25, EB=0.125. Stems = bunches × stems per bunch. Длина (40cm/50cm/60cm)
   — часть номенклатуры, пиши её в название: "Rose Madam Red 40cm".
 - Гортензии (Кондор, American Flowers): часто одна цена на всё, названия = цвета.
+- Positano — это старое название фермы Tessa (Эквадор): всегда пиши farm = "Tessa".
 - Трейдеры: NextWave (NEXTWAVE IMPORTS AND EXPORTS) выставляет ОДИН инвойс за несколько плантаций
   (колонка FARM: "SIAN FLOWERS-AGRIFLORA" = Agriflora, "SIAN FLOWERS-MAASAI" = Massai). Для каждой строки
   заполни lines[].farm каноническим именем плантации; верхнее поле farm = плантация, если она одна,
