@@ -51,15 +51,35 @@ def parse(data: bytes) -> dict:
 
 
 def clean(data: bytes) -> bytes:
-    """The file as-is, minus ETD / ETA and Weight / VW columns (boxes only)."""
+    """For the chats: AWB | Ферма | Коробки (+ «Общее»). No consignee, origin, dest, house bill, weights, dates."""
     from openpyxl import load_workbook
     wb = load_workbook(io.BytesIO(data))
     ws = wb.worksheets[0]
     head = [str(c.value or "").strip().lower() for c in ws[1]]
-    for name in ("eta", "etd", "weight", "vw"):          # chats see boxes only: no weights, no dates
+    drop = ("eta", "etd", "weight", "vw", "consignee full name", "origin", "dest.", "dest", "house bill")
+    for name in drop:                                    # chats see: AWB | Ферма | Коробки
         if name in head:
             ws.delete_cols(head.index(name) + 1)
             head = [str(c.value or "").strip().lower() for c in ws[1]]
+    rename = {"shipper full name": "Ферма", "packs": "Коробки"}
+    for c in ws[1]:
+        k = str(c.value or "").strip().lower()
+        if k in rename:
+            c.value = rename[k]
+    for row in ws.iter_rows():
+        for c in row:
+            if isinstance(c.value, str) and c.value.strip().upper() == "TOTAL":
+                c.value = "Общее"
+    # «TOTAL» sat under a deleted column -> put «Общее» next to the boxes total, left of it
+    hb = [str(c.value or "") for c in ws[1]]
+    if "Коробки" in hb:
+        bc = hb.index("Коробки") + 1
+        for r in range(2, ws.max_row + 1):
+            if ws.cell(r, 1).value in (None, "") and isinstance(ws.cell(r, bc).value, (int, float)):
+                ws.cell(r, bc - 1, "Общее")
+    ws.column_dimensions["A"].width = 16
+    ws.column_dimensions["B"].width = 28
+    ws.column_dimensions["C"].width = 10
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
