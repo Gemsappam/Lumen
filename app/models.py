@@ -99,6 +99,20 @@ class User(SQLModel, table=True):
     role: str = "viewer"
 
 
+class Upload(SQLModel, table=True):
+    """Every document anyone sent to the bot / app — kept even if the invoice or draft is deleted later."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    ts: str                                # «02.10.2026 15:40» MSK
+    uid: int = 0
+    user: str = ""
+    filename: str = ""
+    mime: str = ""
+    tg_file_id: Optional[str] = None       # Telegram keeps the original — resend any time
+    local_path: Optional[str] = None       # uploads from the app
+    kind: str = ""                         # farm_invoice / freight_invoice / kg_breakdown / topup_receipt / …
+    summary: str = ""
+
+
 class AwbWeights(SQLModel, table=True):
     """Per-farm kg on one MAWB. Comes separately from the freight bill (Expolanka bills have no breakdown)."""
     awb: str = Field(primary_key=True)     # normalized MAWB (digits only)

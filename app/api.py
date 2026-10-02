@@ -1015,6 +1015,93 @@ def set_opening(body: OpeningIn, uid: int = Depends(writer)):
     return ledger_view()
 
 
+# ---------- archive of every uploaded document ----------
+def record_upload(uid: int, user: str, filename: str, mime: str, tg_file_id=None, local_path=None, kind="") -> int:
+    from datetime import datetime, timedelta, timezone
+    from .models import Upload
+    ts = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%d.%m.%Y %H:%M")
+    with session() as s:
+        u = Upload(ts=ts, uid=uid, user=user, filename=filename, mime=mime, tg_file_id=tg_file_id,
+                   local_path=local_path, kind=kind)
+        s.add(u); s.commit(); s.refresh(u)
+        return u.id
+
+
+def update_upload(up_id: int, kind: str = None, summary: str = None):
+    from .models import Upload
+    if not up_id:
+        return
+    with session() as s:
+        u = s.get(Upload, up_id)
+        if u:
+            if kind is not None:
+                u.kind = kind
+            if summary is not None:
+                u.summary = summary[:300]
+            s.add(u); s.commit()
+    from .backup import mark_dirty
+    mark_dirty()
+
+
+KIND_RU = {"farm_invoice": "инвойс фермы", "freight_invoice": "счёт ТК", "kg_breakdown": "разбивка кг",
+           "topup_receipt": "пополнение", "kenya_breakdown": "детализация Кении", "floratrack": "отчёт ТК МСК",
+           "master": "мастер-файл учёта", "other": "другое"}
+
+
+@router.get("/uploads")
+def list_uploads(uid: int = Depends(sysadmin)):
+    """Archive for the system admin: who sent what, and what is left of it in the books."""
+    from .models import Upload
+    with session() as s:
+        ups = s.exec(select(Upload).order_by(Upload.id.desc()).limit(300)).all()
+        invs = s.exec(select(Invoice)).all()
+        tdate = {t.id: t.date for t in s.exec(select(TopUp)).all()}
+    drafts = {}
+    for p in DRAFTS.glob("*.json"):
+        try:
+            d = json.loads(p.read_text())
+            if d.get("upload_id"):
+                drafts.setdefault(d["upload_id"], []).append(d.get("farm") or "")
+        except ValueError:
+            pass
+    out = []
+    for u in ups:
+        booked = [i for i in invs if i.source_file == f"up:{u.id}"]
+        if booked:
+            status = "в учёте: " + ", ".join(f"{i.farm} ({tdate.get(i.topup_id, 'в пути')})" for i in booked)
+        elif u.id in drafts:
+            status = "черновик"
+        elif u.kind in ("farm_invoice", "freight_invoice"):
+            status = "нет в учёте — удалён или не внесён"
+        else:
+            status = ""
+        out.append({**u.model_dump(), "kind_ru": KIND_RU.get(u.kind, u.kind or "—"), "status": status,
+                    "gone": status.startswith("нет в учёте")})
+    return out
+
+
+@router.post("/uploads/{up_id}/send")
+async def resend_upload(up_id: int, uid: int = Depends(sysadmin)):
+    """Send the ORIGINAL file back into the admin's chat with the finance bot."""
+    from aiogram.types import FSInputFile
+    from .models import Upload
+    with session() as s:
+        u = s.get(Upload, up_id)
+    if not u or not BOT:
+        raise HTTPException(404)
+    cap = f"📎 {u.filename or 'документ'} · {u.user} · {u.ts}"
+    if u.tg_file_id:
+        if u.mime.startswith("image/") and not u.filename:
+            await BOT.send_photo(uid, u.tg_file_id, caption=cap)
+        else:
+            await BOT.send_document(uid, u.tg_file_id, caption=cap)
+    elif u.local_path and (DATA_DIR / "files" / u.local_path).exists():
+        await BOT.send_document(uid, FSInputFile(DATA_DIR / "files" / u.local_path, filename=u.filename), caption=cap)
+    else:
+        raise HTTPException(410, "Файл не сохранился")
+    return {"ok": True}
+
+
 # ---------- client markings & chats ----------
 @router.get("/markings")
 def list_markings(uid: int = Depends(writer)):
@@ -1106,7 +1193,10 @@ async def parse(file: UploadFile = File(...), uid: int = Depends(writer)):
         fs = [f.model_dump() for f in s.exec(select(Farm)).all()]
         catalog = sorted({l.name for l in s.exec(select(Line)).all()})
     out = await ai.parse_document(data, mime, fs, catalog)
-    out["source_file"] = name
+    up = record_upload(uid, "приложение", file.filename or name, mime, local_path=name, kind=out.get("doc_type", ""))
+    update_upload(up, summary=f"{out.get('farm') or ''} {out.get('invoice_no') or ''} ${out.get('invoice_total_usd') or ''}".strip())
+    out["source_file"] = f"up:{up}"
+    out["upload_id"] = up
     fill_mawb(out)
     return out
 

@@ -137,10 +137,12 @@ async def master(m: Message):
     except Exception:
         is_ft = False
     if is_ft:
+        _record(m, "floratrack")
         await _floratrack(m, data)
         return
     from . import kbreak
     if kbreak.is_breakdown(data):
+        _record(m, "kenya_breakdown")
         await _kenya_breakdown(m, data)
         return
     from .xltext import excel_to_text, looks_like_master
@@ -148,6 +150,7 @@ async def master(m: Message):
         text = excel_to_text(data, m.document.file_name)
         await _parse_and_reply(m, text.encode(), "text/plain")
         return
+    _record(m, "master")
     if MASTER_XLSX.exists():
         shutil.copy(MASTER_XLSX, DATA_DIR / f"учет_backup_{datetime.now():%Y%m%d_%H%M}.xlsx")
     MASTER_XLSX.write_bytes(data)
@@ -240,9 +243,26 @@ async def _say(m: Message, holder: dict, text: str):
     await m.answer(text)
 
 
+def _record(m: Message, kind: str = "") -> int:
+    """Keep the original file (Telegram file_id) with who/when — visible to the system admin forever."""
+    from .api import record_upload
+    doc = m.document
+    fid = doc.file_id if doc else (m.photo[-1].file_id if m.photo else None)
+    name = (doc.file_name if doc else "") or ("фото" if m.photo else "")
+    mime = (doc.mime_type if doc else "image/jpeg") or ""
+    u = m.from_user
+    who = (u.full_name or "") + (f" (@{u.username})" if u.username else "")
+    try:
+        return record_upload(u.id, who, name, mime, tg_file_id=fid, kind=kind)
+    except Exception as e:
+        print(f"[lumen] archive: {e}", flush=True)
+        return 0
+
+
 async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dict):
     note = await m.answer("Читаю документ…")
     holder["note"] = note
+    up_id = _record(m)
     with session() as s:
         fs = [f.model_dump() for f in s.exec(select(Farm)).all()]
         catalog = sorted({l.name for l in s.exec(select(Line)).all()})
@@ -252,6 +272,10 @@ async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dic
         await note.edit_text(f"Не смог прочитать: {e}")
         return
     warn = ("\n⚠️ " + "\n⚠️ ".join(out["warnings"])) if out.get("warnings") else ""
+    from .api import update_upload
+    update_upload(up_id, kind=out.get("doc_type", ""),
+                  summary=f"{out.get('farm') or ''} {out.get('invoice_no') or ''} MAWB {out.get('awb') or '?'} ${out.get('invoice_total_usd') or ''}")
+    out["upload_id"], out["source_file"] = up_id, f"up:{up_id}"
 
     if out.get("doc_type") == "topup_receipt":
         await note.edit_text(_register_topup(out.get("topup") or {}, m.caption or ""))
@@ -1101,6 +1125,34 @@ async def packing_cmd(m: Message):
                          "(в супергруппе — внутри нужной темы). Убрать: /packing_off там же.")
 
 
+@dp.message(pv, sysf, Command("archive"))
+async def archive_cmd(m: Message):
+    """Last documents anyone sent — with a button to get each original back."""
+    from .api import list_uploads
+    ups = list_uploads(m.from_user.id)[:15]
+    if not ups:
+        await m.answer("Архив пуст.")
+        return
+    lines, rows = [], []
+    for u in ups:
+        mark = "🗑" if u["gone"] else "📎"
+        lines.append(f"{mark} {u['ts']} · {u['user']} · {u['kind_ru']} · {u['summary'] or u['filename']}"
+                     + (f"\n   ↳ {u['status']}" if u["status"] else ""))
+        rows.append([(f"{mark} #{u['id']} {(u['summary'] or u['filename'])[:28]}", f"arch:{u['id']}")])
+    await m.answer("Архив документов (последние 15). Полный список — «Учёт» → Ещё → Архив.\n\n" + "\n".join(lines)[:3800],
+                   reply_markup=_kb(rows))
+
+
+@dp.callback_query(F.data.startswith("arch:"), sysf)
+async def archive_send(c: CallbackQuery):
+    from .api import resend_upload
+    await c.answer()
+    try:
+        await resend_upload(int(c.data.split(":")[1]), c.from_user.id)
+    except Exception as e:
+        await bot.send_message(c.from_user.id, f"Не смог отправить: {e}")
+
+
 @dp.message(pv, wr, Command("pay"))
 async def pay_cmd(m: Message):
     """Show the payment list now (same as the Tue/Wed reminder)."""
@@ -1132,8 +1184,14 @@ def push_text(r: dict) -> str:
     if r.get("error"):
         return "⚠️ " + r["error"]
     txt = f"📦 Отправлено пакингов: {r['sent']} (в {r['chats']} чат(а))"
-    if r["skipped"]:
-        txt += "\nБез MAWB, не отправлены: " + ", ".join(r["skipped"])
+    no_awb = [x for x in r["skipped"] if "детализации" not in x]
+    no_bd = [x for x in r["skipped"] if "детализации" in x]
+    if no_awb:
+        txt += "\nБез MAWB, не отправлены: " + ", ".join(no_awb)
+    if no_bd:
+        awbs = sorted({x.split("детализации ")[-1].rstrip(")") for x in no_bd})
+        txt += ("\nКения — ждут детализацию (файл разбивки ТК Кения) по MAWB " + ", ".join(awbs)
+                + ": " + ", ".join(x.split(" (")[0] for x in no_bd) + ". Пришли файл боту — уйдёт сразу.")
     return txt
 
 

@@ -111,7 +111,7 @@ function go(view, args={}, push=true){ if(push) stack.push([view,args]); render(
 function back(){ stack.pop(); const [v,a]=stack[stack.length-1]||['home',{}]; render(v,a) }
 tg?.BackButton.onClick(back);
 const TABS=[['home','💐','Откупы'],['transit','🚚','В пути'],['stock','📦','Остатки'],['more','⋯','Ещё']];
-const TAB_OF={ledger:'more',marks:'more',home:'home',topup:'home',topupForm:'home',draft:'home',invoice:null,logistics:null,weights:'home',
+const TAB_OF={archive:'more',ledger:'more',marks:'more',home:'home',topup:'home',topupForm:'home',draft:'home',invoice:null,logistics:null,weights:'home',
   transit:'transit',transitInv:'transit',stock:'stock',more:'more',farms:'more',farm:'more',users:'more'};
 let CUR_TAB='home';
 function tab(v){ stack.length=0; go(v) }
@@ -632,6 +632,7 @@ async more(){
     <div class="row" id="m-led"><div class="grow"><div class="t">Расчёты с фермами</div><div class="s">авансы и долги в $</div></div></div>
     <div class="row" id="m-marks"><div class="grow"><div class="t">Маркировки клиентов</div><div class="s">чаты клиентов для статусов грузов</div></div></div>
     <div class="row" id="m-farms"><div class="grow"><div class="t">Плантации</div><div class="s">справочник, правила коробок, нюансы для AI</div></div></div>
+    ${ME.role==='sys'?'<div class="row" id="m-arch"><div class="grow"><div class="t">Архив документов</div><div class="s">всё, что загружали в бота, с исходными файлами</div></div></div>':''}
     ${ME.role==='sys'?'<div class="row" id="m-users"><div class="grow"><div class="t">Пользователи и роли</div><div class="s">кто что видит</div></div></div>':''}
   </div>
   <h2>Маркировка по умолчанию</h2>
@@ -644,6 +645,21 @@ async more(){
   document.getElementById('m-marks').onclick=()=>go('marks');
   document.getElementById('m-led').onclick=()=>go('ledger');
   document.getElementById('m-users')?.addEventListener('click',()=>go('users'));
+  document.getElementById('m-arch')?.addEventListener('click',()=>go('archive'));
+},
+
+// ======================= АРХИВ ДОКУМЕНТОВ (sys) =======================
+async archive(){
+  const list=await api('/uploads');
+  $app.innerHTML=`<h1>Архив</h1>
+  <p class="sub">Каждый документ, который кто-либо загрузил в бота или приложение — даже если инвойс потом удалили. Нажми «Файл» — исходник придёт тебе в чат с ботом.</p>
+  <div class="group">${list.length?list.map(u=>`<div class="row"><div class="grow">
+      <div class="t">${u.gone?'🗑 ':''}${esc(u.summary||u.filename||'документ')}</div>
+      <div class="s">${esc(u.ts)} · ${esc(u.user||'')} · ${esc(u.kind_ru)}${u.filename?' · '+esc(u.filename):''}</div>
+      ${u.status?`<div class="s" style="color:${u.gone?'var(--err)':'var(--ok)'}">${esc(u.status)}</div>`:''}</div>
+      <button data-up="${u.id}" style="padding:8px 10px">Файл</button></div>`).join(''):'<div class="empty">Пока ничего не загружали.</div>'}</div>`;
+  $app.querySelectorAll('[data-up]').forEach(b=>b.onclick=async()=>{b.disabled=true;
+    try{await api(`/uploads/${b.dataset.up}/send`,{method:'POST'});toast('Отправил в чат с ботом')}catch(e){toast(e.message)} b.disabled=false});
 },
 
 // ======================= РАСЧЁТЫ С ФЕРМАМИ =======================
