@@ -1570,9 +1570,11 @@ async def send_correction(inv_id: int, before: dict, why: str):
     buf = _io.BytesIO(); wb.save(buf)
     cap = f"🔁 Корректировка себестоимости · {farm} · MAWB {awb}\n{why}"
     ids = set(_money_people()) | {u["tg_id"] for u in roles.users() if u["role"] == "viewer"}
+    safe_farm = re.sub(r"[^\w\-]+", "_", farm)
+    fname = "Корректировка_" + safe_farm + ".xlsx"
     for uid in ids:
         try:
-            await bot.send_document(uid, BufferedInputFile(buf.getvalue(), f"Корректировка_{re.sub(r'[^\w\-]+', '_', farm)}.xlsx"),
+            await bot.send_document(uid, BufferedInputFile(buf.getvalue(), fname),
                                     caption=cap)
         except Exception:
             pass
