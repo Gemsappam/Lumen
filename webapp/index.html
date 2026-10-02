@@ -570,7 +570,12 @@ async transit(){
       <div class="t">${esc(l.provider||'Фрахт')}</div><div style="margin:3px 0"><span class="pill warn">не оплачен</span></div><div class="s">MAWB ${esc(l.awb)}</div></div>
       <div class="v"><div class="num">$${fmt(l.usd||0,2)}</div><div class="s">≈ ${fmt(l.rub_est)} ₽</div></div>
       <button class="primary" data-pl="${l.id}" style="margin-left:6px;padding:8px 10px">Оплачен</button></div>`).join('')}</div>`:''}
-  <div class="actions"><button id="addT">+ Инвойс в пути</button></div>`;
+  <div class="actions"><button id="addT">+ Инвойс в пути</button><button id="pushP">📦 Пакинги в чаты</button></div>`;
+  document.getElementById('pushP').onclick=async e=>{
+    if(!confirm('Отправить пакинг-листы ВСЕХ грузов в пути (с MAWB) во все чаты пакингов?')) return;
+    e.target.disabled=true; e.target.textContent='Отправляю…';
+    try{ const r=await api('/packing/push',{method:'POST'}); toast(r.text.split('\n')[0]); if(r.text.includes('\n')) alert(r.text) }catch(x){toast(x.message)}
+    e.target.disabled=false; e.target.textContent='📦 Пакинги в чаты'};
   $app.querySelectorAll('[data-ti]').forEach(e=>e.onclick=()=>go('transitInv',{i:v.invoices.find(x=>x.id==e.dataset.ti),v}));
   $app.querySelectorAll('[data-mk]').forEach(e=>e.onclick=async()=>{
     const cur=[...new Set(v.invoices.filter(i=>i.awb===e.dataset.mk).flatMap(i=>(i.client_code||'').split(',').map(x=>x.trim()).filter(Boolean)))].join(', ');
@@ -578,7 +583,7 @@ async transit(){
     await api('/awb/'+encodeURIComponent(e.dataset.mk)+'/markings',{method:'POST',body:{markings:nv.split(',')}}); toast('Маркировки сохранены'); render('transit',{})});
   $app.querySelectorAll('[data-pl]').forEach(b=>b.onclick=ev=>{ev.stopPropagation();payForm({kind:'logistics',id:+b.dataset.pl,usd:v.unpaid_logistics.find(x=>x.id==b.dataset.pl).usd})});
   document.getElementById('addT').onclick=()=>go('invoice',{t:{id:0,date:'в пути'}});
-  if(!ME.can_write) document.getElementById('addT').style.display='none';
+  if(!ME.can_write){ document.getElementById('addT').style.display='none'; document.getElementById('pushP').style.display='none' }
 },
 
 async transitInv({i,v}){

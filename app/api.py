@@ -1378,6 +1378,13 @@ def transit_view(s=None) -> dict:
             s.close()
 
 
+@router.post("/packing/push")
+async def api_push_packing(uid: int = Depends(writer)):
+    from .bot import push_packing_all, push_text
+    r = await push_packing_all()
+    return {"ok": not r.get("error"), "text": push_text(r)}
+
+
 @router.get("/transit")
 def get_transit(uid: int = Depends(user_id)):
     return transit_view()

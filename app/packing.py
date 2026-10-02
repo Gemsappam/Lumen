@@ -79,6 +79,22 @@ def pending() -> list:
         return out
 
 
+def in_transit_all() -> tuple[list, list]:
+    """Every invoice still in transit: (with MAWB -> files, without MAWB -> farms skipped)."""
+    with session() as s:
+        out, skipped = [], []
+        for i in s.exec(select(Invoice)).all():
+            if i.arrived_at:
+                continue
+            if not (i.awb and i.awb.strip()):
+                skipped.append(i.farm)
+                continue
+            ls = s.exec(select(Line).where(Line.invoice_id == i.id)).all()
+            if ls:
+                out.append((i.id, build_xlsx(i, ls), i.farm, i.awb))
+        return out, skipped
+
+
 def mark_sent(inv_id: int):
     with session() as s:
         i = s.get(Invoice, inv_id)

@@ -1077,6 +1077,48 @@ async def pay_cmd(m: Message):
 REMINDER_SLOTS = [(1, 10), (2, 10)]   # (weekday Mon=0, hour MSK): Tuesday 10:00 and Wednesday 10:00
 
 
+async def push_packing_all() -> dict:
+    """«Push»: packing lists of ALL goods in transit (with a MAWB) -> every packing chat, again."""
+    from aiogram.types import BufferedInputFile
+    from . import packing, reader
+    tg, sender = packing.targets(), reader.RBOT
+    if not sender:
+        return {"error": "бот-читатель выключен (нет READER_BOT_TOKEN)"}
+    if not tg:
+        return {"error": "нет чатов для пакингов — добавь @бота-читателя в чат и напиши там /packing_here"}
+    items, skipped = packing.in_transit_all()
+    sent = 0
+    for inv_id, data, farm, awb in items:
+        safe = re.sub(r"[^\w\-]+", "_", f"{farm}_{awb}")
+        ok = False
+        for t in tg:
+            try:
+                await sender.send_document(t["chat_id"], BufferedInputFile(data, f"Packing_{safe}.xlsx"),
+                                           caption=f"📦 Packing list · {farm} · MAWB {awb}",
+                                           message_thread_id=t.get("thread_id"))
+                ok = True
+            except Exception as e:
+                print(f"[lumen] push packing to {t.get('title')}: {e}", flush=True)
+        if ok:
+            packing.mark_sent(inv_id)
+            sent += 1
+    return {"sent": sent, "chats": len(tg), "skipped": skipped}
+
+
+def push_text(r: dict) -> str:
+    if r.get("error"):
+        return "⚠️ " + r["error"]
+    txt = f"📦 Отправлено пакингов: {r['sent']} (в {r['chats']} чат(а))"
+    if r["skipped"]:
+        txt += "\nБез MAWB, не отправлены: " + ", ".join(r["skipped"])
+    return txt
+
+
+@dp.message(pv, wr, Command("push_packing"))
+async def push_packing_cmd(m: Message):
+    await m.answer(push_text(await push_packing_all()))
+
+
 async def send_packing_lists():
     """Every invoice that got a MAWB -> its packing list (.xlsx, no prices) to every registered chat/topic."""
     from aiogram.types import BufferedInputFile
