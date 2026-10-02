@@ -141,11 +141,71 @@ def store_rows(awb_key: str, awb_display: str, country: str, farms: list[dict], 
         ws.column_dimensions[col].width = w
     buf = io.BytesIO(); wb.save(buf)
     (DIR / f"{awb_key}.xlsx").write_bytes(buf.getvalue())
+    from datetime import datetime as _dt
     st = _state()
-    st[awb_key] = {"sent": False, "country": country, "packs": sum(f["packs"] or 0 for f in farms),
+    prev = st.get(awb_key, {})
+    st[awb_key] = {"sent": prev.get("sent", False), "ts": prev.get("ts") or _dt.now().strftime("%Y-%m-%d"),
+                   "skip": prev.get("skip", []), "awb": awb_display, "country": country, "packs": sum(f["packs"] or 0 for f in farms),
                    "kg": round(sum(f.get("kg") or 0 for f in farms), 1), "farms": farms,
                    "arrive": (f"{(eta + timedelta(days=5)):%d.%m}–{(eta + timedelta(days=7)):%d.%m}" if eta else None)}
     _save_state(st)
+
+
+# ---- Ecuador / Colombia: «WEIGHT & DIMENSIONS REPORT» (no AWB inside — it comes in the message text) ----
+def is_weight_report(data: bytes) -> bool:
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        for ws in wb.worksheets:
+            for r in ws.iter_rows(max_row=8, values_only=True):
+                if any("WEIGHT & DIMENSIONS REPORT" in str(v or "").upper() for v in r):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def parse_weight_report(data: bytes) -> dict:
+    """Summary sheet: Exporter | PCS | FB | Actual Weight | Volume Weight. Kg = the larger column by total."""
+    from datetime import datetime, timedelta
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(data), data_only=True)
+    ws = wb["Summary"] if "Summary" in wb.sheetnames else wb.worksheets[0]
+    rows = [list(r) for r in ws.iter_rows(values_only=True)]
+    origin, date = None, None
+    for r in rows:
+        k = str(r[0] or "").strip().lower()
+        if k.startswith("origin"):
+            origin = str(r[1] or "").strip().upper()
+        if k.startswith("shipment date"):
+            v = r[1]
+            if hasattr(v, "strftime"):
+                date = v
+            else:
+                for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d"):
+                    try:
+                        date = datetime.strptime(str(v).strip(), fmt); break
+                    except ValueError:
+                        pass
+    hi = next(i for i, r in enumerate(rows) if str(r[0] or "").strip().lower() == "exporter")
+    h = [str(v or "").strip().lower() for v in rows[hi]]
+    ip = h.index("pcs")
+    ia = next(i for i, x in enumerate(h) if x.startswith("actual weight"))
+    iv = next(i for i, x in enumerate(h) if x.startswith("volume weight"))
+    out = []
+    for r in rows[hi + 1:]:
+        name = str(r[0] or "").strip()
+        if not name or name.upper().startswith(("SUBTOTAL", "TOTAL")):
+            if name.upper().startswith("SUBTOTALS"):
+                break
+            continue
+        out.append({"farm_raw": name, "packs": int(float(r[ip] or 0)),
+                    "act": float(r[ia] or 0), "vol": float(r[iv] or 0)})
+    use = "vol" if sum(x["vol"] for x in out) > sum(x["act"] for x in out) else "act"
+    for x in out:
+        x["kg"] = round(x[use], 2)
+    country = {"UIO": "Эквадор", "GYE": "Эквадор", "BOG": "Колумбия", "MDE": "Колумбия"}.get(origin or "", "Эквадор")
+    return {"rows": out, "country": country, "eta": (date + timedelta(days=1)) if date else None, "use": use}
 
 
 # ---- Ecuador: «prealerta» xlsx (UIO -> AMS) ---------------------------------------------------------
@@ -222,6 +282,41 @@ def caption(awb_key: str, packing_farms: list[str]) -> str:
     if packing_farms:
         lines.append("📦 В файле: детализация + пакинг-листы (" + ", ".join(packing_farms) + ")")
     return "\n".join(lines)[:1024]
+
+
+def missing_invoices(max_days: int = 21) -> list[dict]:
+    """Farms listed in a consolidation list whose invoice for that MAWB hasn't been uploaded yet."""
+    from datetime import datetime, timedelta
+    from sqlmodel import select
+    from .calc import norm_awb
+    from .models import Invoice, session
+    from .api import _norm_name, _farm_keys
+    out = []
+    with session() as s:
+        have = {}
+        for i in s.exec(select(Invoice)).all():
+            have.setdefault(norm_awb(i.awb), set()).add(_norm_name(i.farm))
+        for k, st in _state().items():
+            try:
+                if datetime.now() - datetime.strptime(st.get("ts") or "", "%Y-%m-%d") > timedelta(days=max_days):
+                    continue
+            except ValueError:
+                pass
+            for f in st.get("farms", []):
+                if f["farm"] in st.get("skip", []):
+                    continue
+                keys = _farm_keys(s, f["farm"]) | {_norm_name(f["farm"])}
+                if not (keys & have.get(k, set())):
+                    out.append({"awb_key": k, "awb": st.get("awb") or k, "farm": f["farm"], "packs": f.get("packs"),
+                                "country": st.get("country", ""), "since": st.get("ts", "")})
+    return out
+
+
+def skip_farm(awb_key: str, farm: str):
+    st = _state()
+    if awb_key in st:
+        st[awb_key].setdefault("skip", []).append(farm)
+        _save_state(st)
 
 
 def breakdown_bytes(awb_key: str) -> bytes:

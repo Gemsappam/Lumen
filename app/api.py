@@ -539,6 +539,12 @@ def infer_mawb(farm: str, topup_id: int | None = None):
             # MAWBs whose freight is paid from this top-up go first
             paid_here = {norm_awb(l.awb) for l in s.exec(select(Logistics)).all() if l.topup_id == topup_id}
             cands.sort(key=lambda c: c[0] not in paid_here)
+        if not cands:                  # consolidation lists (boxes only, e.g. Ecuador prealert) also know the farms
+            from . import kbreak
+            for k, st in sorted(kbreak._state().items(), key=lambda x: x[1].get("ts", ""), reverse=True):
+                names = {_norm_name(f["farm"]) for f in st.get("farms", [])}
+                if names & set(keys) and not any((k, kk) in taken for kk in keys):
+                    cands.append((k, None))
     if not cands:
         return None, None, 0
     a, kg = cands[0]
@@ -1750,7 +1756,8 @@ def fill_mawb(out: dict, topup_id: int | None = None):
         return
     out["awb"], out["weight_kg"] = awb, kg
     out["warnings"] = [w for w in out.get("warnings", []) if "MAWB" not in w and "awb" not in w.lower()]
-    out["mawb_note"] = f"MAWB взят из разбивки: {out.get('farm')} {kg:g} кг" + (
+    out["mawb_note"] = (f"MAWB взят из разбивки: {out.get('farm')} {kg:g} кг" if kg else
+                        f"MAWB взят из консолидационного листа: {out.get('farm')}") + (
         f" (подходящих MAWB {n}, взят последний — проверь)" if n > 1 else "")
 
 

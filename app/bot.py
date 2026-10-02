@@ -150,6 +150,18 @@ async def master(m: Message):
         _record(m, "kenya_breakdown")
         await _kenya_breakdown(m, data)
         return
+    if kbreak.is_weight_report(data):
+        _record(m, "consolidation")
+        info = kbreak.parse_weight_report(data)
+        awb = ai.find_mawb(m.caption or "")
+        if not awb:
+            _CONS_WAIT[m.from_user.id] = info
+            await m.answer(f"⚖️ Отчёт о весе: {sum(r['packs'] for r in info['rows'])} кор., "
+                           f"{len(info['rows'])} ферм ({info['country']}). AWB в файле нет — напиши MAWB этого отчёта, "
+                           "например `369-99583094`. В следующий раз можно сразу в подписи к файлу.", parse_mode="Markdown")
+            return
+        await _consolidation(m, awb, info["country"], info["rows"], info["eta"])
+        return
     if kbreak.is_prealert(data):
         _record(m, "consolidation")
         info = kbreak.parse_prealert(data)
@@ -265,6 +277,9 @@ async def _consolidation(m: Message, awb_raw: str, country: str, rows: list, eta
                    + (("\n\n" + _applied_text(w)) if w else "")
                    + (f"\n🛬 Прибытие ориентировочно {arrive}" if arrive else "")
                    + "\n\n📦 В чаты пакингов уйдёт ОДНИМ файлом: детализация + пакинг-листы инвойсов этого MAWB.")
+    from . import kbreak as _kb_
+    await send_packing_lists()
+    await missing_reminder([m.from_user.id])
     if was_sent:
         from . import packing, reader
         k = norm_awb(awb)
@@ -309,6 +324,7 @@ async def _kenya_breakdown(m: Message, data: bytes):
            + (f"\n🛬 Прибытие ориентировочно {kbreak._state().get(norm_awb(awb), {}).get('arrive')}" if info.get("eta") else ""))
     await m.answer(txt)
     await send_packing_lists()
+    await missing_reminder([m.from_user.id])
 
 
 async def _floratrack(m: Message, data: bytes):
@@ -459,6 +475,7 @@ async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dic
 
 # ---------- the «оплачен? → откуп → $» conversation --------------------------------------
 FLOW: dict[int, dict] = {}   # user -> current document in progress
+_CONS_WAIT: dict = {}        # user -> parsed weight report waiting for its MAWB
 
 
 def _flow_docs(flow):
@@ -1102,6 +1119,10 @@ async def set_topup(c: CallbackQuery):
 async def mawb_followup(m: Message):
     """MAWB sent as a separate message right after a document -> goes into that draft.
     MAWB + 'Farm kg' pairs in one message -> a kg breakdown for that MAWB."""
+    info = _CONS_WAIT.pop(m.from_user.id, None)
+    if info:
+        await _consolidation(m, ai.find_mawb(m.text), info["country"], info["rows"], info["eta"])
+        return
     flow = FLOW.get(m.from_user.id)
     if flow and flow.get("awb_wait"):
         awb = ai.find_mawb(m.text)
@@ -1401,6 +1422,45 @@ async def send_packing_lists():
         await _send_items(items, sender, tg)
 
 
+async def missing_reminder(uid_list=None):
+    """Every day: farms from consolidation lists without an uploaded invoice — ask until they appear."""
+    from . import kbreak
+    miss = kbreak.missing_invoices()
+    if not miss:
+        return False
+    by = {}
+    for x in miss:
+        by.setdefault((x["awb_key"], x["awb"], x["country"]), []).append(x)
+    lines, rows = ["❗️ Где инвойсы? По разбивке они есть, а в боте их нет:"], []
+    for (k, awb, country), xs in by.items():
+        lines.append(f"\n✈️ {country} · MAWB {awb}:")
+        for x in xs:
+            lines.append(f"• {x['farm']} — {x['packs']} кор." if x.get("packs") else f"• {x['farm']}")
+            rows.append([(f"🚫 {x['farm']} ({awb[-4:]}) — инвойса не будет", f"miss:{k}:{x['farm'][:40]}")])
+    lines.append("\nКинь инвойсы сюда — сами привяжутся к MAWB. Пока их нет, пакинг этих ферм не уйдёт, а я буду спрашивать каждый день 🙂")
+    for uid in uid_list or _money_people():
+        try:
+            await bot.send_message(uid, "\n".join(lines)[:4000], reply_markup=_kb(rows[:20]))
+        except Exception:
+            pass
+    return True
+
+
+@dp.callback_query(F.data.startswith("miss:"), wr)
+async def missing_skip(c: CallbackQuery):
+    from . import kbreak
+    _, k, farm = c.data.split(":", 2)
+    kbreak.skip_farm(k, farm)
+    await c.answer("Ок, больше не спрашиваю")
+    await c.message.answer(f"Ок, по {farm} инвойса не будет — больше не спрашиваю.")
+
+
+@dp.message(pv, wr, Command("missing"))
+async def missing_cmd(m: Message):
+    if not await missing_reminder([m.from_user.id]):
+        await m.answer("✅ По всем разбивкам инвойсы на месте.")
+
+
 async def scheduler_loop():
     from .api import _settings, SETTINGS, arrive_due
     while True:
@@ -1426,6 +1486,10 @@ async def scheduler_loop():
                 if now.weekday() == wd and now.hour == hh and now.minute < 15:
                     slot = now.strftime(f"%Y-%m-%d-{hh}")
             st = _settings()
+            if now.hour == 11 and now.minute < 15 and st.get("last_missing") != now.strftime("%Y-%m-%d"):
+                SETTINGS.write_text(json.dumps({**st, "last_missing": now.strftime("%Y-%m-%d")}))
+                st = _settings()
+                await missing_reminder()
             if now.weekday() == 1 and now.hour == 10 and now.minute < 15 and st.get("last_bf") != now.strftime("%Y-%m-%d"):
                 SETTINGS.write_text(json.dumps({**st, "last_bf": now.strftime("%Y-%m-%d")}))
                 st = _settings()
