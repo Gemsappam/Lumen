@@ -177,7 +177,15 @@ async def _kenya_breakdown(m: Message, data: bytes):
     col = info["use"]
     per = [{"farm": r["farm"], "kg": round(r[col], 2), "boxes": r["packs"]} for r in info["rows"]]
     w = store_breakdown(awb, per)
+    was_sent = kbreak.is_sent(norm_awb(awb))
     kbreak.store(data, info, norm_awb(awb), [{"farm": r["farm"], "packs": r["packs"], "kg": r[col]} for r in info["rows"]])
+    if was_sent:                      # packings already went out with a provisional breakdown -> send the real one
+        from . import packing, reader
+        if reader.RBOT and packing.targets():
+            k = norm_awb(awb)
+            if await _post(reader.RBOT, packing.targets(), kbreak.breakdown_bytes(k), f"Breakdown_{awb}.xlsx",
+                           "🔄 Обновлённая детализация\n" + kbreak.caption(k, [])):
+                kbreak.mark_sent(k)
     lines = "\n".join(f"• {r['farm']}: {r['packs']} кор. · {r[col]:g} кг" for r in info["rows"])
     txt = (f"📋 Детализация MAWB {awb}: {info['packs']} кор., {info[col]:g} кг "
            f"({'реальный вес' if col == 'weight' else 'объёмный вес'} — он больше: {info['weight']:g} / VW {info['vw']:g})\n"

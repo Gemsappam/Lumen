@@ -551,12 +551,20 @@ async draft({d,tops}){
 },
 
 // ======================= В ПУТИ =======================
-async transit(){
+async transit({seg}={}){
   const v=await api('/transit');
-  const by={}; v.invoices.forEach(i=>(by[i.awb||'без MAWB']??=[]).push(i));
+  const SEG = seg || window.TRANSIT_SEG || 'unpaid';
+  window.TRANSIT_SEG = SEG;
+  const nUn=v.invoices.filter(i=>i.paid_state!=='paid').length, nPd=v.invoices.length-nUn;
+  const shown=v.invoices.filter(i=>SEG==='paid'?i.paid_state==='paid':i.paid_state!=='paid');
+  const by={}; shown.forEach(i=>(by[i.awb||'без MAWB']??=[]).push(i));
   const eta=i=>i.eta?`прибытие ${i.eta.slice(8,10)}.${i.eta.slice(5,7)} ${i.eta.slice(11,16)}`:'';
   $app.innerHTML=`<h1>Груз в пути</h1>
-  <p class="sub">${ME.can_write?`≈ по курсу ${fmt(v.est_rate,2)} (пополнение ${esc(v.est_topup||'—')}). `:''}Приблизительная себестоимость — отклонение до ±10%.</p>
+  <div class="seg" style="display:flex;gap:6px;margin:4px 16px 10px">
+    <button data-seg="unpaid" class="${SEG==='unpaid'?'primary':''}" style="flex:1">🟠 Не оплачены (${nUn})</button>
+    <button data-seg="paid" class="${SEG==='paid'?'primary':''}" style="flex:1">🟢 Оплачены (${nPd})</button></div>
+  <p class="sub">${SEG==='paid'?'Оплаченные грузы, которые ещё едут.':'Неоплаченные грузы в пути — себестоимость приблизительная (±10%).'}
+    ${ME.can_write&&SEG!=='paid'?` ≈ по курсу ${fmt(v.est_rate,2)} (пополнение ${esc(v.est_topup||'—')}).`:''}</p>
   ${Object.keys(by).length?Object.entries(by).map(([awb,list])=>`<h2>${awb==='без MAWB'?'MAWB ещё не известен':'MAWB '+esc(awb)}${list.find(x=>x.eta)?' · '+eta(list.find(x=>x.eta)):''}
       ${awb!=='без MAWB'&&ME.can_write?`<span class="pill" data-mk="${esc(awb)}" style="cursor:pointer;margin-left:6px">🏷 ${esc([...new Set(list.flatMap(i=>(i.client_code||'').split(',').map(x=>x.trim()).filter(Boolean)))].join(', ')||'маркировки')}</span>`:''}</h2>
     <div class="group">${list.map(i=>`<div class="row" data-ti="${i.id}"><div class="grow">
@@ -565,12 +573,17 @@ async transit(){
       <div class="s num">${fmt(i.stems)} ст${i.paid_state==='paid'?'':' · ≈$'+fmt(i.est_usd||0,0)}${i.truck?' · 🚚 '+esc(i.truck):''}</div>
       <div class="s num">${legsOf(i).map(l=>`${l.name} ${fmt(l.per,2)}`).join(' + ')} ₽/ст</div></div>
       <div class="v"><div class="num">${i.approx?'≈ ':''}${fmt(i.avg_rub,2)} ₽</div><div class="s">${i.approx?'±10% · ':''}за стебель</div></div></div>`).join('')}</div>`).join('')
-    :'<div class="empty">Всё прибыло — в пути ничего нет.</div>'}
-  ${v.unpaid_logistics.length?`<h2>Неоплаченная логистика</h2><div class="group">${v.unpaid_logistics.map(l=>`<div class="row"><div class="grow">
+    :`<div class="empty">${SEG==='paid'?'Оплаченных грузов в пути нет.':'Неоплаченных грузов в пути нет.'}</div>`}
+  ${SEG!=='paid'&&v.unpaid_logistics.length?`<h2>Неоплаченная логистика</h2><div class="group">${v.unpaid_logistics.map(l=>`<div class="row"><div class="grow">
       <div class="t">${esc(l.provider||'Фрахт')}</div><div style="margin:3px 0"><span class="pill warn">не оплачен</span></div><div class="s">MAWB ${esc(l.awb)}</div></div>
       <div class="v"><div class="num">$${fmt(l.usd||0,2)}</div><div class="s">≈ ${fmt(l.rub_est)} ₽</div></div>
       <button class="primary" data-pl="${l.id}" style="margin-left:6px;padding:8px 10px">Оплачен</button></div>`).join('')}</div>`:''}
-  <div class="actions"><button id="addT">+ Инвойс в пути</button><button id="pushP">📦 Пакинги в чаты</button></div>`;
+  <div class="actions"><button id="addT">+ Инвойс в пути</button><button id="pushP">📦 Пакинги в чаты</button></div>
+  <div class="actions"><button id="xlsT">📊 Excel по грузам в пути</button></div>`;
+  $app.querySelectorAll('[data-seg]').forEach(b=>b.onclick=()=>render('transit',{seg:b.dataset.seg}));
+  document.getElementById('xlsT').onclick=async e=>{e.target.disabled=true;e.target.textContent='Собираю…';
+    try{await api('/transit/export',{method:'POST'});toast('Excel по грузам в пути отправлен в чат')}catch(x){toast(x.message)}
+    e.target.disabled=false;e.target.textContent='📊 Excel по грузам в пути'};
   document.getElementById('pushP').onclick=async e=>{
     if(!confirm('Отправить пакинг-листы ВСЕХ грузов в пути (с MAWB) во все чаты пакингов?')) return;
     e.target.disabled=true; e.target.textContent='Отправляю…';

@@ -51,12 +51,12 @@ def parse(data: bytes) -> dict:
 
 
 def clean(data: bytes) -> bytes:
-    """The file as-is, minus ETD / ETA columns."""
+    """The file as-is, minus ETD / ETA and Weight / VW columns (boxes only)."""
     from openpyxl import load_workbook
     wb = load_workbook(io.BytesIO(data))
     ws = wb.worksheets[0]
     head = [str(c.value or "").strip().lower() for c in ws[1]]
-    for name in ("eta", "etd"):
+    for name in ("eta", "etd", "weight", "vw"):          # chats see boxes only: no weights, no dates
         if name in head:
             ws.delete_cols(head.index(name) + 1)
             head = [str(c.value or "").strip().lower() for c in ws[1]]
@@ -67,7 +67,14 @@ def clean(data: bytes) -> bytes:
 
 def _state() -> dict:
     from .api import _settings
-    return _settings().get("kenya_bd") or {}
+    st = _settings().get("kenya_bd") or {}
+    bad = [k for k, v in st.items() if v.get("packs") == "?"]        # built from kg by an older version: drop
+    if bad:
+        for k in bad:
+            st.pop(k, None)
+            (DIR / f"{k}.xlsx").unlink(missing_ok=True)
+        _save_state(st)
+    return st
 
 
 def _save_state(st: dict):
@@ -89,42 +96,8 @@ def store(data: bytes, info: dict, awb_key: str, farms: list[dict]):
 
 
 def has(awb_key: str) -> bool:
-    if awb_key in _state() and (DIR / f"{awb_key}.xlsx").exists():
-        return True
-    return _from_weights(awb_key)
-
-
-def _from_weights(awb_key: str) -> bool:
-    """No breakdown FILE for this MAWB, but a kg breakdown was sent earlier (screenshot / text / older bot)
-    -> build the breakdown sheet from it, so the packing lists aren't stuck."""
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill
-    from .models import AwbWeights, session
-    with session() as s:
-        w = s.get(AwbWeights, awb_key)
-        bd = json.loads(w.farm_kg_json or "{}") if w else {}
-    bd = {k: float(v) for k, v in bd.items() if v}
-    if not bd:
-        return False
-    awb = f"{awb_key[:3]}-{awb_key[3:]}" if len(awb_key) == 11 else awb_key
-    wb = Workbook()
-    ws = wb.active
-    for c, h in enumerate(["AWB", "Ферма", "Вес, кг"], 1):
-        x = ws.cell(1, c, h); x.font = Font(name="Arial", bold=True); x.fill = PatternFill("solid", fgColor="D9E1F2")
-    for r, (farm, kg) in enumerate(sorted(bd.items(), key=lambda x: -x[1]), 2):
-        ws.cell(r, 1, awb); ws.cell(r, 2, farm); ws.cell(r, 3, kg)
-    t = len(bd) + 2
-    ws.cell(t, 2, "TOTAL").font = Font(name="Arial", bold=True)
-    ws.cell(t, 3, sum(bd.values())).font = Font(name="Arial", bold=True)
-    for col, wd in zip("ABC", (16, 28, 10)):
-        ws.column_dimensions[col].width = wd
-    buf = io.BytesIO(); wb.save(buf)
-    (DIR / f"{awb_key}.xlsx").write_bytes(buf.getvalue())
-    st = _state()
-    st[awb_key] = {"sent": False, "packs": "?", "kg": round(sum(bd.values()), 1), "arrive": None,
-                   "farms": [{"farm": f, "packs": "?", "kg": k} for f, k in sorted(bd.items(), key=lambda x: -x[1])]}
-    _save_state(st)
-    return True
+    """Kenyan packing lists go ONLY after the TK Kenya breakdown FILE for this MAWB."""
+    return awb_key in _state() and (DIR / f"{awb_key}.xlsx").exists() and bool(_state()[awb_key].get("from_file", True))
 
 
 def is_sent(awb_key: str) -> bool:
@@ -139,12 +112,11 @@ def mark_sent(awb_key: str, sent=True):
 
 
 def caption(awb_key: str, packing_farms: list[str]) -> str:
+    """Chat message: boxes only (no kg)."""
     st = _state().get(awb_key, {})
     awb = f"{awb_key[:3]}-{awb_key[3:]}" if len(awb_key) == 11 else awb_key
-    packs = st.get("packs", "?")
-    lines = [f"📋 Поставка Кения · MAWB {awb}", (f"{packs} кор. · " if packs != "?" else "") + f"{st.get('kg', 0):g} кг"]
-    lines += [f"• {f['farm']} — {f['kg']:g} кг" + (f" · {f['packs']} кор." if f.get("packs") not in ("?", None) else "")
-              for f in st.get("farms", [])]
+    lines = [f"📋 Поставка Кения · MAWB {awb}", f"{st.get('packs', '?')} кор."]
+    lines += [f"• {f['farm']} — {f['packs']} кор." for f in st.get("farms", [])]
     if st.get("arrive"):
         lines.append(f"🛬 Ориентировочное прибытие: {st['arrive']}")
     if packing_farms:

@@ -1,6 +1,7 @@
 import hashlib
 import re
 import hmac
+import io
 import json
 import shutil
 import time
@@ -1473,6 +1474,65 @@ async def api_push_packing(uid: int = Depends(writer)):
     from .bot import push_packing_all, push_text
     r = await push_packing_all()
     return {"ok": not r.get("error"), "text": push_text(r)}
+
+
+@router.post("/transit/export")
+async def export_transit(uid: int = Depends(user_id)):
+    """Excel of all goods in transit: sheets «Не оплачены» / «Оплачены», a row per item, status & cost."""
+    from aiogram.types import BufferedInputFile
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Border, Side
+    from .roles import can_write
+    full = can_write(role_of_(uid))                  # 1С operator: no paid sums
+    v = transit_view()
+    F_, thin = "Arial", Side(style="thin", color="BFBFBF")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    head = ["MAWB", "Ферма", "Маркировка", "Номенклатура", "Стебли", "Цена $", "Цветок ₽/ст", "ТК Кения ₽/ст",
+            "ТК МСК ₽/ст", "Итого ₽/ст", "Сумма ₽", "Статус оплаты", "Пополнение", "Оплачено $", "Машина", "Прибытие", "Точность"]
+    if not full:
+        head = [h for h in head if h not in ("Пополнение", "Оплачено $")]
+    wb = Workbook()
+    wb.remove(wb.active)
+    for title, want in (("Не оплачены", "unpaid"), ("Оплачены", "paid")):
+        ws = wb.create_sheet(title)
+        for c, h in enumerate(head, 1):
+            x = ws.cell(1, c, h); x.font = Font(name=F_, bold=True); x.border = box
+            x.fill = PatternFill("solid", fgColor="FCE4D6" if want == "unpaid" else "E2EFDA")
+        r = 2
+        tot_st = tot_rub = 0
+        for i in [x for x in v["invoices"] if x["paid_state"] == want]:
+            eta = (i.get("eta") or "").replace("T", " ")
+            for l in i["lines"]:
+                row = {"MAWB": i.get("awb") or "—", "Ферма": i["farm"], "Маркировка": i.get("client_code") or "",
+                       "Номенклатура": l["name"], "Стебли": l["stems"], "Цена $": l["price_usd"],
+                       "Цветок ₽/ст": round(l["price_rub"], 4), "ТК Кения ₽/ст": round(l.get("air_rub") or 0, 4),
+                       "ТК МСК ₽/ст": round(l.get("msk_rub") or 0, 4), "Итого ₽/ст": round(l["total_rub"], 4),
+                       "Сумма ₽": round(l["total_rub"] * l["stems"]),
+                       "Статус оплаты": "оплачен" if want == "paid" else "НЕ оплачен",
+                       "Пополнение": i.get("topup") or "", "Оплачено $": i.get("usd_paid") if want == "paid" else i.get("est_usd"),
+                       "Машина": i.get("truck") or "", "Прибытие": eta,
+                       "Точность": "≈ ±10%" if i.get("approx") else "точно"}
+                for c, h in enumerate(head, 1):
+                    x = ws.cell(r, c, row[h]); x.font = Font(name=F_); x.border = box
+                    if h.endswith("₽/ст"):
+                        x.number_format = "#,##0.0000"
+                    elif h == "Сумма ₽":
+                        x.number_format = "#,##0"
+                tot_st += l["stems"]; tot_rub += row["Сумма ₽"]
+                r += 1
+        ws.cell(r, 1, "ИТОГО").font = Font(name=F_, bold=True)
+        ws.cell(r, head.index("Стебли") + 1, tot_st).font = Font(name=F_, bold=True)
+        ws.cell(r, head.index("Сумма ₽") + 1, tot_rub).font = Font(name=F_, bold=True)
+        ws.cell(r, head.index("Сумма ₽") + 1).number_format = "#,##0"
+        for c, w in enumerate([15, 18, 14, 34, 9, 8, 12, 13, 12, 12, 12, 14, 12, 11, 16, 16, 10][:len(head)], 1):
+            ws.column_dimensions[chr(64 + c)].width = w
+        ws.freeze_panes = "A2"
+    buf = io.BytesIO(); wb.save(buf)
+    n_un = sum(1 for x in v["invoices"] if x["paid_state"] != "paid")
+    if BOT:
+        await BOT.send_document(uid, BufferedInputFile(buf.getvalue(), "Грузы_в_пути.xlsx"),
+                                caption=f"🚚 Грузы в пути: не оплачено {n_un}, оплачено {len(v['invoices']) - n_un} инв.")
+    return {"ok": True}
 
 
 @router.get("/transit")
