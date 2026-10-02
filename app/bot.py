@@ -1700,6 +1700,9 @@ async def _truck_event(uid_list, text: str, sent_msk, notify_uid=None):
     from . import clients, reader
     fresh = clients.is_fresh(sent_msk, _msk_now())
     per_client = clients.messages_for(ev) if fresh else {}
+    if fresh:                                   # staff / warehouse chat: the message itself, in our wording
+        from . import staffnotify
+        await staffnotify.post(reader.RBOT, text)
     line = truck.apply(ev, _msk_now(), fresh=fresh)
     await clients.send(reader.RBOT, per_client)
     targets = [notify_uid] if notify_uid else uid_list
@@ -1772,6 +1775,7 @@ async def reader_joined(chat_id: int, title: str, chat_type: str, status: str, r
         kb = _kb([[("🚛 Чат ТК МСК (машины)", f"rj:ft:{chat_id}")],
                   [("📦 Сюда пакинг-листы", f"rj:pk:{chat_id}")],
                   [("👥 Чат клиента (статусы груза)", f"rj:cl:{chat_id}")],
+                  [("🚛 Уведомления по грузам (наш склад/сотрудники)", f"rj:nt:{chat_id}")],
                   [("Ничего, просто так", f"rj:no:{chat_id}")]])
     for uid in roles.sys_ids():
         try:
@@ -1800,6 +1804,14 @@ async def reader_join_choice(c: CallbackQuery):
             ts = [x for x in packing.targets() if not (x["chat_id"] == cid and x.get("thread_id") is None)]
             packing.set_targets(ts + [{"chat_id": cid, "thread_id": None, "title": title}])
             txt = f"✅ В «{title}» будут приходить пакинг-листы."
+    elif what == "nt":
+        from . import staffnotify
+        if ctype == "supergroup":
+            txt = (f"«{title}» — супергруппа с темами. Открой нужную тему и напиши там /notify_here — "
+                   "уведомления по грузам будут приходить в неё.")
+        else:
+            staffnotify.add(cid, None, title)
+            txt = f"✅ В «{title}» будут приходить уведомления по грузам (сообщения ТК МСК в нашем формате)."
     elif what == "cl":
         marks = sorted(clients.registry().keys())
         rows = [[(m, f"rjm:{cid}:{m}")] for m in marks[:20]]

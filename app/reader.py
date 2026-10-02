@@ -45,6 +45,19 @@ def build():
         clients.add_chat(mk, m.chat.id, th, m.chat.title or "")
         await m.reply(f"✅ Статусы грузов с маркировкой {mk} будут приходить сюда.")
 
+    @rdp.message(Command("notify_here"), staff)
+    async def notify_here(m: Message):
+        """Staff / warehouse chat (or a topic): TK MSK truck messages in our wording come here."""
+        from . import staffnotify
+        staffnotify.add(m.chat.id, m.message_thread_id if m.is_topic_message else None, m.chat.title or "")
+        await m.reply("✅ Сюда будут приходить уведомления по грузам: забрали, граница, едет на склад.")
+
+    @rdp.message(Command("notify_off"), staff)
+    async def notify_off(m: Message):
+        from . import staffnotify
+        staffnotify.remove(m.chat.id, m.message_thread_id if m.is_topic_message else None)
+        await m.reply("Уведомления по грузам сюда больше не отправляю.")
+
     @rdp.message(Command("packing_here"), staff)
     async def packing_here(m: Message):
         """In a staff group (or a topic of a supergroup): packing lists will be posted here by this bot."""
