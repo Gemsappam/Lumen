@@ -72,6 +72,9 @@ DOMAIN = """Ты — бухгалтер-логист оптовой компан
   Счёт перевозчика — это НЕ цветы, это логистика (doc_type=freight_invoice).
 - MAWB vs HAWB: нас интересует ТОЛЬКО MAWB (master, обычно формат 3 цифры-8 цифр, напр. 065-4053 8245).
   HAWB (house) игнорируй полностью. В поле awb пиши только MAWB. Если в документе только HAWB — awb=null и warning.
+- Консолидационный лист отправки (SHIPPING LIST / prealerta / breakdown агента: одна AWB, таблица SHIPPER/EXPORTER
+  с количеством коробок PCS и весом) — doc_type=consolidation: awb, origin (BOG/UIO/NBO), eta (YYYY-MM-DD),
+  rows: shipper (как в документе), boxes = PCS (штук коробок), weight (кг, если есть).
 - Скрин покупки валюты («Покупка 1 732,5887 USDT за 152 000,01 RUB», «Запрос на вывод средств, Сумма ...»)
   — это пополнение: doc_type=topup_receipt, заполни topup (rub, usd_bought, usd_withdrawn, order_no = номер заявки).
   Числа в русском формате: пробел — разделитель тысяч, запятая — десятичная.
@@ -109,7 +112,13 @@ PARSE_TOOL = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "doc_type": {"type": "string", "enum": ["farm_invoice", "freight_invoice", "kg_breakdown", "topup_receipt", "awb", "other"]},
+            "doc_type": {"type": "string", "enum": ["farm_invoice", "freight_invoice", "kg_breakdown", "topup_receipt", "consolidation", "awb", "other"]},
+            "consolidation": {"type": ["object", "null"], "description": "only for consolidation", "properties": {
+                "awb": {"type": ["string", "null"]},
+                "origin": {"type": ["string", "null"], "description": "airport code: BOG / UIO / NBO"},
+                "eta": {"type": ["string", "null"], "description": "arrival date YYYY-MM-DD"},
+                "rows": {"type": "array", "items": {"type": "object", "properties": {
+                    "shipper": {"type": "string"}, "boxes": {"type": ["number", "null"]}, "weight": {"type": ["number", "null"]}}}}}},
             "topup": {"type": ["object", "null"], "description": "only for topup_receipt", "properties": {
                 "rub": {"type": ["number", "null"], "description": "RUB paid"},
                 "usd_bought": {"type": ["number", "null"], "description": "USDT/USD bought"},

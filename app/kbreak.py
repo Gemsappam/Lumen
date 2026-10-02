@@ -115,13 +115,84 @@ def _save_state(st: dict):
 def store(data: bytes, info: dict, awb_key: str, farms: list[dict]):
     """farms: [{"farm", "packs", "kg"}] with OUR farm names."""
     from datetime import timedelta
-    names = {r["farm_raw"]: f["farm"] for r, f in zip(info["rows"], farms)}
-    (DIR / f"{awb_key}.xlsx").write_bytes(clean(data, names))
+    store_rows(awb_key, info["awb"] or awb_key, "Кения", farms, info.get("eta"))
+
+
+def store_rows(awb_key: str, awb_display: str, country: str, farms: list[dict], eta=None):
+    """Any consolidation list (Kenya / Ecuador / Colombia) -> our sheet AWB | Ферма | Коробки (+ Общее)."""
+    from datetime import timedelta
+    from openpyxl import Workbook
+    from openpyxl.styles import Border, Font, PatternFill, Side
+    thin = Side(style="thin", color="BFBFBF")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Детализация"
+    for c, h in enumerate(["AWB", "Ферма", "Коробки"], 1):
+        x = ws.cell(1, c, h); x.font = Font(name="Arial", bold=True); x.border = box
+        x.fill = PatternFill("solid", fgColor="D9E1F2")
+    for r, f in enumerate(farms, 2):
+        for c, v in enumerate([awb_display, f["farm"], f["packs"]], 1):
+            x = ws.cell(r, c, v); x.font = Font(name="Arial"); x.border = box
+    t = len(farms) + 2
+    ws.cell(t, 2, "Общее").font = Font(name="Arial", bold=True)
+    ws.cell(t, 3, sum(f["packs"] or 0 for f in farms)).font = Font(name="Arial", bold=True)
+    for col, w in zip("ABC", (16, 30, 10)):
+        ws.column_dimensions[col].width = w
+    buf = io.BytesIO(); wb.save(buf)
+    (DIR / f"{awb_key}.xlsx").write_bytes(buf.getvalue())
     st = _state()
-    eta = info.get("eta")
-    st[awb_key] = {"sent": False, "packs": info["packs"], "kg": info[info["use"]], "farms": farms,
+    st[awb_key] = {"sent": False, "country": country, "packs": sum(f["packs"] or 0 for f in farms),
+                   "kg": round(sum(f.get("kg") or 0 for f in farms), 1), "farms": farms,
                    "arrive": (f"{(eta + timedelta(days=5)):%d.%m}–{(eta + timedelta(days=7)):%d.%m}" if eta else None)}
     _save_state(st)
+
+
+# ---- Ecuador: «prealerta» xlsx (UIO -> AMS) ---------------------------------------------------------
+def is_prealert(data: bytes) -> bool:
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        for ws in wb.worksheets:
+            vals = {str(v).strip().upper() for r in ws.iter_rows(max_row=40, values_only=True) for v in r if v}
+            if "AWB/BL" in vals and "EXPORTER" in vals:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def parse_prealert(data: bytes) -> dict:
+    from datetime import datetime
+    from openpyxl import load_workbook
+    ws = load_workbook(io.BytesIO(data), data_only=True).worksheets[0]
+    rows = [list(r) for r in ws.iter_rows(values_only=True)]
+    awb, eta, origin, out = None, None, None, []
+    for r in rows:
+        cells = [str(v).strip() if v is not None else "" for v in r]
+        up = [c.upper() for c in cells]
+        if "AWB/BL" in up and not awb:
+            awb = next((c for c in cells[up.index("AWB/BL") + 1:] if c), None)
+        if "ORIGIN" in up:
+            origin = next((c for c in cells[up.index("ORIGIN") + 1:] if c), origin)
+        if "AMS" in up and up.index("AMS") + 1 < len(cells):                  # tracking leg ending in AMS
+            i = up.index("AMS")
+            for c in cells[i + 1:]:
+                try:
+                    eta = datetime.strptime(c, "%d/%m/%y"); break
+                except ValueError:
+                    continue
+    hdr = next((i for i, r in enumerate(rows) if any(str(v or "").strip().upper() == "EXPORTER" for v in r)), None)
+    if hdr is not None:
+        h = [str(v or "").strip().upper() for v in rows[hdr]]
+        ie = h.index("EXPORTER")
+        ip = h.index("PCS RECEIVED") if "PCS RECEIVED" in h else (h.index("PCS COORD.") if "PCS COORD." in h else None)
+        for r in rows[hdr + 1:]:
+            name = str(r[ie] or "").strip()
+            if not name or name.upper() == "TOTAL":
+                continue
+            out.append({"farm_raw": name, "packs": int(float(r[ip] or 0)) if ip is not None else 0, "kg": 0.0})
+    return {"awb": awb, "rows": out, "eta": eta, "country": "Колумбия" if origin == "BOG" else "Эквадор"}
 
 
 def has(awb_key: str) -> bool:
@@ -144,7 +215,7 @@ def caption(awb_key: str, packing_farms: list[str]) -> str:
     """Chat message: boxes only (no kg)."""
     st = _state().get(awb_key, {})
     awb = f"{awb_key[:3]}-{awb_key[3:]}" if len(awb_key) == 11 else awb_key
-    lines = [f"📋 Поставка Кения · MAWB {awb}", f"{st.get('packs', '?')} кор."]
+    lines = [f"📋 Поставка {st.get('country') or 'Кения'} · MAWB {awb}", f"{st.get('packs', '?')} кор."]
     lines += [f"• {f['farm']} — {f['packs']} кор." for f in st.get("farms", [])]
     if st.get("arrive"):
         lines.append(f"🛬 Ориентировочное прибытие: {st['arrive']}")

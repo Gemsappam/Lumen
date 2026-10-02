@@ -37,7 +37,10 @@ FORWARDERS = {
 }
 
 
-FARM_ALIASES = {"PjDave": "PJ FLORA,PJ FLOWERS,PJ",
+FARM_ALIASES = {"Кондор (Гортензия)": "CONDOR ANDINO,CÓNDOR ANDINO,CONDOR ANDINO S.A.S,CÓNDOR ANDINO S.A.S,CONDOR",
+                "Plazoleta": "PLAZOLETA BAZZANI,PLAZOLETA BAZZANI S.A.S",
+                "Nintanga": "NINTANGA S.A.",
+                "PjDave": "PJ FLORA,PJ FLOWERS,PJ",
                 "Agriflora": "SIAN FLOWERS-AGRIFLORA,SIAN FLOWERS -AGRIFLORA,Агрифлора,Агри",
                 "Massai": "SIAN FLOWERS-MAASAI,Maasai,Массай,Масаи"}
 

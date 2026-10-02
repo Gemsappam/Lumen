@@ -122,11 +122,10 @@ def pending() -> list:
         for i in s.exec(select(Invoice).where(Invoice.packing_sent == False)).all():  # noqa: E712
             if i.awb and i.awb.strip():
                 k = norm_awb(i.awb)
-                kenya = _is_kenya(s, i)
-                if kenya and not kbreak.has(k):
-                    continue                       # hold: no breakdown for this Kenyan MAWB yet
+                if not kbreak.has(k):
+                    continue                       # hold: no consolidation list for this MAWB yet (any country)
                 if s.exec(select(Line).where(Line.invoice_id == i.id)).first():
-                    out.append((i.id, i.farm, i.awb, k if kenya else None))
+                    out.append((i.id, i.farm, i.awb, k))
         return out
 
 
@@ -142,7 +141,7 @@ def in_transit_all() -> tuple[list, list]:
                 continue
             if s.exec(select(Line).where(Line.invoice_id == i.id)).first():
                 from .calc import norm_awb
-                out.append((i.id, i.farm, i.awb, norm_awb(i.awb) if _is_kenya(s, i) else None))
+                out.append((i.id, i.farm, i.awb, norm_awb(i.awb)))
         return out, skipped
 
 

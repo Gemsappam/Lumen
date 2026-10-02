@@ -145,6 +145,11 @@ async def master(m: Message):
         _record(m, "kenya_breakdown")
         await _kenya_breakdown(m, data)
         return
+    if kbreak.is_prealert(data):
+        _record(m, "consolidation")
+        info = kbreak.parse_prealert(data)
+        await _consolidation(m, info["awb"], info["country"], info["rows"], info["eta"])
+        return
     from .xltext import excel_to_text, looks_like_master
     if not looks_like_master(data):                    # not our учёт file -> it's an invoice in Excel
         text = excel_to_text(data, m.document.file_name)
@@ -157,6 +162,41 @@ async def master(m: Message):
     from .backup import mark_dirty
     mark_dirty()
     await m.answer("Мастер-файл обновлён ✅ (старый сохранён в бэкап)")
+
+
+async def _consolidation(m: Message, awb_raw: str, country: str, rows: list, eta=None):
+    """Ecuador / Colombia consolidation list: boxes per farm (+kg if given) -> packing chats get it before packings."""
+    from . import kbreak
+    from .ai import find_mawb
+    from .calc import norm_awb
+    from .api import resolve_farm
+    awb = find_mawb(awb_raw or "") or awb_raw
+    if not awb or not rows:
+        await m.answer("Не нашёл в листе AWB и строки по фермам.")
+        return
+    with session() as s:
+        for r in rows:
+            f = resolve_farm(s, r["farm_raw"])
+            r["farm"] = f.name if f else r["farm_raw"].title()
+    farms = [{"farm": r["farm"], "packs": int(r.get("packs") or 0), "kg": float(r.get("kg") or 0)} for r in rows]
+    w = None
+    if any(f["kg"] for f in farms):
+        w = store_breakdown(awb, [{"farm": f["farm"], "kg": f["kg"]} for f in farms if f["kg"]])
+    was_sent = kbreak.is_sent(norm_awb(awb))
+    kbreak.store_rows(norm_awb(awb), awb, country, farms, eta)
+    lines = "\n".join(f"• {f['farm']}: {f['packs']} кор." + (f" · {f['kg']:g} кг" if f["kg"] else "") for f in farms)
+    arrive = kbreak._state().get(norm_awb(awb), {}).get("arrive")
+    await m.answer(f"📋 Консолидация {country} · MAWB {awb}: {sum(f['packs'] for f in farms)} кор.\n{lines}"
+                   + (("\n\n" + _applied_text(w)) if w else "")
+                   + (f"\n🛬 Прибытие ориентировочно {arrive}" if arrive else "")
+                   + "\n\n📦 В чаты пакингов уйдёт ОДНИМ файлом: детализация + пакинг-листы инвойсов этого MAWB.")
+    if was_sent:
+        from . import packing, reader
+        k = norm_awb(awb)
+        if reader.RBOT and packing.targets() and await _post(reader.RBOT, packing.targets(), kbreak.breakdown_bytes(k),
+                                                              f"Breakdown_{awb}.xlsx", "🔄 Обновлённая детализация\n" + kbreak.caption(k, [])):
+            kbreak.mark_sent(k)
+    await send_packing_lists()
 
 
 async def _kenya_breakdown(m: Message, data: bytes):
@@ -284,6 +324,24 @@ async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dic
     update_upload(up_id, kind=out.get("doc_type", ""),
                   summary=f"{out.get('farm') or ''} {out.get('invoice_no') or ''} MAWB {out.get('awb') or '?'} ${out.get('invoice_total_usd') or ''}")
     out["upload_id"], out["source_file"] = up_id, f"up:{up_id}"
+
+    if out.get("doc_type") == "consolidation":
+        from datetime import datetime as _dt
+        cons = out.get("consolidation") or {}
+        country = {"BOG": "Колумбия", "MDE": "Колумбия", "UIO": "Эквадор", "GYE": "Эквадор", "NBO": "Кения"}.get(
+            (cons.get("origin") or "").upper(), out.get("country") or "Колумбия")
+        try:
+            eta = _dt.strptime(cons.get("eta") or "", "%Y-%m-%d")
+        except ValueError:
+            eta = None
+        rows = [{"farm_raw": r.get("shipper") or "", "packs": r.get("boxes") or 0, "kg": r.get("weight") or 0}
+                for r in cons.get("rows") or [] if r.get("shipper")]
+        try:
+            await note.delete()
+        except Exception:
+            pass
+        await _consolidation(m, cons.get("awb") or "", country, rows, eta)
+        return
 
     if out.get("doc_type") == "topup_receipt":
         await note.edit_text(_register_topup(out.get("topup") or {}, m.caption or ""))
@@ -1189,7 +1247,7 @@ async def push_packing_all() -> dict:
     from . import kbreak
     held = [it for it in items if it[3] and not kbreak.has(it[3])]
     items = [it for it in items if not (it[3] and not kbreak.has(it[3]))]
-    skipped += [f"{it[1]} (Кения, нет детализации {it[2]})" for it in held]
+    skipped += [f"{it[1]} (нет детализации {it[2]})" for it in held]
     sent = await _send_items(items, sender, tg, resend_breakdown=True)
     return {"sent": sent, "chats": len(tg), "skipped": skipped}
 
@@ -1204,7 +1262,7 @@ def push_text(r: dict) -> str:
         txt += "\nБез MAWB, не отправлены: " + ", ".join(no_awb)
     if no_bd:
         awbs = sorted({x.split("детализации ")[-1].rstrip(")") for x in no_bd})
-        txt += ("\nКения — ждут детализацию (файл разбивки ТК Кения) по MAWB " + ", ".join(awbs)
+        txt += ("\nЖдут консолидационный лист (детализацию по фермам) по MAWB " + ", ".join(awbs)
                 + ": " + ", ".join(x.split(" (")[0] for x in no_bd) + ". Пришли файл боту — уйдёт сразу.")
     return txt
 
@@ -1242,7 +1300,7 @@ async def _send_items(items, sender, tg, resend_breakdown=False) -> int:
         with_bd = bool(kkey) and (resend_breakdown or not kbreak.is_sent(kkey))
         if with_bd:
             data = packing.bundle(ids, kbreak.breakdown_bytes(kkey))
-            ok = await _post(sender, tg, data, f"Kenya_{safe}.xlsx", kbreak.caption(kkey, farms))
+            ok = await _post(sender, tg, data, f"Shipment_{safe}.xlsx", kbreak.caption(kkey, farms))
             if ok:
                 kbreak.mark_sent(kkey)
         else:
