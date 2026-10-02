@@ -89,6 +89,8 @@ class InvoiceIn(BaseModel):
     topup_id: int = 0                  # 0 = not paid yet (груз в пути)
     est_usd: float | None = None       # unpaid: approximate $
     farm_usd: float | None = None      # $ that reached the farm (None = exactly the invoice total)
+    box_mismatch: list[dict] = []      # mixed boxes: varieties ≠ box stems (from the AI)
+    stems_total: float | None = None   # TOTAL row of the invoice (any farm) — checked against the lines
     country: str = ""
     client_code: str = ""              # empty -> default marking (LUMEN)
     invoice_no: str = ""
@@ -283,6 +285,25 @@ def _apply_box_rules(body):
             l.weight_kg = round(total * l.stems / st, 3)
 
 
+def merge_lines(out: dict) -> dict:
+    """Same variety, same length, same price -> one line («Julietta Honey 60cm — 115 ст»), boxes added up."""
+    lines = out.get("lines") or []
+    merged, idx = [], {}
+    for l in lines:
+        k = (_norm_name(l.get("name") or ""), round(float(l.get("price_usd") or 0), 4), (l.get("farm") or "").lower())
+        if k in idx:
+            m = merged[idx[k]]
+            m["stems"] = (m.get("stems") or 0) + (l.get("stems") or 0)
+            if l.get("boxes"):
+                m["boxes"] = (m.get("boxes") or 0) + l["boxes"]
+        else:
+            idx[k] = len(merged)
+            merged.append(dict(l))
+    if len(merged) != len(lines):
+        out["lines"] = merged
+    return out
+
+
 def split_by_farm(out: dict) -> list[dict]:
     """One trader invoice (NextWave) covering several farms -> one sub-invoice per farm."""
     lines = out.get("lines") or []
@@ -366,6 +387,7 @@ def book_document(out: dict, topup_id: int, usd, rub, uid: int, paid: bool = Tru
                          invoice_total_usd=out.get("invoice_total_usd"),
                          usd_paid=usd if paid else 0, rub_paid_override=rub, paid_date=today if paid else "",
                          paid=paid, est_usd=None if paid else usd, farm_usd=farm_usd if paid else None,
+                         box_mismatch=out.get("box_mismatch") or [], stems_total=out.get("stems_total"),
                          note=out.get("mawb_note") or "", source_file=out.get("source_file"), lines=lines)
         return save_invoice(body, None, uid), "invoice"
     if out.get("doc_type") == "freight_invoice":
@@ -825,7 +847,7 @@ def save_invoice(body: InvoiceIn, inv_id: int | None = None, uid: int = Depends(
     if not body.awb:
         body.awb = infer_mawb(body.farm)[0] or ""      # typed by hand without MAWB -> take it from the breakdown
     with session() as s:
-        data = body.model_dump(exclude={"lines"})
+        data = body.model_dump(exclude={"lines", "box_mismatch", "stems_total"})
         inv = s.get(Invoice, inv_id) if inv_id else Invoice(**data)
         if inv_id:
             for k, v in data.items():
@@ -839,6 +861,14 @@ def save_invoice(body: InvoiceIn, inv_id: int | None = None, uid: int = Depends(
         s.commit()
         if not inv.topup_id:
             inv.paid = False
+            s.add(inv); s.commit()
+        dis = [{**x, "resolved": False} for x in (body.box_mismatch or [])]
+        lines_sum = sum(l.stems for l in body.lines)
+        if body.stems_total and abs(lines_sum - body.stems_total) >= 1 and not dis:   # any farm: lines ≠ TOTAL
+            dis.append({"box": "ИТОГО инвойса", "box_stems": body.stems_total, "units": lines_sum,
+                        "varieties": [l.name for l in body.lines], "resolved": False})
+        if dis and not inv.discrepancy_json:
+            inv.discrepancy_json = json.dumps(dis, ensure_ascii=False)
             s.add(inv); s.commit()
         return snapshot(s, inv.topup_id)
 
@@ -1223,7 +1253,7 @@ async def parse(file: UploadFile = File(...), uid: int = Depends(writer)):
     with session() as s:
         fs = [f.model_dump() for f in s.exec(select(Farm)).all()]
         catalog = sorted({l.name for l in s.exec(select(Line)).all()})
-    out = await ai.parse_document(data, mime, fs, catalog)
+    out = merge_lines(await ai.parse_document(data, mime, fs, catalog))
     up = record_upload(uid, "приложение", file.filename or name, mime, local_path=name, kind=out.get("doc_type", ""))
     update_upload(up, summary=f"{out.get('farm') or ''} {out.get('invoice_no') or ''} ${out.get('invoice_total_usd') or ''}".strip())
     out["source_file"] = f"up:{up}"
@@ -1256,6 +1286,20 @@ async def export(tid: int, audience: str | None = None, uid: int = Depends(user_
             raise HTTPException(404)
     names = await export_topups([tid], uid, "", audience=_audience(uid, audience), only=True)
     return {"ok": True, "sheet": names[0] if names else None}
+
+
+def invoice_costs(inv_id: int) -> dict:
+    """{line_id: {name, stems, flower, logi, total}} — current cost of every line of one invoice."""
+    with session() as s:
+        tops, invs, lines, logs = _all(s)
+        res = compute(0, tops, invs, lines, logs, _awb_kg(s))
+    out = {}
+    for l in lines:
+        if l.invoice_id == inv_id:
+            c = res.lines[l.id]
+            out[l.id] = {"name": l.name, "stems": l.stems, "flower": c.price_rub,
+                         "logi": c.air_rub_stem + c.msk_rub_stem, "total": c.price_rub + c.air_rub_stem + c.msk_rub_stem}
+    return out
 
 
 def awb_spread(awb: str) -> list[dict]:

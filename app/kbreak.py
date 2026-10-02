@@ -271,11 +271,18 @@ def mark_sent(awb_key: str, sent=True):
         _save_state(st)
 
 
+FLAGS = {"Кения": "🇰🇪", "Эквадор": "🇪🇨", "Колумбия": "🇨🇴", "Нидерланды": "🇳🇱"}
+
+
+def flag(country: str) -> str:
+    return f"{FLAGS.get(country, '')} {country}".strip()
+
+
 def caption(awb_key: str, packing_farms: list[str]) -> str:
     """Chat message: boxes only (no kg)."""
     st = _state().get(awb_key, {})
     awb = f"{awb_key[:3]}-{awb_key[3:]}" if len(awb_key) == 11 else awb_key
-    lines = [f"📋 Поставка {st.get('country') or 'Кения'} · MAWB {awb}", f"{st.get('packs', '?')} кор."]
+    lines = [f"📋 Поставка {flag(st.get('country') or 'Кения')} · MAWB {awb}", f"{st.get('packs', '?')} кор."]
     lines += [f"• {f['farm']} — {f['packs']} кор." for f in st.get("farms", [])]
     if st.get("arrive"):
         lines.append(f"🛬 Ориентировочное прибытие: {st['arrive']}")

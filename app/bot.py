@@ -273,7 +273,7 @@ async def _consolidation(m: Message, awb_raw: str, country: str, rows: list, eta
     kbreak.store_rows(norm_awb(awb), awb, country, farms, eta)
     lines = "\n".join(f"• {f['farm']}: {f['packs']} кор." + (f" · {f['kg']:g} кг" if f["kg"] else "") for f in farms)
     arrive = kbreak._state().get(norm_awb(awb), {}).get("arrive")
-    await m.answer(f"📋 Консолидация {country} · MAWB {awb}: {sum(f['packs'] for f in farms)} кор.\n{lines}"
+    await m.answer(f"📋 Консолидация {kbreak.flag(country)} · MAWB {awb}: {sum(f['packs'] for f in farms)} кор.\n{lines}"
                    + (("\n\n" + _applied_text(w)) if w else "")
                    + (f"\n🛬 Прибытие ориентировочно {arrive}" if arrive else "")
                    + "\n\n📦 В чаты пакингов уйдёт ОДНИМ файлом: детализация + пакинг-листы инвойсов этого MAWB.")
@@ -398,6 +398,8 @@ async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dic
         catalog = sorted({l.name for l in s.exec(select(Line)).all()})
     try:
         out = await ai.parse_document(data, mime, fs, catalog, note=m.caption or "")
+        from .api import merge_lines
+        out = merge_lines(out)
     except Exception as e:
         await note.edit_text(f"Не смог прочитать: {e}")
         return
@@ -1361,7 +1363,8 @@ async def push_packing_cmd(m: Message):
     if not aw:
         await m.answer("Грузов в пути с MAWB нет.")
         return
-    rows = [[(f"{'✅' if a['has_bd'] else '⏳'} {a['awb']} · {a['country']} · {len(a['farms'])} ферм", f"pp:{a['key']}")] for a in aw]
+    from .kbreak import flag
+    rows = [[(f"{'✅' if a['has_bd'] else '⏳'} {a['awb']} · {flag(a['country'])} · {len(a['farms'])} ферм", f"pp:{a['key']}")] for a in aw]
     rows.append([("📦 Все грузы в пути", "pp:all")])
     await m.answer("Какую поставку отправить в чаты пакингов?\n✅ — есть консолидационный лист, ⏳ — ещё нет (не уйдёт)",
                    reply_markup=_kb(rows))
@@ -1439,7 +1442,8 @@ async def missing_reminder(uid_list=None):
         by.setdefault((x["awb_key"], x["awb"], x["country"]), []).append(x)
     lines, rows = ["❗️ Где инвойсы? По разбивке они есть, а в боте их нет:"], []
     for (k, awb, country), xs in by.items():
-        lines.append(f"\n✈️ {country} · MAWB {awb}:")
+        from .kbreak import flag
+        lines.append(f"\n✈️ {flag(country)} · MAWB {awb}:")
         for x in xs:
             lines.append(f"• {x['farm']} — {x['packs']} кор." if x.get("packs") else f"• {x['farm']}")
             rows.append([(f"🚫 {x['farm']} ({awb[-4:]}) — инвойса не будет", f"miss:{k}:{x['farm'][:40]}")])
@@ -1467,6 +1471,161 @@ async def missing_cmd(m: Message):
         await m.answer("✅ По всем разбивкам инвойсы на месте.")
 
 
+def _discrepancies():
+    """Arrived invoices with an unresolved mixed-box mismatch."""
+    from .models import Invoice
+    out = []
+    with session() as s:
+        for i in s.exec(select(Invoice)).all():
+            if i.arrived_at and i.discrepancy_json:
+                for n, d in enumerate(json.loads(i.discrepancy_json)):
+                    if not d.get("resolved"):
+                        out.append((i, n, d))
+    return out
+
+
+async def discrepancy_alert(uid_list=None):
+    items = _discrepancies()
+    for inv, n, d in items:
+        whole = d["box"] == "ИТОГО инвойса"
+        txt = (f"🚨 ГРУЗ ПРИЕХАЛ — СРОЧНО УЗНАЙ У КЛАДОВЩИКА!\n"
+               + (f"{inv.farm.upper()} · MAWB {inv.awb} · ИНВОЙС {inv.invoice_no or ''}:\n"
+                  f"ПО СТРОКАМ {d['units']:g} СТ, А В ИТОГЕ ИНВОЙСА {d['box_stems']:g} СТ.\n" if whole else
+                  f"{inv.farm.upper()} · MAWB {inv.awb} · КОРОБКА {d['box'].upper()}:\n"
+                  f"ПО СОРТАМ В ИНВОЙСЕ {d['units']:g} СТ, А В КОРОБКЕ {d['box_stems']:g} СТ.\n")
+               + f"СКОЛЬКО ПРИЕХАЛО ПО ФАКТУ?\n\nСорта: {', '.join(d.get('varieties') or [])}\n"
+               + "Себестоимость пока не трогаю — посчитаю, когда ответишь.")
+        kb = _kb([[(f"{d['units']:g} — как по {'строкам' if whole else 'сортам'}", f"dsc:{inv.id}:{n}:u")],
+                  [(f"{d['box_stems']:g} — как в {'итоге' if whole else 'коробке'}", f"dsc:{inv.id}:{n}:b")],
+                  [("Другое число", f"dsc:{inv.id}:{n}:o")]])
+        for uid in uid_list or _money_people():
+            try:
+                await bot.send_message(uid, txt, reply_markup=kb)
+            except Exception:
+                pass
+    return bool(items)
+
+
+_DSC_WAIT: dict = {}     # user -> (inv_id, n) waiting for a typed fact
+
+
+async def _ask_variety(target, inv_id: int, n: int, diff: float):
+    """Fact ≠ variety sum: which variety is short / extra?"""
+    from .models import Line
+    with session() as s:
+        ls = s.exec(select(Line).where(Line.invoice_id == inv_id)).all()
+    word = "МЕНЬШЕ" if diff < 0 else "БОЛЬШЕ"
+    rows = [[(f"{l.name} ({l.stems:g} ст)", f"dsv:{inv_id}:{n}:{l.id}:{diff:g}")] for l in ls]
+    await target(f"Какого сорта {word} на {abs(diff):g} ст? Поправлю количество и пересчитаю себестоимость.", _kb(rows))
+
+
+@dp.callback_query(F.data.startswith("dsc:"), wr)
+async def discrepancy_answer(c: CallbackQuery):
+    from .models import Invoice
+    _, inv_id, n, what = c.data.split(":")
+    inv_id, n = int(inv_id), int(n)
+    with session() as s:
+        d = json.loads(s.get(Invoice, inv_id).discrepancy_json)[n]
+    await c.answer()
+    if what == "u":                      # fact = varieties: lines are already right
+        _resolve(inv_id, n, d["units"])
+        await c.message.edit_text(f"✅ По факту {d['units']:g} ст, как по сортам. Сорта и себестоимость оставляю так "
+                                  f"(ферма выставила за {d['box_stems']:g}, лишние стебли удешевляют партию).")
+        return
+    if what == "b":                      # fact = box: some variety is short
+        await c.message.edit_text(f"По факту {d['box_stems']:g} ст.")
+        await _ask_variety(lambda t, kb: c.message.answer(t, reply_markup=kb), inv_id, n, d["box_stems"] - d["units"])
+        return
+    _DSC_WAIT[c.from_user.id] = (inv_id, n)
+    await c.message.edit_text("Напиши, сколько стеблей приехало по факту в этой коробке, например `245`.", parse_mode="Markdown")
+
+
+async def send_correction(inv_id: int, before: dict, why: str):
+    """«Корректировка себестоимости» + Excel of this farm's invoice (before → after) to owners and the 1С operator."""
+    import io as _io
+    from aiogram.types import BufferedInputFile
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    from .api import invoice_costs
+    from .models import Invoice
+    after = invoice_costs(inv_id)
+    with session() as s:
+        inv = s.get(Invoice, inv_id)
+        farm, awb, no = inv.farm, inv.awb, inv.invoice_no
+    wb = Workbook(); ws = wb.active; ws.title = farm[:28] or "Ферма"
+    ws.append([f"Корректировка себестоимости · {farm} · инвойс {no} · MAWB {awb}"]); ws["A1"].font = Font(bold=True, size=12)
+    ws.append([why]); ws.append([])
+    head = ["Номенклатура", "Стебли было", "Стебли стало", "Себестоимость было, ₽/ст", "Себестоимость стало, ₽/ст", "Разница, ₽/ст"]
+    ws.append(head)
+    for c in range(1, 7):
+        ws.cell(4, c).font = Font(bold=True); ws.cell(4, c).fill = PatternFill("solid", fgColor="D9E1F2")
+    for lid, a in after.items():
+        b = before.get(lid, a)
+        ws.append([a["name"], b["stems"], a["stems"], round(b["total"], 4), round(a["total"], 4), round(a["total"] - b["total"], 4)])
+        if abs(a["total"] - b["total"]) > 0.0001 or a["stems"] != b["stems"]:
+            for c in range(1, 7):
+                ws.cell(ws.max_row, c).fill = PatternFill("solid", fgColor="FFF2CC")
+    for col, w in zip("ABCDEF", (36, 12, 12, 22, 22, 14)):
+        ws.column_dimensions[col].width = w
+    buf = _io.BytesIO(); wb.save(buf)
+    cap = f"🔁 Корректировка себестоимости · {farm} · MAWB {awb}\n{why}"
+    ids = set(_money_people()) | {u["tg_id"] for u in roles.users() if u["role"] == "viewer"}
+    for uid in ids:
+        try:
+            await bot.send_document(uid, BufferedInputFile(buf.getvalue(), f"Корректировка_{re.sub(r'[^\w\-]+', '_', farm)}.xlsx"),
+                                    caption=cap)
+        except Exception:
+            pass
+
+
+@dp.callback_query(F.data.startswith("dsv:"), wr)
+async def discrepancy_variety(c: CallbackQuery):
+    from .models import Line
+    from .api import invoice_costs
+    _, inv_id, n, line_id, diff = c.data.split(":")
+    before = invoice_costs(int(inv_id))
+    with session() as s:
+        l = s.get(Line, int(line_id))
+        l.stems = max(0, l.stems + float(diff))
+        s.add(l); s.commit()
+        name, st = l.name, l.stems
+    with session() as s:
+        from .models import Invoice
+        d = json.loads(s.get(Invoice, int(inv_id)).discrepancy_json)[int(n)]
+    _resolve(int(inv_id), int(n), d["units"] + float(diff))
+    await c.answer()
+    await c.message.edit_text(f"✅ {name}: теперь {st:g} ст. Себестоимость пересчитана по факту.")
+    await send_correction(int(inv_id), before, f"По факту со склада: {name} {'+' if float(diff) > 0 else ''}{float(diff):g} ст "
+                                               f"({d['box']}: в инвойсе {d['units']:g}, приехало {d['units'] + float(diff):g}).")
+
+
+def _resolve(inv_id: int, n: int, fact: float):
+    from .models import Invoice
+    with session() as s:
+        inv = s.get(Invoice, inv_id)
+        ds = json.loads(inv.discrepancy_json)
+        ds[n]["resolved"], ds[n]["fact"] = True, fact
+        inv.discrepancy_json = json.dumps(ds, ensure_ascii=False)
+        s.add(inv); s.commit()
+    from .backup import mark_dirty
+    mark_dirty()
+
+
+@dp.message(pv, wr, F.from_user.id.func(lambda i: i in _DSC_WAIT), F.text.regexp(r"^\s*\d+([.,]\d+)?\s*$"))
+async def discrepancy_typed(m: Message):
+    from .models import Invoice
+    inv_id, n = _DSC_WAIT.pop(m.from_user.id)
+    fact = float(m.text.replace(",", "."))
+    with session() as s:
+        d = json.loads(s.get(Invoice, inv_id).discrepancy_json)[n]
+    diff = fact - d["units"]
+    if abs(diff) < 0.5:
+        _resolve(inv_id, n, fact)
+        await m.answer("✅ Совпадает с сортами — оставляю как есть.")
+        return
+    await _ask_variety(lambda t, kb: m.answer(t, reply_markup=kb), inv_id, n, diff)
+
+
 async def scheduler_loop():
     from .api import _settings, SETTINGS, arrive_due
     while True:
@@ -1479,6 +1638,11 @@ async def scheduler_loop():
             cdone = client_arrivals_due(now.strftime("%Y-%m-%dT%H:%M"))     # TK time + 6 h
             if cdone:
                 await clients.send(reader.RBOT, clients.arrived_messages(cdone))
+            slot3 = now.strftime("%Y-%m-%d-%H") if now.hour in (9, 12, 15, 18, 21) else None
+            if done or (slot3 and _settings().get("last_dsc") != slot3):
+                if slot3:
+                    SETTINGS.write_text(json.dumps({**_settings(), "last_dsc": slot3}))
+                await discrepancy_alert()
             if done:
                 txt = "📦 Прибыло на склад (по сообщению Floratrack +1 ч):\n" + "\n".join(
                     f"• {d['farm']} · MAWB {d['awb']} · {'оплачен' if d['paid'] else 'НЕ оплачен'}" for d in done)

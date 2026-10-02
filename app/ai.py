@@ -84,6 +84,15 @@ DOMAIN = """Ты — бухгалтер-логист оптовой компан
 - Коробки: FB=1, HB=0.5, QB=0.25, EB=0.125. Stems = bunches × stems per bunch. Длина (40cm/50cm/60cm)
   — часть номенклатуры, пиши её в название: "Rose Madam Red 40cm".
 - Гортензии (Кондор, American Flowers): часто одна цена на всё, названия = цвета.
+- СМЕШАННЫЕ КОРОБКИ (Kikwetu и др.): строка коробки вида «MIX 364 … Jumbo Box, Qty 1, Stems 200, Price 0.90»,
+  а под ней подстроки «1Product: Roses Julietta Cerise; Grade: 60 CM; Units: 60». НЕ пиши строку «MIX 364» как
+  номенклатуру — разверни коробку в её сорта: на каждую подстроку отдельная строка lines:
+  name = «Rose <сорт> <длина>cm» (например «Rose Julietta Cerise 60cm»), stems = Units, price_usd = цена строки
+  коробки, boxes = Qty коробки только у ПЕРВОЙ подстроки этой коробки (у остальных null).
+  Обычная строка без подстрок (Roses Apricot Lace 60 CM, 200 ст) — как есть: «Rose Apricot Lace 60cm».
+  Если сумма Units подстрок ≠ Stems коробки — добавь warning «MIX 365: по сортам 250 ст, а в коробке 240» И запись
+  в box_mismatch: box="MIX 365", box_stems=240, units=250, varieties = имена строк lines этой коробки (как ты их назвал).
+- stems_total — число стеблей в строке TOTAL/ИТОГО инвойса, как напечатано (не пересчитывай сам).
 - Positano — это старое название фермы Tessa (Эквадор): всегда пиши farm = "Tessa".
 - Трейдеры: NextWave (NEXTWAVE IMPORTS AND EXPORTS) выставляет ОДИН инвойс за несколько плантаций
   (колонка FARM: "SIAN FLOWERS-AGRIFLORA" = Agriflora, "SIAN FLOWERS-MAASAI" = Massai). Для каждой строки
@@ -148,6 +157,11 @@ PARSE_TOOL = {
                 "per_farm_kg": {"type": "array", "items": {"type": "object", "properties": {
                     "farm": {"type": "string"}, "kg": {"type": "number"}, "boxes": {"type": ["number", "null"]}}}}}},
             "warnings": {"type": "array", "items": {"type": "string"}},
+            "stems_total": {"type": ["number", "null"], "description": "stems in the invoice TOTAL row, as printed"},
+            "box_mismatch": {"type": "array", "description": "mixed boxes whose variety Units don't add up to the box Stems",
+                             "items": {"type": "object", "properties": {
+                                 "box": {"type": "string"}, "box_stems": {"type": "number"}, "units": {"type": "number"},
+                                 "varieties": {"type": "array", "items": {"type": "string"}}}}},
         },
         "required": ["doc_type", "lines", "warnings"],
     },
