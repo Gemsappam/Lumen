@@ -1061,7 +1061,10 @@ async def packing_cmd(m: Message):
     ts = packing.targets()
     txt = ("Пакинг-листы уходят в:\n" + "\n".join(f"• {t['title'] or t['chat_id']}" + (" (тема)" if t.get('thread_id') else "")
                                                   for t in ts)) if ts else "Чаты для пакинг-листов не заданы."
-    await m.answer(txt + "\n\nДобавить чат: добавь меня в группу и напиши там /packing_here "
+    from . import reader
+    who = "бота-читателя" if reader.RBOT else "бота-читателя (сейчас он выключен — нужен READER_BOT_TOKEN)"
+    await m.answer(txt + f"\n\nПакинг-листы отправляет {who}, финансовый бот в чатах не нужен.\n"
+                         "Добавить чат: добавь бота-читателя в группу и напиши там /packing_here "
                          "(в супергруппе — внутри нужной темы). Убрать: /packing_off там же.")
 
 
@@ -1077,16 +1080,17 @@ REMINDER_SLOTS = [(1, 10), (2, 10)]   # (weekday Mon=0, hour MSK): Tuesday 10:00
 async def send_packing_lists():
     """Every invoice that got a MAWB -> its packing list (.xlsx, no prices) to every registered chat/topic."""
     from aiogram.types import BufferedInputFile
-    from . import packing
+    from . import packing, reader
     tg = packing.targets()
-    if not tg:
+    sender = reader.RBOT                      # the neutral bot posts; the finance bot never shows in chats
+    if not tg or not sender:
         return
     for inv_id, data, farm, awb in packing.pending():
         ok = False
         safe = re.sub(r"[^\w\-]+", "_", f"{farm}_{awb}")
         for t in tg:
             try:
-                await bot.send_document(t["chat_id"], BufferedInputFile(data, f"Packing_{safe}.xlsx"),
+                await sender.send_document(t["chat_id"], BufferedInputFile(data, f"Packing_{safe}.xlsx"),
                                         caption=f"📦 Packing list · {farm} · MAWB {awb}",
                                         message_thread_id=t.get("thread_id"))
                 ok = True
@@ -1229,25 +1233,6 @@ async def reader_joined(chat_id: int, title: str, chat_type: str, status: str, r
             await bot.send_message(uid, text, reply_markup=kb)
         except Exception:
             pass
-
-
-@grp.message(Command("packing_here"), F.from_user.id.func(lambda i: roles.can_write(roles.role_of(i))))
-async def packing_here(m: Message):
-    """Type /packing_here in a group (or inside a topic of a supergroup) -> packing lists go here."""
-    from . import packing
-    t = {"chat_id": m.chat.id, "thread_id": m.message_thread_id if m.is_topic_message else None,
-         "title": m.chat.title or ""}
-    ts = [x for x in packing.targets() if not (x["chat_id"] == t["chat_id"] and x.get("thread_id") == t["thread_id"])]
-    packing.set_targets(ts + [t])
-    await m.reply("✅ Сюда будут приходить пакинг-листы (как только у инвойса появится MAWB).")
-
-
-@grp.message(Command("packing_off"), F.from_user.id.func(lambda i: roles.can_write(roles.role_of(i))))
-async def packing_off(m: Message):
-    from . import packing
-    th = m.message_thread_id if m.is_topic_message else None
-    packing.set_targets([x for x in packing.targets() if not (x["chat_id"] == m.chat.id and x.get("thread_id") == th)])
-    await m.reply("Пакинг-листы сюда больше не отправляю.")
 
 
 @grp.message(F.text)

@@ -45,6 +45,23 @@ def build():
         clients.add_chat(mk, m.chat.id, th, m.chat.title or "")
         await m.reply(f"✅ Статусы грузов с маркировкой {mk} будут приходить сюда.")
 
+    @rdp.message(Command("packing_here"), staff)
+    async def packing_here(m: Message):
+        """In a staff group (or a topic of a supergroup): packing lists will be posted here by this bot."""
+        from . import packing
+        t = {"chat_id": m.chat.id, "thread_id": m.message_thread_id if m.is_topic_message else None,
+             "title": m.chat.title or ""}
+        ts = [x for x in packing.targets() if not (x["chat_id"] == t["chat_id"] and x.get("thread_id") == t["thread_id"])]
+        packing.set_targets(ts + [t])
+        await m.reply("✅ Сюда будут приходить пакинг-листы (как только у инвойса появится MAWB).")
+
+    @rdp.message(Command("packing_off"), staff)
+    async def packing_off(m: Message):
+        from . import packing
+        th = m.message_thread_id if m.is_topic_message else None
+        packing.set_targets([x for x in packing.targets() if not (x["chat_id"] == m.chat.id and x.get("thread_id") == th)])
+        await m.reply("Пакинг-листы сюда больше не отправляю.")
+
     @rdp.message(Command("marking_off"), staff)
     async def marking_off(m: Message):
         from . import clients
