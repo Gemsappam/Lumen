@@ -1500,10 +1500,16 @@ def transit_view(s=None) -> dict:
             s.close()
 
 
+@router.get("/packing/awbs")
+def api_packing_awbs(uid: int = Depends(writer)):
+    from .packing import awbs_in_transit
+    return awbs_in_transit()
+
+
 @router.post("/packing/push")
-async def api_push_packing(uid: int = Depends(writer)):
+async def api_push_packing(awb: str | None = None, uid: int = Depends(writer)):
     from .bot import push_packing_all, push_text
-    r = await push_packing_all()
+    r = await push_packing_all(awb or None)
     return {"ok": not r.get("error"), "text": push_text(r)}
 
 

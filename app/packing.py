@@ -129,12 +129,34 @@ def pending() -> list:
         return out
 
 
-def in_transit_all() -> tuple[list, list]:
-    """Every invoice still in transit: (with MAWB -> files, without MAWB -> farms skipped)."""
+def awbs_in_transit() -> list[dict]:
+    """MAWBs with goods in transit — for «which shipment to send to the chats?»."""
+    from .calc import norm_awb
+    from . import kbreak
+    by = {}
+    with session() as s:
+        for i in s.exec(select(Invoice)).all():
+            if i.arrived_at or not (i.awb or "").strip():
+                continue
+            k = norm_awb(i.awb)
+            d = by.setdefault(k, {"key": k, "awb": i.awb, "farms": [], "country": i.country or ""})
+            d["farms"].append(i.farm)
+    st = kbreak._state()
+    for k, d in by.items():
+        d["has_bd"] = kbreak.has(k)
+        d["country"] = (st.get(k) or {}).get("country") or d["country"]
+    return sorted(by.values(), key=lambda d: d["awb"])
+
+
+def in_transit_all(awb_key: str | None = None) -> tuple[list, list]:
+    """Every invoice still in transit (or only of one MAWB): (with MAWB -> items, without MAWB -> farms skipped)."""
+    from .calc import norm_awb
     with session() as s:
         out, skipped = [], []
         for i in s.exec(select(Invoice)).all():
             if i.arrived_at:
+                continue
+            if awb_key and norm_awb(i.awb) != awb_key:
                 continue
             if not (i.awb and i.awb.strip()):
                 skipped.append(i.farm)

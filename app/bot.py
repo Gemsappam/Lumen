@@ -280,12 +280,8 @@ async def _consolidation(m: Message, awb_raw: str, country: str, rows: list, eta
     from . import kbreak as _kb_
     await send_packing_lists()
     await missing_reminder([m.from_user.id])
-    if was_sent:
-        from . import packing, reader
-        k = norm_awb(awb)
-        if reader.RBOT and packing.targets() and await _post(reader.RBOT, packing.targets(), kbreak.breakdown_bytes(k),
-                                                              f"Breakdown_{awb}.xlsx", "🔄 Обновлённая детализация\n" + kbreak.caption(k, [])):
-            kbreak.mark_sent(k)
+    if was_sent:                      # list changed after the shipment went out -> send the whole shipment again
+        await push_packing_all(norm_awb(awb))
     await send_packing_lists()
 
 
@@ -309,13 +305,8 @@ async def _kenya_breakdown(m: Message, data: bytes):
     w = store_breakdown(awb, per)
     was_sent = kbreak.is_sent(norm_awb(awb))
     kbreak.store(data, info, norm_awb(awb), [{"farm": r["farm"], "packs": r["packs"], "kg": r[col]} for r in info["rows"]])
-    if was_sent:                      # packings already went out with a provisional breakdown -> send the real one
-        from . import packing, reader
-        if reader.RBOT and packing.targets():
-            k = norm_awb(awb)
-            if await _post(reader.RBOT, packing.targets(), kbreak.breakdown_bytes(k), f"Breakdown_{awb}.xlsx",
-                           "🔄 Обновлённая детализация\n" + kbreak.caption(k, [])):
-                kbreak.mark_sent(k)
+    if was_sent:                      # list changed after the shipment went out -> send the whole shipment again
+        await push_packing_all(norm_awb(awb))
     lines = "\n".join(f"• {r['farm']}: {r['packs']} кор. · {r[col]:g} кг" for r in info["rows"])
     txt = (f"📋 Детализация MAWB {awb}: {info['packs']} кор., {info[col]:g} кг "
            f"({'реальный вес' if col == 'weight' else 'объёмный вес'} — он больше: {info['weight']:g} / VW {info['vw']:g})\n"
@@ -1330,7 +1321,7 @@ async def pay_cmd(m: Message):
 REMINDER_SLOTS = [(1, 10), (2, 10)]   # (weekday Mon=0, hour MSK): Tuesday 10:00 and Wednesday 10:00
 
 
-async def push_packing_all() -> dict:
+async def push_packing_all(awb_key: str | None = None) -> dict:
     """«Push»: packing lists of ALL goods in transit (with a MAWB) -> every packing chat, again."""
     from aiogram.types import BufferedInputFile
     from . import packing, reader
@@ -1339,7 +1330,7 @@ async def push_packing_all() -> dict:
         return {"error": "бот-читатель выключен (нет READER_BOT_TOKEN)"}
     if not tg:
         return {"error": "нет чатов для пакингов — добавь @бота-читателя в чат и напиши там /packing_here"}
-    items, skipped = packing.in_transit_all()
+    items, skipped = packing.in_transit_all(awb_key)
     from . import kbreak
     held = [it for it in items if it[3] and not kbreak.has(it[3])]
     items = [it for it in items if not (it[3] and not kbreak.has(it[3]))]
@@ -1365,7 +1356,22 @@ def push_text(r: dict) -> str:
 
 @dp.message(pv, wr, Command("push_packing"))
 async def push_packing_cmd(m: Message):
-    await m.answer(push_text(await push_packing_all()))
+    from . import packing
+    aw = packing.awbs_in_transit()
+    if not aw:
+        await m.answer("Грузов в пути с MAWB нет.")
+        return
+    rows = [[(f"{'✅' if a['has_bd'] else '⏳'} {a['awb']} · {a['country']} · {len(a['farms'])} ферм", f"pp:{a['key']}")] for a in aw]
+    rows.append([("📦 Все грузы в пути", "pp:all")])
+    await m.answer("Какую поставку отправить в чаты пакингов?\n✅ — есть консолидационный лист, ⏳ — ещё нет (не уйдёт)",
+                   reply_markup=_kb(rows))
+
+
+@dp.callback_query(F.data.startswith("pp:"), wr)
+async def push_packing_pick(c: CallbackQuery):
+    k = c.data.split(":", 1)[1]
+    await c.answer("Отправляю…")
+    await c.message.edit_text(push_text(await push_packing_all(None if k == "all" else k)))
 
 
 async def _post(sender, tg, data: bytes, fname: str, caption: str) -> bool:
