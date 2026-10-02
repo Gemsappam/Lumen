@@ -18,7 +18,7 @@ SEED = {
     "Кения": ["Zeeflora", "Tambuzi", "Heritage", "Agriflora", "Massai", "Mzurrie (Winchester farm)", "Subati",
               "Kikwetu", "Karen Roses", "Batian", "Black Tulip", "PjDave", "Primarosa", "Red Lands"],
     "Эквадор": ["Tessa", "Nintanga", "Agroterranorte", "Josar Flor", "Tikan", "EC Blooms (Starroses)", "Sand Flowers",
-                "Allegro Farms", "Dayka", "Guaisa (Sunrite)", "Meral Flowers", "Monterosas", "Rosaprima", "Rosas Del Vento"],
+                "Allegro Farms", "Dayka", "Guaisa (Sunrite)", "Meral Flowers", "Monterosas", "Rosaprima", "Rosas Del Viento"],
     "Колумбия": ["Кондор (Гортензия)", "American Flowers", "Plazoleta", "La Conejera", "Serrezuela Flowers"],
 }
 
@@ -37,7 +37,8 @@ FORWARDERS = {
 }
 
 
-FARM_ALIASES = {"Кондор (Гортензия)": "CONDOR ANDINO,CÓNDOR ANDINO,CONDOR ANDINO S.A.S,CÓNDOR ANDINO S.A.S,CONDOR",
+FARM_ALIASES = {"Rosas Del Viento": "TIPANLUIZA LANCHIMBA JUAN MIGUEL,TIPANLUIZA,ROSAS DEL VENTO,Rosas del Viento",
+                "Кондор (Гортензия)": "CONDOR ANDINO,CÓNDOR ANDINO,CONDOR ANDINO S.A.S,CÓNDOR ANDINO S.A.S,CONDOR",
                 "Plazoleta": "PLAZOLETA BAZZANI,PLAZOLETA BAZZANI S.A.S",
                 "Nintanga": "NINTANGA S.A.",
                 "PjDave": "PJ FLORA,PJ FLOWERS,PJ",
@@ -53,6 +54,17 @@ BROKER = {"Tessa": ("Эквадор", "POSITANO,Позитано"), "Plazoleta":
 
 def upsert_forwarders():
     with session() as s:
+        from .models import Invoice
+        old = s.exec(select(Farm).where(Farm.name == "Rosas Del Vento")).first()   # old misspelling -> Rosas Del Viento
+        if old:
+            if s.exec(select(Farm).where(Farm.name == "Rosas Del Viento")).first():
+                s.delete(old)
+            else:
+                old.name = "Rosas Del Viento"; s.add(old)
+            for inv in s.exec(select(Invoice)).all():
+                if inv.farm == "Rosas Del Vento":
+                    inv.farm = "Rosas Del Viento"; s.add(inv)
+            s.commit()
         for name, (country, aliases) in BROKER.items():   # bought through a broker: 3 % in, 7 % on the invoice
             f = s.exec(select(Farm).where(Farm.name == name)).first() or Farm(name=name, country=country)
             f.country = country
