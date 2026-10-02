@@ -271,6 +271,7 @@ async topup({id, snap}){
 // ======================= INVOICE =======================
 async invoice({t, inv, draft}){
   const TOPS = await api('/topups');
+  let LED = {farms:[]}; try{ LED = await api('/ledger') }catch(e){}
   if(!t.id){ t={...t, rate:(TOPS[0]||{}).rate||0, date:t.date||'в пути'} }        // unpaid: ≈ at the last top-up rate
   inv = inv || {topup_id:t.id,country:'',client_code:'',invoice_no:'',invoice_date:'',awb:'',farm:'',weight_kg:null,
     invoice_total_usd:null,usd_paid:'',rub_paid_override:null,alloc_mode:'value',paid:true,paid_date:t.id?t.date:'',note:'',lines:[]};
@@ -300,7 +301,8 @@ async invoice({t, inv, draft}){
   <form id="p" class="group">
     <div class="two"><div class="field"><label>Итог по инвойсу, $ (для справки)</label><input name="invoice_total_usd" inputmode="decimal" value="${inv.invoice_total_usd??''}"></div>
     <div class="field"><label id="usdLbl">Оплачено, $</label><input name="usd_paid" inputmode="decimal" value="${inv.usd_paid??''}"></div></div>
-    <div class="field" id="farmUsdF"><label>Дошло до фермы, $ (пусто = ровно по инвойсу; больше — аванс, меньше — долг)</label><input name="farm_usd" inputmode="decimal" value="${inv.farm_usd??''}"></div>
+    <div class="field" id="farmUsdF"><label>Дошло до фермы, $ (пусто = ровно по инвойсу; больше — аванс, меньше — долг)</label><input name="farm_usd" inputmode="decimal" value="${inv.farm_usd??''}">
+      <div id="farmBal" class="num" style="margin-top:6px;font-weight:600"></div></div>
     <div class="field"><label>Оплачено, ₽ <span id="rubMode" class="pill" style="margin-left:6px"></span></label><input name="rub_paid_override" inputmode="decimal" value="${inv.rub_paid_override??''}"></div>
     <div class="hint" style="padding:0 14px 8px" id="trueRate">Истинный курс = все ₽ за инвойс ÷ $ строк цветов. Комиссия, налог и сборы ложатся на стебли пропорционально цене.</div>
     <div class="field"><label>Как делить ₽ по строкам</label><select name="alloc_mode">
@@ -342,7 +344,28 @@ async invoice({t, inv, draft}){
     const usd=numOrNull(p.usd_paid.value), rub=numOrNull(p.rub_paid_override.value);
     const perStem=p.alloc_mode.value==='stems';
     const tr=document.getElementById('trueRate');
-    if(tr && rub && val && !perStem) tr.textContent=`Истинный курс ${fmt(rub/val,4)} ₽/$ (курс ${fmt(rateNow(),2)} + косты ${fmt(((usd||0)/val-1)*100,1)}%). Все ₽ за инвойс разложены по стеблям пропорционально цене.`;
+    // ledger-aware: invoice is paid by «дошло до фермы»; the rest is debt (or an advance stays at the farm)
+    const T = numOrNull(p.invoice_total_usd.value) || val;
+    const F = numOrNull(p.farm_usd.value) || T;
+    // advance the farm already had: for a saved invoice — what it actually used; for a new one — current advance
+    const fl = LED.farms.find(x=>x.farm.toLowerCase()===(f.farm.value||'').trim().toLowerCase());
+    const A = inv.id ? (inv.ledger?.from_advance||0) : (fl?.advance_usd||0);
+    const fb = document.getElementById('farmBal');
+    if(fb){
+      const d = F + A - T;
+      const how = `инвойс $${fmt(T,2)} − дошло $${fmt(F,2)}` + (A>0.005?` − аванс фермы $${fmt(A,2)}`:'');
+      fb.innerHTML = !T ? '' : Math.abs(d) < 0.01 ? `<span style="color:var(--ok)">✓ Инвойс закрыт полностью</span> <span class="s">(${how.replace(' − дошло',' = дошло').replace('инвойс ','')})</span>`
+        : d < 0 ? `<span style="color:var(--err)">Долг ферме: $${fmt(-d,2)}</span> <span class="s">(${how})</span>`
+        : `<span style="color:var(--ok)">Аванс у фермы: $${fmt(d,2)}</span> <span class="s">(${how}; зачтётся в следующий инвойс)</span>`;
+      if(rub && F){
+        const k = rub / F, r = rateNow();
+        if(k < r*0.98) fb.innerHTML += `<div style="color:var(--warn);margin-top:4px">⚠️ ${fmt(k,2)} ₽ за 1 $ фермы — это меньше курса пополнения ${fmt(r,2)}. Так не бывает: проверь «Оплачено, ₽» и «Дошло до фермы».</div>`;
+      }
+    }
+    if(tr && rub && val && !perStem){
+      const k = rub / F, cost = k * T;                       // debt part ≈ at the same rate until it is paid
+      tr.textContent=`Истинный курс ≈ ${fmt(cost/val,4)} ₽/$: ${fmt(k,2)} ₽ за каждый $, дошедший до фермы (курс ${fmt(rateNow(),2)} + косты ${fmt(((usd||0)/F-1)*100,1)}%).`;
+    }
     inv.lines.forEach((l,i)=>{const c=tb.querySelector(`[data-c="${i}"]`); if(!c) return;
       const flower = !rub ? null : perStem ? (st? rub/st : null) : (val ? (numOrNull(l.price_usd)||0)*rub/val : null);
       const logi=(l.air_rub||0)+(l.msk_rub||0);
@@ -620,13 +643,21 @@ async more(){
 
 // ======================= РАСЧЁТЫ С ФЕРМАМИ =======================
 async ledger(){
-  const r=await api('/ledger');
+  const r=await api('/ledger'); if(!FARMS.length) FARMS=await api('/farms');
   $app.innerHTML=`<h1>Расчёты с фермами</h1>
   <p class="sub">В $, по тому, что дошло до фермы. Аванс — деньги лежат у фермы и зачтутся в следующий инвойс по курсу той оплаты. Долг — мы должны; пока не оплачен, считается ≈ по курсу последнего пополнения.</p>
   <div class="group">${r.farms.length?r.farms.map(f=>`<div class="row"><div class="grow"><div class="t">${esc(f.farm)}</div>
       <div class="s num">${f.advances.map(a=>`аванс $${fmt(a.usd,2)} по ${fmt(a.rate,2)} ₽/$ (оплата ${esc(a.from)})`).join('<br>')}${f.debts.length?(f.advances.length?'<br>':'')+`долг $${fmt(f.debt_usd,2)}`:''}</div></div>
       <div class="v"><div class="num" style="color:${f.balance_usd<0?'var(--err)':'var(--ok)'}"><b>${f.balance_usd<0?'долг ':'аванс '}$${fmt(Math.abs(f.balance_usd),2)}</b></div></div></div>`).join('')
-    :'<div class="empty">Со всеми фермами расчёты закрыты: ни авансов, ни долгов.</div>'}</div>`;
+    :'<div class="empty">Со всеми фермами расчёты закрыты: ни авансов, ни долгов.</div>'}</div>
+  <h2>Баланс, который был до бота</h2>
+  <form id="op" class="group"><div class="field"><label>Ферма</label><input name="farm" list="opf" placeholder="Agriflora"><datalist id="opf">${FARMS.map(f=>`<option value="${esc(f.name)}">`).join('')}</datalist></div>
+    <div class="two"><div class="field"><label>$ (+ аванс у фермы, − наш долг)</label><input name="usd" inputmode="decimal" placeholder="48"></div>
+    <div class="field"><label>Курс ₽/$ (пусто = последнего пополнения)</label><input name="rate" inputmode="decimal"></div></div></form>
+  <div class="actions"><button class="primary" id="opSave">Сохранить начальный баланс</button></div>
+  <p class="hint" style="margin:6px 16px">Например, у фермы лежали $48 от прошлой переплаты: впиши +48. Бот зачтёт их в следующий инвойс этой фермы.</p>`;
+  document.getElementById('opSave').onclick=async()=>{const o=document.getElementById('op'); const b={farm:o.farm.value.trim(),usd:numOrNull(o.usd.value),rate:numOrNull(o.rate.value)};
+    if(!b.farm||b.usd==null) return toast('Ферма и сумма'); await api('/ledger/opening',{method:'POST',body:b}); toast('Сохранено'); render('ledger',{})};
 },
 
 // ======================= МАРКИРОВКИ КЛИЕНТОВ =======================

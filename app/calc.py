@@ -88,6 +88,9 @@ def invoice_total(inv, ls) -> float:
     return float(t) if t and t >= v - 0.01 else v
 
 
+OPENINGS: dict = {}   # farm (lower) -> (usd, rate): balance BEFORE the bot (+ advance at the farm / − our debt)
+
+
 def farm_ledger(topups, invoices, lines_by_inv, est_rate) -> dict:
     """Settlements with each farm in farm-$ (what actually reached the farm).
     payment:  +farm_usd at «₽ per farm-$» = ₽ paid ÷ farm_usd  (agent/bank costs sit in this rate)
@@ -100,11 +103,19 @@ def farm_ledger(topups, invoices, lines_by_inv, est_rate) -> dict:
     by_farm = defaultdict(list)
     for inv in invoices:
         by_farm[(inv.farm or "").strip().lower()].append(inv)
+    names = {k: k for k in by_farm}
+    for k in OPENINGS:
+        by_farm.setdefault(k, [])
     out_inv, farms = {}, {}
     for key, invs in by_farm.items():
         credits = deque()          # [usd_left, rub_per_usd, label]
-        debts = deque()            # [inv_id, usd_left]
+        debts = deque()            # [inv_id | None (old debt), usd_left]
         cost_factor = []           # typical ₽/farm-$ ÷ top-up rate of this farm (to value debts)
+        o_usd, o_rate = (OPENINGS.get(key) or (0, None))[:2]
+        if o_usd > 0.005:
+            credits.append([o_usd, o_rate or est_rate, "начальный баланс"])
+        elif o_usd < -0.005:
+            debts.append([None, -o_usd])
         for inv in sorted(invs, key=lambda x: x.id):
             ls = lines_by_inv[inv.id]
             total = invoice_total(inv, ls)
@@ -125,10 +136,11 @@ def farm_ledger(topups, invoices, lines_by_inv, est_rate) -> dict:
                         d = debts[0]
                         c = credits[0]
                         take = min(d[1], c[0])
-                        old = out_inv[d[0]]
-                        old["rub_cost"] += take * c[1]
-                        old["debt_usd"] -= take
-                        old["parts"].append({"usd": take, "rate": c[1], "src": f"оплата {c[2]}"})
+                        if d[0] is not None:                   # None = old debt from before the bot: no invoice cost
+                            old = out_inv[d[0]]
+                            old["rub_cost"] += take * c[1]
+                            old["debt_usd"] -= take
+                            old["parts"].append({"usd": take, "rate": c[1], "src": f"оплата {c[2]}"})
                         d[1] -= take; c[0] -= take
                         if d[1] <= 1e-6: debts.popleft()
                         if c[0] <= 1e-6: credits.popleft()
@@ -157,7 +169,8 @@ def farm_ledger(topups, invoices, lines_by_inv, est_rate) -> dict:
                 rec["rub_cost"] += rec["debt_usd"] * est_rate * f
         adv = sum(c[0] for c in credits)
         debt = sum(d[1] for d in debts)
-        name = invs[0].farm
+        op = OPENINGS.get(key)
+        name = invs[0].farm if invs else (op[2] if op and len(op) > 2 else key)
         farms[name] = {"farm": name, "advance_usd": round(adv, 2), "debt_usd": round(debt, 2),
                        "balance_usd": round(adv - debt, 2),
                        "advances": [{"usd": round(c[0], 2), "rate": round(c[1], 4), "from": c[2]} for c in credits],

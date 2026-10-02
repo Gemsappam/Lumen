@@ -135,6 +135,9 @@ class FarmIn(BaseModel):
 
 # ---------- helpers ------------------------------------------------------------------
 def _all(s):
+    from . import calc
+    calc.OPENINGS = {f.name.strip().lower(): (f.opening_usd or 0, f.opening_rate, f.name)
+                     for f in s.exec(select(Farm)).all() if f.opening_usd}
     return (s.exec(select(TopUp)).all(), s.exec(select(Invoice)).all(),
             s.exec(select(Line)).all(), s.exec(select(Logistics)).all())
 
@@ -959,8 +962,56 @@ def farm_balance_text(farm: str) -> str:
     return f"⚖️ {farm}: " + "; ".join(parts)
 
 
+def _farm_now(farm: str):
+    v = ledger_view()
+    return next((f for f in v["farms"] if f["farm"].lower() == (farm or "").lower()), None)
+
+
+def farm_balance_projection(farm: str, total: float) -> str:
+    """Before booking an unpaid invoice: «Kikwetu: сейчас аванс $48 → после поставки долг $512.20»."""
+    f = _farm_now(farm)
+    bal = f["balance_usd"] if f else 0.0
+    now = "расчёты закрыты" if abs(bal) < 0.01 else (f"аванс ${bal:,.2f}" if bal > 0 else f"долг ${-bal:,.2f}")
+    after = bal - (total or 0)
+    aft = "ровно" if abs(after) < 0.01 else (f"аванс ${after:,.2f}" if after > 0 else f"долг ${-after:,.2f}")
+    return f"⚖️ {farm}: сейчас {now} → после этой поставки {aft} (инвойс ${total:,.2f})".replace(",", " ")
+
+
+def adjust_farm_balance(farm: str, target_usd: float):
+    """«У фермы другой баланс»: make the balance BEFORE the new invoice equal target (via the opening balance)."""
+    f = _farm_now(farm)
+    cur = f["balance_usd"] if f else 0.0
+    delta = target_usd - cur
+    if abs(delta) < 0.005:
+        return
+    with session() as s:
+        fr = resolve_farm(s, farm, create_country="Кения")
+        fr.opening_usd = (fr.opening_usd or 0) + delta
+        s.add(fr); s.commit()
+    from .backup import mark_dirty
+    mark_dirty()
+
+
 @router.get("/ledger")
 def get_ledger(uid: int = Depends(writer)):
+    return ledger_view()
+
+
+class OpeningIn(BaseModel):
+    farm: str
+    usd: float                 # + advance at the farm / − our debt
+    rate: float | None = None
+
+
+@router.post("/ledger/opening")
+def set_opening(body: OpeningIn, uid: int = Depends(writer)):
+    """Balance with a farm that existed BEFORE the bot (e.g. a $48 advance)."""
+    with session() as s:
+        f = resolve_farm(s, body.farm, create_country="Кения")
+        f.opening_usd, f.opening_rate = body.usd, body.rate
+        s.add(f); s.commit()
+    from .backup import mark_dirty
+    mark_dirty()
     return ledger_view()
 
 

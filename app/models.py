@@ -25,7 +25,9 @@ class Farm(SQLModel, table=True):
     is_forwarder: bool = False             # Expolanka etc.
     notes: str = ""                        # free-text nuances the AI should know
     box_kg_json: str = "{}"                # {"Spray Rose Reflex Bicolour 60cm": 25} — fixed kg per box of these items
-    box_dims_json: str = "{}"              # Expolanka box sizes seen: {"100.48.25": 40} -> volumetric kg = L*W*H/6000
+    box_dims_json: str = "{}"
+    opening_usd: float = 0                 # balance before the bot: + advance at the farm / − our debt, in $
+    opening_rate: Optional[float] = None   # ₽ per $ of that advance (None = rate of the latest top-up)              # Expolanka box sizes seen: {"100.48.25": 40} -> volumetric kg = L*W*H/6000
 
 
 class Invoice(SQLModel, table=True):
@@ -117,6 +119,10 @@ def init_db():
         with engine.begin() as c:
             c.execute(text("ALTER TABLE logistics ADD COLUMN farm_kg_json VARCHAR DEFAULT '{}'"))
     fcols = {c["name"] for c in inspect(engine).get_columns("farm")}
+    if "opening_usd" not in fcols:
+        with engine.begin() as c:
+            c.execute(text("ALTER TABLE farm ADD COLUMN opening_usd FLOAT DEFAULT 0"))
+            c.execute(text("ALTER TABLE farm ADD COLUMN opening_rate FLOAT"))
     if "box_dims_json" not in fcols:
         with engine.begin() as c:
             c.execute(text("ALTER TABLE farm ADD COLUMN box_dims_json VARCHAR DEFAULT '{}'"))
