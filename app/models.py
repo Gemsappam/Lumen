@@ -59,6 +59,8 @@ class Invoice(SQLModel, table=True):
     packing_sent: bool = False             # packing list already posted to the chats
     client_eta: Optional[str] = None       # ISO MSK: when clients are told «прибыл» (TK time + 6 h)
     farm_usd: Optional[float] = None       # $ that actually reached the farm with this payment (None = exactly the invoice)
+    via_broker: bool = False               # bought & paid from the broker balance (Tessa / Plazoleta statement)
+    ext_id: Optional[str] = None           # BiFlorica operation ID
     client_done: bool = False              # «прибыл» already sent to client chats
 
 
@@ -100,6 +102,18 @@ class User(SQLModel, table=True):
     tg_id: int = Field(primary_key=True)
     name: str = ""
     role: str = "viewer"
+
+
+class BrokerDeposit(SQLModel, table=True):
+    """Money put on the broker's exchange (BiFlorica): $ sent from a top-up, $ credited after the 3 % fee."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    ext_id: str = Field(index=True)          # BiFlorica operation ID — re-importing never duplicates
+    account: str = "Брокер"
+    date: str = ""                           # YYYY-MM-DD
+    usd_credited: float = 0                  # what arrived on the exchange (291)
+    usd_sent: float = 0                      # what left the top-up (300)
+    topup_id: Optional[int] = None
+    rub: Optional[float] = None              # None = usd_sent × rate of the top-up
 
 
 class Upload(SQLModel, table=True):
@@ -166,6 +180,10 @@ def init_db():
         with engine.begin() as c:
             c.execute(text("ALTER TABLE invoice ADD COLUMN packing_sent BOOLEAN DEFAULT 0"))
             c.execute(text("UPDATE invoice SET packing_sent = 1"))
+    for col, typ in (("via_broker", "BOOLEAN DEFAULT 0"), ("ext_id", "VARCHAR")):
+        if col not in icols:
+            with engine.begin() as c:
+                c.execute(text(f"ALTER TABLE invoice ADD COLUMN {col} {typ}"))
     if "farm_usd" not in icols:
         with engine.begin() as c:
             c.execute(text("ALTER TABLE invoice ADD COLUMN farm_usd FLOAT"))

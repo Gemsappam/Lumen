@@ -140,6 +140,11 @@ async def master(m: Message):
         _record(m, "floratrack")
         await _floratrack(m, data)
         return
+    from . import biflorica
+    if biflorica.is_statement(data):
+        _record(m, "broker_statement")
+        await _broker_statement(m, data)
+        return
     from . import kbreak
     if kbreak.is_breakdown(data):
         _record(m, "kenya_breakdown")
@@ -164,6 +169,74 @@ async def master(m: Message):
     await m.answer("Мастер-файл обновлён ✅ (старый сохранён в бэкап)")
 
 
+async def _broker_statement(m: Message, data: bytes):
+    """BiFlorica statement: deposits + purchases of Tessa / Plazoleta -> books, balance, cost per stem."""
+    from . import biflorica
+    from .api import farm_balance_text, transit_view
+    from .models import BrokerDeposit, Invoice, TopUp
+    try:
+        r = biflorica.import_statement(data)
+    except Exception as e:
+        await m.answer(f"Не смог разобрать выписку брокера: {e}")
+        return
+    fmt = lambda x: f"{x:,.2f}".replace(",", " ")
+    deps = [o for o in r["ops"] if o["kind"] == "dep"]
+    buys = [o for o in r["ops"] if o["kind"] == "buy"]
+    lines = [f"🏦 Выписка брокера BiFlorica: {len(deps)} пополн., {len(buys)} закупок"
+             + (f" (новых: {len(r['new_dep'])} пополн., {len(r['new_buy']) + len(r['linked'])} закупок)" if r["new_dep"] or r["new_buy"] or r["linked"] else " — всё уже было внесено")]
+    rows = []
+    with session() as s:
+        tdate = {t.id: (t.date, t.rub / t.usd if t.usd else 0) for t in s.exec(select(TopUp)).all()}
+        for did in r["new_dep"]:
+            d = s.get(BrokerDeposit, did)
+            td = tdate.get(d.topup_id, ("?", 0))
+            lines.append(f"💵 {d.date[8:10]}.{d.date[5:7]}: на биржу ${d.usd_credited:g} (отправлено ${d.usd_sent:g}) — из пополнения {td[0]}"
+                         + (f" → {d.usd_sent * td[1] / d.usd_credited:.2f} ₽ за $ на бирже" if td[1] else ""))
+            rows.append([(f"↔️ Другое пополнение для ${d.usd_credited:g} от {d.date[8:10]}.{d.date[5:7]}", f"bfd:{d.id}")])
+    by_farm = {}
+    for o in buys:
+        f = by_farm.setdefault(o["farm"], [0, 0.0])
+        f[0] += o["stems"]; f[1] += o["amount"] + o["fee"]
+    for farm, (st, usd) in by_farm.items():
+        lines.append(f"🌸 {farm}: {st:g} ст на ${fmt(usd)} (с 7%)")
+    tv = {i["id"]: i for i in transit_view()["invoices"]}
+    new = [tv[i] for i in r["new_buy"] + r["linked"] if i in tv]
+    if new:
+        lines.append("\nСебестоимость цветка (без логистики):")
+        for i in new[:8]:
+            l = i["lines"][0] if i["lines"] else None
+            if l:
+                lines.append(f"• {i['farm']} {i['invoice_date']}: {l['name'][:40]} — {l['price_rub']:.2f} ₽/ст")
+    lines.append("\n" + farm_balance_text("Tessa"))
+    await m.answer("\n".join(lines)[:4000], reply_markup=_kb(rows) if rows else None)
+
+
+@dp.callback_query(F.data.startswith("bfd:"), wr)
+async def broker_dep_topup(c: CallbackQuery):
+    from .models import TopUp
+    did = int(c.data.split(":")[1])
+    with session() as s:
+        tops = s.exec(select(TopUp).order_by(TopUp.id.desc()).limit(8)).all()
+    await c.answer()
+    await c.message.answer("Из какого пополнения ушли эти доллары на биржу?",
+                           reply_markup=_kb([[(f"{t.date} · курс {t.rub / t.usd:.2f}", f"bft:{did}:{t.id}")] for t in tops]))
+
+
+@dp.callback_query(F.data.startswith("bft:"), wr)
+async def broker_dep_topup_set(c: CallbackQuery):
+    from .models import BrokerDeposit, TopUp
+    _, did, tid = c.data.split(":")
+    with session() as s:
+        d, t = s.get(BrokerDeposit, int(did)), s.get(TopUp, int(tid))
+        d.topup_id = t.id
+        s.add(d); s.commit()
+        txt = f"✅ ${d.usd_credited:g} от {d.date} — из пополнения {t.date}: {d.usd_sent * t.rub / t.usd / d.usd_credited:.2f} ₽ за $ на бирже"
+    from .backup import mark_dirty
+    mark_dirty()
+    await c.answer()
+    await c.message.edit_text(txt + "\nСебестоимость Tessa / Plazoleta пересчитана.")
+
+
 async def _consolidation(m: Message, awb_raw: str, country: str, rows: list, eta=None):
     """Ecuador / Colombia consolidation list: boxes per farm (+kg if given) -> packing chats get it before packings."""
     from . import kbreak
@@ -182,6 +255,8 @@ async def _consolidation(m: Message, awb_raw: str, country: str, rows: list, eta
     w = None
     if any(f["kg"] for f in farms):
         w = store_breakdown(awb, [{"farm": f["farm"], "kg": f["kg"]} for f in farms if f["kg"]])
+    from .api import assign_awb_by_farms
+    assign_awb_by_farms(awb, [f["farm"] for f in farms])
     was_sent = kbreak.is_sent(norm_awb(awb))
     kbreak.store_rows(norm_awb(awb), awb, country, farms, eta)
     lines = "\n".join(f"• {f['farm']}: {f['packs']} кор." + (f" · {f['kg']:g} кг" if f["kg"] else "") for f in farms)
@@ -1351,6 +1426,17 @@ async def scheduler_loop():
                 if now.weekday() == wd and now.hour == hh and now.minute < 15:
                     slot = now.strftime(f"%Y-%m-%d-{hh}")
             st = _settings()
+            if now.weekday() == 1 and now.hour == 10 and now.minute < 15 and st.get("last_bf") != now.strftime("%Y-%m-%d"):
+                SETTINGS.write_text(json.dumps({**st, "last_bf": now.strftime("%Y-%m-%d")}))
+                st = _settings()
+                for uid in _money_people():
+                    try:
+                        await bot.send_message(uid, "Привет, дорогой! 🌷\nПожалуйста, прогрузи выписку баланса брокера BiFlorica "
+                                                    "по Plazoleta и Tessa (Excel из личного кабинета) — просто кинь файл сюда.\n"
+                                                    "Я сам внесу закупки и пополнения брокера и пересчитаю себестоимость. "
+                                                    "Проверь только, из каких пополнений ушли доллары на биржу — я подскажу.")
+                    except Exception:
+                        pass
             if slot and st.get("last_reminder") != slot:
                 SETTINGS.write_text(json.dumps({**st, "last_reminder": slot}))
                 await payment_reminder()

@@ -143,6 +143,11 @@ def _all(s):
                   for f in farms if (getattr(f, "account", "") or getattr(f, "in_fee_pct", 0) or getattr(f, "markup_pct", 0))}
     calc.OPENINGS = {((getattr(f, "account", "") or f.name).strip().lower()): (f.opening_usd or 0, f.opening_rate, f.name)
                      for f in farms if f.opening_usd}
+    from .models import BrokerDeposit
+    calc.DEPOSITS = s.exec(select(BrokerDeposit)).all()
+    bo = _settings().get("broker_opening")
+    if bo and "брокер" not in calc.OPENINGS:
+        calc.OPENINGS["брокер"] = (bo.get("usd") or 0, bo.get("rate"), "Брокер")
     return (s.exec(select(TopUp)).all(), s.exec(select(Invoice)).all(),
             s.exec(select(Line)).all(), s.exec(select(Logistics)).all())
 
@@ -1472,7 +1477,8 @@ def transit_view(s=None) -> dict:
                 logi_rub += lg * l.stems
             approx = (not i.topup_id) or legs_est or approx_legs
             out.append({**i.model_dump(), "lines": rows, "stems": st, "country": country,
-                        "paid_state": "paid" if i.topup_id else "unpaid", "topup": tdate.get(i.topup_id),
+                        "paid_state": "paid" if (i.topup_id or getattr(i, "via_broker", False)) else "unpaid",
+                        "topup": tdate.get(i.topup_id) or ("брокер" if getattr(i, "via_broker", False) else None),
                         "rub_goods": round(res.invoice_rub.get(i.id) or flower_rub), "rub_logi": round(logi_rub),
                         "avg_rub": round((flower_rub + logi_rub) / st, 2), "approx": approx,
                         "logi_source": ("; ".join(notes) or "нет данных").replace("Expolanka", "ТК Кения").replace("Floratrack", "ТК МСК"),
@@ -1675,6 +1681,21 @@ def client_arrivals_due(now_iso: str) -> list:
                 out.append({"awb": i.awb})
         s.commit()
     return out
+
+
+def assign_awb_by_farms(awb: str, farms: list[str]) -> list[str]:
+    """Consolidation list without weights: in-transit invoices of these farms that have no MAWB get this one."""
+    from .ai import find_mawb
+    awb = find_mawb(awb) or awb
+    done = []
+    with session() as s:
+        for i in sorted(s.exec(select(Invoice)).all(), key=lambda x: -x.id):
+            if not (i.awb or "").strip() and not i.arrived_at and i.farm in farms and i.farm not in done:
+                i.awb = awb; s.add(i); done.append(i.farm)
+        s.commit()
+    from .backup import mark_dirty
+    mark_dirty()
+    return done
 
 
 def set_truck(awb: str, truck: str) -> list[str]:

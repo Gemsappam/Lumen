@@ -90,6 +90,17 @@ def invoice_total(inv, ls) -> float:
 
 OPENINGS: dict = {}   # farm/account (lower) -> (usd, rate, name): balance BEFORE the bot
 RULES: dict = {}      # farm (lower) -> {"account", "in_fee", "markup"} (brokers: Tessa / Plazoleta)
+DEPOSITS: list = []   # BrokerDeposit rows (money put on the exchange)
+
+
+def _d(s: str):
+    from datetime import datetime
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime((s or "").strip()[:10], fmt)
+        except ValueError:
+            pass
+    return None
 
 
 def _rule(farm: str) -> dict:
@@ -112,6 +123,10 @@ def farm_ledger(topups, invoices, lines_by_inv, est_rate) -> dict:
     names = {k: k for k in by_farm}
     for k in OPENINGS:
         by_farm.setdefault(k, [])
+    deps = defaultdict(list)
+    for d in DEPOSITS:
+        deps[(d.account or "").strip().lower()].append(d)
+        by_farm.setdefault((d.account or "").strip().lower(), [])
     out_inv, farms = {}, {}
     for key, invs in by_farm.items():
         credits = deque()          # [usd_left, rub_per_usd, label]
@@ -122,7 +137,32 @@ def farm_ledger(topups, invoices, lines_by_inv, est_rate) -> dict:
             credits.append([o_usd, o_rate or est_rate, "начальный баланс"])
         elif o_usd < -0.005:
             debts.append([None, -o_usd])
-        for inv in sorted(invs, key=lambda x: x.id):
+        if deps.get(key):     # broker: deposits and purchases in date order
+            from datetime import datetime as _dt
+            far = _dt(2100, 1, 1)
+            events = [(_d(d.date) or far, 0, d.id, "dep", d) for d in deps[key]] + \
+                     [(_d(i.invoice_date) or far, 1, i.id, "inv", i) for i in invs]
+            events = [(e[3], e[4]) for e in sorted(events, key=lambda e: e[:3])]
+        else:
+            events = [("inv", i) for i in sorted(invs, key=lambda x: x.id)]
+        for kind, inv in events:
+            if kind == "dep":
+                t = tmap.get(inv.topup_id)
+                rub = inv.rub if inv.rub else (inv.usd_sent * rate_of(t) if t else inv.usd_sent * est_rate)
+                if inv.usd_credited > 0:
+                    rpu = rub / inv.usd_credited
+                    credits.append([inv.usd_credited, rpu, f"пополнение брокера {inv.date}"])
+                    while debts and credits:
+                        d0, c0 = debts[0], credits[0]
+                        take = min(d0[1], c0[0])
+                        if d0[0] is not None:
+                            old = out_inv[d0[0]]
+                            old["rub_cost"] += take * c0[1]; old["debt_usd"] -= take
+                            old["parts"].append({"usd": take, "rate": c0[1], "src": c0[2]})
+                        d0[1] -= take; c0[0] -= take
+                        if d0[1] <= 1e-6: debts.popleft()
+                        if c0[0] <= 1e-6: credits.popleft()
+                continue
             ls = lines_by_inv[inv.id]
             rule = _rule(inv.farm)
             total = invoice_total(inv, ls) * (1 + rule.get("markup", 0) / 100)   # broker: +7 % on the invoice
@@ -213,7 +253,7 @@ def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result
     led = farm_ledger(topups, invoices, lines_by_inv, est_rate)
     res.ledger = led["farms"]
     for inv in invoices:
-        unpaid = not inv.topup_id
+        unpaid = not inv.topup_id and not getattr(inv, "via_broker", False)
         r = est_rate if unpaid else rate_of(tmap.get(inv.topup_id))
         usd = (inv.usd_paid or getattr(inv, "est_usd", None) or 0) if unpaid else inv.usd_paid
         rub = inv.rub_paid_override if (inv.rub_paid_override is not None and not unpaid) else round(usd * r)
@@ -242,6 +282,11 @@ def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result
             res.rub_spent += rub
             if inv.rub_paid_override is None:
                 res.warnings.append(f"{inv.farm}: сумма в ₽ не внесена — взял $ × курс пополнения")
+
+    for d in DEPOSITS:
+        if d.topup_id == topup_id:
+            res.usd_spent += d.usd_sent or 0
+            res.rub_spent += d.rub or round((d.usd_sent or 0) * rate)
 
     # ---- logistics -----------------------------------------------------------
     inv_by_awb = defaultdict(list)
