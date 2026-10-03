@@ -364,6 +364,35 @@ def _boxes_from_raw(lines: list) -> list:
     return out
 
 
+def needs_box_detail(d: dict) -> bool:
+    """No box-by-box layout in the invoice (and it can't be derived cleanly) -> ask for a box breakdown."""
+    if d.get("doc_type") != "farm_invoice" or d.get("boxes_from_ai"):
+        return False
+    bx = d.get("boxes_detail") or []
+    return not bx or any(b.get("even") is False for b in bx)
+
+
+def find_invoice_id(d: dict):
+    with session() as s:
+        cands = [i for i in s.exec(select(Invoice)).all()
+                 if (d.get("source_file") and i.source_file == d["source_file"] and _norm_name(i.farm) == _norm_name(d.get("farm") or i.farm))
+                 or (d.get("invoice_no") and i.invoice_no == d["invoice_no"] and _norm_name(i.farm) == _norm_name(d.get("farm") or ""))]
+        return max(cands, key=lambda i: i.id).id if cands else None
+
+
+def set_box_detail(inv_id: int, boxes: list) -> str:
+    with session() as s:
+        inv = s.get(Invoice, inv_id)
+        inv.boxes_json = json.dumps(boxes, ensure_ascii=False)
+        s.add(inv); s.commit()
+        n = sum(int(b.get("qty") or 1) for b in boxes)
+        out = f"📦 Детализация по коробкам для {inv.farm} № {inv.invoice_no or ''} сохранена: {n} кор."
+        key = norm_awb(inv.awb) if inv.awb else None
+    from .backup import mark_dirty
+    mark_dirty()
+    return out, key
+
+
 def find_same_invoice(d: dict):
     """A farm invoice with this farm + number is already booked -> {id, farm, invoice_no, where}."""
     no = re.sub(r"\D", "", d.get("invoice_no") or "")
@@ -424,6 +453,7 @@ def merge_lines(out: dict) -> dict:
     lines = out.get("lines") or []
     for l in lines:                              # «Hydrangea Green Premium» -> «Hydrangea Green»
         l["name"] = re.sub(r"\s+\b(premium|standard|std)\b", "", l.get("name") or "", flags=re.I).strip()
+    out["boxes_from_ai"] = bool(out.get("boxes_detail"))
     if not out.get("boxes_detail"):
         out["boxes_detail"] = _boxes_from_raw(lines)  # BEFORE merging: box structure is still intact
     mixes = [l.get("name") for l in lines if re.search(r"\b(mix|assorted|select|surtido)\b", l.get("name") or "", re.I)]

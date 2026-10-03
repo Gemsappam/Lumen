@@ -405,6 +405,22 @@ def _record(m: Message, kind: str = "") -> int:
 
 
 async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dict):
+    if m.from_user.id in BOXWAIT:
+        iid = BOXWAIT.pop(m.from_user.id)
+        note = await m.answer("Читаю детализацию по коробкам…")
+        holder["note"] = note
+        from .api import set_box_detail, _boxes_from_raw
+        out = await ai.parse_document(data, mime, [], [], note="Это детализация по коробкам (packing list) к уже внесённому "
+                                      "инвойсу: заполни boxes_detail — что лежит в каждой коробке.")
+        boxes = out.get("boxes_detail") or _boxes_from_raw(out.get("lines") or [])
+        if not boxes:
+            await _send(m.from_user.id, "Не нашёл в документе раскладку по коробкам. Пришли другой файл.", None, note)
+            BOXWAIT[m.from_user.id] = iid
+            return
+        txt, key = set_box_detail(iid, boxes)
+        edited = await refresh_shipment(key, "добавлена детализация по коробкам") if key else 0
+        await _send(m.from_user.id, txt + ("\n🔄 Пакинг в чатах обновлён." if edited else ""), None, note)
+        return
     note = await m.answer("Читаю документ…")
     holder["note"] = note
     up_id = _record(m)
@@ -493,6 +509,19 @@ async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dic
 
 
 CORR: dict = {}       # user -> pending «is it a correction?»
+BOXWAIT: dict = {}    # user -> invoice id waiting for its box breakdown file
+
+
+@dp.callback_query(F.data.startswith("bx:"), wr)
+async def box_detail_answer(c: CallbackQuery):
+    _, what, iid = c.data.split(":")
+    await c.answer()
+    if what == "yes":
+        BOXWAIT[c.from_user.id] = int(iid)
+        await c.message.edit_text("Жду детализацию по коробкам: пришли файл, фото или PDF (packing list фермы, "
+                                  "раскладку по коробкам). Следующий документ от тебя возьму как детализацию к этому инвойсу.")
+    else:
+        await c.message.edit_text("Ок, без детализации. В пакинге коробки будут по строкам инвойса.")
 
 
 async def _start_flow(uid: int, subs: list, out: dict, caption: str, note, head: str):
@@ -687,7 +716,7 @@ async def _book_flow(uid: int, head: str, note):
             t = s.get(TopUp, flow["topup"])
     pays = flow["pays"] + [None] * (len(docs) - len(flow["pays"]))
     farm_usd = (flow.get("farm") or []) + [None] * len(docs)
-    out = []
+    out, ask_boxes = [], []
     for n, ((p, d), pr) in enumerate(zip(docs, pays)):
         usd, rub = pr or (None, None)
         if d.get("doc_type") == "farm_invoice":
@@ -700,9 +729,18 @@ async def _book_flow(uid: int, head: str, note):
         pre = f"{d['farm']}: " if len(docs) > 1 else ""
         out.append(pre + (_booked_text(snap, d, kind, t, uid) if t else _transit_text(snap, d, kind)))
         if d.get("doc_type") == "farm_invoice":
-            from .api import farm_balance_text
+            from .api import farm_balance_text, find_invoice_id, needs_box_detail
             out[-1] += "\n" + farm_balance_text(d.get("farm") or "")
+            if needs_box_detail(d):
+                iid = find_invoice_id(d)
+                if iid:
+                    ask_boxes.append((iid, d.get("farm") or ""))
     await _send(uid, head + "\n\n".join(out), None, note)
+    for iid, farm in ask_boxes:
+        await bot.send_message(uid, f"📦 В инвойсе {farm} НЕТ детализации по коробкам (что в какой коробке).\n"
+                                    "Помоги складу — скинешь детализацию по коробкам?",
+                               reply_markup=_kb([[("📎 Да, сейчас скину", f"bx:yes:{iid}")],
+                                                 [("Нет, без неё", f"bx:no:{iid}")]]))
     await _flush_export(uid, "📊 Логистика легла на товар из прошлого пополнения.")
 
 
@@ -1526,9 +1564,12 @@ async def _send_items(items, sender, tg, resend_breakdown=False) -> int:
     from . import kbreak, packing
     groups = OrderedDict()
     for inv_id, farm, awb, kkey in sorted(items, key=lambda x: (x[2] or "", x[0])):
-        if not resend_breakdown and packing.already_posted(inv_id):
-            packing.mark_sent(inv_id)              # exactly this packing is already in the chats — don't repeat
+        if not resend_breakdown and packing.ever_posted(inv_id):
+            packing.mark_sent(inv_id)              # this farm's packing for this MAWB is already in the chats
+            print(f"[lumen] auto packing: skip {farm} {awb} (уже был в чатах)", flush=True)
             continue
+        if not resend_breakdown:
+            print(f"[lumen] auto packing: send {farm} {awb} inv#{inv_id}", flush=True)
         groups.setdefault((awb, kkey), []).append((inv_id, farm))
     sent = 0
     for (awb, kkey), invs in groups.items():
@@ -1763,12 +1804,16 @@ async def discrepancy_typed(m: Message):
     await _ask_variety(lambda t, kb: m.answer(t, reply_markup=kb), inv_id, n, diff)
 
 
+_STARTED = time.time()
+
+
 async def scheduler_loop():
     from .api import _settings, SETTINGS, arrive_due
     while True:
         try:
             now = _msk_now()
-            await send_packing_lists()
+            if time.time() - _STARTED > 120:          # no automatic posting right after a restart
+                await send_packing_lists()
             done = arrive_due(now.strftime("%Y-%m-%dT%H:%M"))
             from . import clients, reader
             from .api import client_arrivals_due

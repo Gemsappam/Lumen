@@ -260,6 +260,7 @@ async def lifespan(app):
             srv.install_signal_handlers = lambda: None
             tasks.append(asyncio.create_task(srv.serve()))
             opened.append(p)
+    print(f"[lumen] версия: {VERSION}", flush=True)
     print(f"[lumen] основной порт {main}, доп. порты: {opened}", flush=True)
 
     if bot:
@@ -298,6 +299,9 @@ async def lifespan(app):
             await asyncio.wait_for(backup.flush(bot), timeout=20)
         except Exception as e:
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
+
+
+VERSION = "2026-10-03 · пакинги без повторов + детализация коробок"
 
 
 async def _once_recalc_true_rate():

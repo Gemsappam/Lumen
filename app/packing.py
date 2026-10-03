@@ -271,6 +271,13 @@ def signature(inv_id: int) -> tuple[str, str]:
         return f"{norm_awb(i.awb)}|{i.farm}", hashlib.md5((body + (i.boxes_json or "")).encode()).hexdigest()
 
 
+def ever_posted(inv_id: int) -> bool:
+    """Any packing of this farm for this MAWB was already posted (whatever the content)."""
+    from .api import _settings
+    k, _h = signature(inv_id)
+    return bool(k) and k in (_settings().get("packing_sigs") or {})
+
+
 def already_posted(inv_id: int) -> bool:
     from .api import _settings
     k, h = signature(inv_id)
