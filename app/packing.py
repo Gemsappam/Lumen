@@ -256,6 +256,35 @@ def in_transit_all(awb_key: str | None = None) -> tuple[list, list]:
         return out, skipped
 
 
+def signature(inv_id: int) -> tuple[str, str]:
+    """(«MAWB|farm», hash of what the packing shows) — to never post the same packing twice automatically."""
+    import hashlib
+    from .calc import norm_awb
+    with session() as s:
+        i = s.get(Invoice, inv_id)
+        if not i:
+            return "", ""
+        if i.packing_lines_json:
+            body = i.packing_lines_json
+        else:
+            body = json.dumps(sorted((l.name, l.stems) for l in s.exec(select(Line).where(Line.invoice_id == inv_id)).all()))
+        return f"{norm_awb(i.awb)}|{i.farm}", hashlib.md5((body + (i.boxes_json or "")).encode()).hexdigest()
+
+
+def already_posted(inv_id: int) -> bool:
+    from .api import _settings
+    k, h = signature(inv_id)
+    return bool(k) and (_settings().get("packing_sigs") or {}).get(k) == h
+
+
+def remember_posted(inv_id: int):
+    from .api import SETTINGS, _settings
+    k, h = signature(inv_id)
+    if k:
+        st = _settings()
+        SETTINGS.write_text(json.dumps({**st, "packing_sigs": {**(st.get("packing_sigs") or {}), k: h}}, ensure_ascii=False))
+
+
 def mark_sent(inv_id: int):
     with session() as s:
         i = s.get(Invoice, inv_id)

@@ -111,7 +111,7 @@ def _fix_double_broker():
                 invs.sort(key=lambda i: (bool(i.packing_lines_json),
                                          _d(i.invoice_date) or __import__("datetime").datetime.min, i.id))
                 for old in invs[:-1]:
-                    old.awb, old.packing_sent = "", False
+                    old.awb = ""
                     s.add(old)
         s.commit()
     _repair_broker_packing()
@@ -137,7 +137,7 @@ def _repair_broker_packing():
                         and norm_awb(i.awb) == k and not i.packing_lines_json), None)
             if tgt:                                    # statement purchase on that MAWB gets the packing
                 tgt.packing_lines_json, tgt.boxes_json, tgt.hawb = src.packing_lines_json, src.boxes_json, src.hawb
-                tgt.packing_sent = False
+                tgt.packing_sent = src.packing_sent
                 s.add(tgt)
                 if not src.ext_id:                     # placeholder without money -> remove
                     for l in s.exec(select(Line).where(Line.invoice_id == src.id)).all():
@@ -146,14 +146,33 @@ def _repair_broker_packing():
                 else:
                     src.packing_lines_json = None; s.add(src)
             else:
-                src.awb, src.packing_sent = awb, False
+                src.awb = awb
                 s.add(src)
         s.commit()
+
+
+def _seed_packing_sigs():
+    """Once: Tessa/Plazoleta packings already in a sent shipment are marked «already posted»
+    (an earlier version re-armed them on every restart)."""
+    from .api import _settings, SETTINGS
+    from .models import Invoice
+    from .calc import norm_awb
+    from . import kbreak, packing
+    if _settings().get("packing_sigs_seeded"):
+        return
+    with session() as s:
+        ids = [i.id for i in s.exec(select(Invoice)).all()
+               if getattr(i, "via_broker", False) and i.awb and i.packing_lines_json and kbreak.is_sent(norm_awb(i.awb))]
+    for i in ids:
+        packing.remember_posted(i)
+        packing.mark_sent(i)
+    SETTINGS.write_text(json.dumps({**_settings(), "packing_sigs_seeded": True}))
 
 
 def seed():
     _seed_farms()
     _fix_double_broker()
+    _seed_packing_sigs()
     upsert_forwarders()          # forwarders + aliases for existing farms (idempotent)
     _seed_box_dims()
 

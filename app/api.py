@@ -1597,6 +1597,21 @@ def _prev_leg(invs, lines, res, inv, line, leg):
     return None, None
 
 
+def _last_kenya_rpk(res, leg: str, skip_awb: str, kenya_awbs: set):
+    """₽ per kg of the most recent Kenyan MAWB that already has a real bill for this leg."""
+    best = None
+    for (awb, lg), g in res.legs.items():
+        if lg != leg or awb == skip_awb or awb not in kenya_awbs or not g.get("rub_per_kg"):
+            continue
+        rec = max(g.get("ids") or [0])
+        if best is None or rec > best[2]:
+            best = (g["rub_per_kg"], awb, rec)
+    if not best:
+        return None, None
+    a = best[1]
+    return best[0], (f"{a[:3]}-{a[3:]}" if len(a) == 11 else a)
+
+
 def transit_view(s=None) -> dict:
     """Everything not arrived yet: paid (in a top-up) and unpaid, with ≈ cost per stem.
     Missing freight is estimated per leg:
@@ -1630,6 +1645,18 @@ def transit_view(s=None) -> dict:
             if country == "Кения":
                 for leg, has, label in (("air", has_air, "Expolanka"), ("msk", has_msk, "Floratrack")):
                     if has:
+                        continue
+                    # 1) this farm's kg on the MAWB is known (breakdown) -> ₽/kg of the latest Kenyan bill × kg,
+                    #    spread over ALL lines — every stem carries logistics, not only items seen before
+                    kenya_awbs = {norm_awb(x.awb) for x in invs if x.awb and (x.country == "Кения")}
+                    rpk, from_awb = _last_kenya_rpk(res, leg, norm_awb(i.awb), kenya_awbs)
+                    if i.weight_kg and rpk:
+                        per = rpk * i.weight_kg / st
+                        for l in ls:
+                            est[l.id][0 if leg == "air" else 1] = per
+                        src[leg] = f"≈ {rpk:.0f} ₽/кг (последний счёт, MAWB {from_awb}) × {i.weight_kg:g} кг фермы"
+                        notes.append(f"{label}: {src[leg]}")
+                        approx_legs = True
                         continue
                     got = 0
                     for l in ls:

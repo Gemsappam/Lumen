@@ -1526,6 +1526,9 @@ async def _send_items(items, sender, tg, resend_breakdown=False) -> int:
     from . import kbreak, packing
     groups = OrderedDict()
     for inv_id, farm, awb, kkey in sorted(items, key=lambda x: (x[2] or "", x[0])):
+        if not resend_breakdown and packing.already_posted(inv_id):
+            packing.mark_sent(inv_id)              # exactly this packing is already in the chats — don't repeat
+            continue
         groups.setdefault((awb, kkey), []).append((inv_id, farm))
     sent = 0
     for (awb, kkey), invs in groups.items():
@@ -1545,6 +1548,7 @@ async def _send_items(items, sender, tg, resend_breakdown=False) -> int:
         if ok:
             for i in ids:
                 packing.mark_sent(i)
+                packing.remember_posted(i)
             sent += len(ids)
     return sent
 
