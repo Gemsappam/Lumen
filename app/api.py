@@ -343,6 +343,10 @@ def attach_broker_packing(d: dict) -> str:
 def merge_lines(out: dict) -> dict:
     """Same variety, same length, same price -> one line («Julietta Honey 60cm — 115 ст»), boxes added up."""
     lines = out.get("lines") or []
+    mixes = [l.get("name") for l in lines if re.search(r"\b(mix|assorted|select|surtido)\b", l.get("name") or "", re.I)]
+    if mixes:
+        out.setdefault("warnings", []).append(
+            "Строка-микс не разложена по сортам: " + ", ".join(dict.fromkeys(mixes)) + " — проверь состав коробок")
     merged, idx = [], {}
     for l in lines:
         k = (_norm_name(l.get("name") or ""), round(float(l.get("price_usd") or 0), 4), (l.get("farm") or "").lower())

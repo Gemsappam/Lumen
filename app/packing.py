@@ -49,7 +49,7 @@ def write_sheet(ws, inv, lines):
             ws.cell(r, c).border = BOX
         r += 1
     ws.cell(r, 1, "ИТОГО").font = Font(name=F, bold=True)
-    ws.cell(r, 2, f"=SUM(B7:B{r - 1})").font = Font(name=F, bold=True)
+    ws.cell(r, 2, sum(float(getattr(l, "stems", 0) or 0) for l in lines)).font = Font(name=F, bold=True)
     ws.cell(r, 2).number_format = "#,##0"
     for c in (1, 2):
         ws.cell(r, c).border = BOX

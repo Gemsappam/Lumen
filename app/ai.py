@@ -95,6 +95,14 @@ DOMAIN = """Ты — бухгалтер-логист оптовой компан
   всего за все коробки. В lines бери колонку STEMS подстроки (40, 30), имя «Hydrangea Light Pink», «Hydrangea White»
   (без слова Premium/Mix). Строку «HYD MIX ASSORTED» как номенклатуру НЕ пиши. Инвойс может быть на нескольких
   страницах — это один инвойс, бери строки со всех страниц. Одинаковые сорта можно не объединять — система объединит.
+- ТО ЖЕ у American Flowers и похожих: строка коробки «0,250 1QBx35 HYD ASSORTED SELECT … 35 st 35 0,66 23,10», а
+  СЛЕДУЮЩАЯ строка — состав этой коробки списком: «DARK BLUE 6, GREEN NATURAL 11, MAGENTA 6, RED 6, GREEN LEMON 6»
+  или без запятых «WHITE 10 LIGHT PINK 13 LIGHT BLUE 12». Это стебли ОДНОЙ коробки (в сумме = 35). Разложи: на каждый
+  цвет строка lines «Hydrangea <Цвет>» (Dark Blue, Green Natural, Magenta, Red, Green Lemon, White, Light Pink,
+  Light Blue, Baby Blue, Blue, Pink, Lavender — LAVANDER пиши Lavender), stems = число × количество коробок (PCS),
+  price_usd = цена строки коробки. Количество коробок = число перед «QB» в PCS («2QBx35» = 2 коробки),
+  а не BXS (0,250 — это доля фулл-бокса). Строка «HYD SUPER BLUE» + следующая строка «LIGHT BLUE» — один сорт:
+  «Hydrangea Super Blue», 70 ст, $0.70. НИКОГДА не пиши «Assorted», «Mix», «Select» как номенклатуру.
 - boxes_detail — укладка по коробкам ровно как в инвойсе: на каждую строку коробки (в т.ч. MIX) запись
   {qty: число коробок, pack: QB/HB/FB, content: [{name, stems_per_box}]}. Для MIX content = подстроки с числом
   стеблей В ОДНОЙ коробке (20 Light Pink, 15 White); для обычной коробки — один сорт (Light Blue, 35).
