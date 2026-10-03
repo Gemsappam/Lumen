@@ -475,24 +475,78 @@ async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dic
                 await send_packing_lists()
                 return
             await m.answer(msg)
-    t = topup_from_text(m.caption or "")
+    if out.get("doc_type") == "farm_invoice":
+        from .api import find_same_invoice
+        same = [(d, find_same_invoice(d)) for d in subs]
+        same = [(d, inv) for d, inv in same if inv]
+        if same and "новый" not in (m.caption or "").lower():
+            d, inv = same[0]
+            did = save_draft(d)
+            CORR[m.from_user.id] = {"draft": did, "inv": inv["id"], "subs": subs, "out": out, "caption": m.caption or "",
+                                    "head": _flow_head(subs) + warn}
+            await _send(m.from_user.id,
+                        f"📝 Инвойс {inv['farm']} № {inv['invoice_no']} уже есть в учёте ({inv['where']}).\nЭто КОРРЕКТИРОВКА инвойса?",
+                        _kb([[("✅ Да, корректировка — заменить", "cor:yes")],
+                             [("➕ Нет, это новый инвойс", "cor:no")]]), note)
+            return
+    await _start_flow(m.from_user.id, subs, out, m.caption or "", note, _flow_head(subs) + warn)
+
+
+CORR: dict = {}       # user -> pending «is it a correction?»
+
+
+async def _start_flow(uid: int, subs: list, out: dict, caption: str, note, head: str):
+    t = topup_from_text(caption)
     if out.get("doc_type") == "farm_invoice":
         for d in subs:
             fill_mawb(d, t.id if t else None)     # MAWB from the Expolanka breakdown right away
-    cu, _cr = money_from_text(m.caption or "")
+    cu, _cr = money_from_text(caption)
     flow = {"ids": [save_draft(d) for d in subs], "paid": None, "topup": t.id if t else None,
             "pays": None, "kind": out.get("doc_type"), "ts": time.time(), "note": note}
-    if "не оплач" in (m.caption or "").lower():
+    if "не оплач" in caption.lower():
         flow["paid"] = False
     elif cu or t:
         flow["paid"] = True                       # sums or a top-up date in the caption = paid
     if cu:
-        flow["pays"] = payments_for(m.caption or "", subs)
+        flow["pays"] = payments_for(caption, subs)
         if flow["paid"] is False:                 # «не оплачен 1100$» = approximate $
             flow["approx"] = True
-    FLOW[m.from_user.id] = flow
-    LAST_DRAFT[m.from_user.id] = (flow["ids"], time.time())
-    await _step(m.from_user.id, head=_flow_head(subs) + warn)
+    FLOW[uid] = flow
+    LAST_DRAFT[uid] = (flow["ids"], time.time())
+    await _step(uid, head=head)
+
+
+@dp.callback_query(F.data.startswith("cor:"), wr)
+async def correction_answer(c: CallbackQuery):
+    from .api import correct_invoice, invoice_costs
+    p = CORR.pop(c.from_user.id, None)
+    await c.answer()
+    if not p:
+        await c.message.edit_text("Устарело — пришли инвойс ещё раз.")
+        return
+    if c.data == "cor:no":
+        await _start_flow(c.from_user.id, p["subs"], p["out"], p["caption"], c.message, p["head"])
+        return
+    d = json.loads((DRAFTS / f"{p['draft']}.json").read_text())
+    before = invoice_costs(p["inv"])
+    r = correct_invoice(p["inv"], d)
+    (DRAFTS / f"{p['draft']}.json").unlink(missing_ok=True)
+    txt = (f"✅ Корректировка внесена: {r['farm']} № {r['invoice_no']}. Оплата, пополнение, MAWB и баланс фермы — как были.\n"
+           + ("\n".join("• " + x for x in r["changes"]) or "Строки не изменились."))
+    edited = 0
+    if r.get("awb_key"):
+        edited = await refresh_shipment(r["awb_key"], f"{r['farm']} — корректировка инвойса № {r['invoice_no']}")
+        from . import kbreak
+        if edited:
+            txt += f"\n\n🔄 Пакинг в чатах ОБНОВЛЁН (отредактировал {edited} сообщ.), новый файл не слал."
+        elif kbreak.is_sent(r["awb_key"]):
+            txt += ("\n\n⚠️ Пакинг этой поставки ушёл в чаты до обновления бота — то сообщение я отредактировать не могу. "
+                    "Нажми «📦 Пакинги в чаты» → этот MAWB: уйдёт исправленный. Дальше буду править старые сообщения сам.")
+        else:
+            txt += "\n\nВ чаты эта поставка ещё не уходила — уйдёт уже исправленной."
+    await c.message.edit_text(txt[:4000])
+    if r["changes"]:
+        await send_correction(p["inv"], before, f"Корректировка инвойса фермы № {r['invoice_no']}")
 
 
 # ---------- the «оплачен? → откуп → $» conversation --------------------------------------
@@ -1411,17 +1465,58 @@ async def push_packing_pick(c: CallbackQuery):
     await c.message.edit_text(push_text(await push_packing_all(None if k == "all" else k)))
 
 
+_LAST_POSTED: list = []      # messages of the last _post call: [(chat_id, message_id)]
+
+
 async def _post(sender, tg, data: bytes, fname: str, caption: str) -> bool:
     from aiogram.types import BufferedInputFile
     ok = False
+    _LAST_POSTED.clear()
     for t in tg:
         try:
-            await sender.send_document(t["chat_id"], BufferedInputFile(data, fname), caption=caption,
-                                       message_thread_id=t.get("thread_id"))
+            msg = await sender.send_document(t["chat_id"], BufferedInputFile(data, fname), caption=caption,
+                                             message_thread_id=t.get("thread_id"))
+            _LAST_POSTED.append((t["chat_id"], getattr(msg, "message_id", None)))
             ok = True
         except Exception as e:
             print(f"[lumen] packing chat {t.get('title')}: {e}", flush=True)
     return ok
+
+
+def _remember_post(awb_key: str):
+    """Shipment file posted: keep where, so a corrected invoice can EDIT this message instead of a new one."""
+    from . import kbreak
+    st = kbreak._state()
+    if awb_key in st and _LAST_POSTED:
+        st[awb_key]["msgs"] = [{"chat_id": c, "message_id": m} for c, m in _LAST_POSTED if m]
+        kbreak._save_state(st)
+
+
+async def refresh_shipment(awb_key: str, note: str) -> int:
+    """Rebuild the shipment file (детализация + all packing lists) and EDIT the messages already in the chats."""
+    from aiogram.types import BufferedInputFile, InputMediaDocument
+    from . import kbreak, packing, reader
+    from .models import Invoice
+    from .calc import norm_awb
+    st = kbreak._state().get(awb_key) or {}
+    if not st.get("msgs") or not reader.RBOT:
+        return 0
+    with session() as s:
+        invs = [i for i in s.exec(select(Invoice)).all() if norm_awb(i.awb) == awb_key and i.packing_sent]
+    ids, farms = [i.id for i in invs], [i.farm for i in invs]
+    data = packing.bundle(ids, kbreak.breakdown_bytes(awb_key))
+    cap = (f"🔄 Исправлено: {note}\n" + kbreak.caption(awb_key, farms))[:1024]
+    fname = "Shipment_" + re.sub(r"[^\w\-]+", "_", st.get("awb") or awb_key) + ".xlsx"
+    done = 0
+    for m in st["msgs"]:
+        try:
+            await reader.RBOT.edit_message_media(
+                chat_id=m["chat_id"], message_id=m["message_id"],
+                media=InputMediaDocument(media=BufferedInputFile(data, fname), caption=cap))
+            done += 1
+        except Exception as e:
+            print(f"[lumen] edit shipment message: {e}", flush=True)
+    return done
 
 
 async def _send_items(items, sender, tg, resend_breakdown=False) -> int:
@@ -1442,6 +1537,7 @@ async def _send_items(items, sender, tg, resend_breakdown=False) -> int:
             ok = await _post(sender, tg, data, f"Shipment_{safe}.xlsx", kbreak.caption(kkey, farms))
             if ok:
                 kbreak.mark_sent(kkey)
+                _remember_post(kkey)
         else:
             data = packing.bundle(ids)
             cap = f"📦 Packing list{'s' if len(ids) > 1 else ''} · MAWB {awb}\n" + "\n".join(f"• {f}" for f in farms)

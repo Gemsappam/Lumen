@@ -364,6 +364,61 @@ def _boxes_from_raw(lines: list) -> list:
     return out
 
 
+def find_same_invoice(d: dict):
+    """A farm invoice with this farm + number is already booked -> {id, farm, invoice_no, where}."""
+    no = re.sub(r"\D", "", d.get("invoice_no") or "")
+    if not no:
+        return None
+    with session() as s:
+        f = resolve_farm(s, d.get("farm") or "")
+        farm = f.name if f else (d.get("farm") or "")
+        tdate = {t.id: t.date for t in s.exec(select(TopUp)).all()}
+        for i in s.exec(select(Invoice)).all():
+            if i.farm == farm and re.sub(r"\D", "", i.invoice_no or "") == no:
+                where = f"пополнение {tdate[i.topup_id]}" if i.topup_id in tdate else ("в пути, не оплачен" if not i.via_broker else "брокер")
+                return {"id": i.id, "farm": i.farm, "invoice_no": i.invoice_no, "where": where}
+    return None
+
+
+def correct_invoice(inv_id: int, d: dict) -> dict:
+    """Corrected farm invoice: replace the lines (and box detail, stems check) — payment, top-up, MAWB stay."""
+    with session() as s:
+        inv = s.get(Invoice, inv_id)
+        old = {l.name: l.stems for l in s.exec(select(Line).where(Line.invoice_id == inv_id)).all()}
+        if inv.via_broker and inv.ext_id:            # broker farm: money lines stay from the statement
+            inv.packing_lines_json = json.dumps([{"name": l.get("name"), "stems": l.get("stems"), "boxes": l.get("boxes")}
+                                                 for l in d.get("lines") or []], ensure_ascii=False)
+        else:
+            for l in s.exec(select(Line).where(Line.invoice_id == inv_id)).all():
+                s.delete(l)
+            for l in d.get("lines") or []:
+                s.add(Line(invoice_id=inv_id, name=l.get("name") or "", boxes=l.get("boxes"),
+                           stems=l.get("stems") or 0, price_usd=l.get("price_usd") or 0))
+            if d.get("invoice_total_usd"):
+                inv.invoice_total_usd = d["invoice_total_usd"]
+        if d.get("boxes_detail"):
+            inv.boxes_json = json.dumps(d["boxes_detail"], ensure_ascii=False)
+        dis = [{**x, "resolved": False} for x in (d.get("box_mismatch") or [])]
+        lines_sum = sum((l.get("stems") or 0) for l in d.get("lines") or [])
+        if d.get("stems_total") and abs(lines_sum - d["stems_total"]) >= 1 and not dis:
+            dis.append({"box": "ИТОГО инвойса", "box_stems": d["stems_total"], "units": lines_sum,
+                        "varieties": [l.get("name") for l in d.get("lines") or []], "resolved": False})
+        inv.discrepancy_json = json.dumps(dis, ensure_ascii=False) if dis else None
+        inv.note = ((inv.note or "") + " · корректировка фермы").strip(" ·")
+        s.add(inv); s.commit()
+        new = {l.get("name"): l.get("stems") for l in d.get("lines") or []}
+        changes = []
+        for n in sorted(set(old) | set(new)):
+            a, b = old.get(n), new.get(n)
+            if a != b:
+                changes.append(f"{n}: {a if a is not None else '—'} → {b if b is not None else 'убран'}")
+        out = {"farm": inv.farm, "invoice_no": inv.invoice_no, "changes": changes,
+               "awb_key": norm_awb(inv.awb) if inv.awb else None}
+    from .backup import mark_dirty
+    mark_dirty()
+    return out
+
+
 def merge_lines(out: dict) -> dict:
     """Same variety, same length, same price -> one line («Julietta Honey 60cm — 115 ст»), boxes added up."""
     lines = out.get("lines") or []
