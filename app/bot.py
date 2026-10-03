@@ -1360,10 +1360,13 @@ def push_text(r: dict) -> str:
     if r.get("error"):
         return "⚠️ " + r["error"]
     txt = f"📦 Отправлено пакингов: {r['sent']} (в {r['chats']} чат(а))"
-    no_awb = [x for x in r["skipped"] if "детализации" not in x]
     no_bd = [x for x in r["skipped"] if "детализации" in x]
+    other = [x for x in r["skipped"] if "детализации" not in x and "(" in x]
+    no_awb = [x for x in r["skipped"] if "детализации" not in x and "(" not in x]
     if no_awb:
         txt += "\nБез MAWB, не отправлены: " + ", ".join(no_awb)
+    if other:
+        txt += "\nНе отправлены:\n" + "\n".join("• " + x for x in other)
     if no_bd:
         awbs = sorted({x.split("детализации ")[-1].rstrip(")") for x in no_bd})
         txt += ("\nЖдут консолидационный лист (детализацию по фермам) по MAWB " + ", ".join(awbs)

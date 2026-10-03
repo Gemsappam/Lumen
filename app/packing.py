@@ -176,9 +176,21 @@ def pending() -> list:
                     continue                       # hold: no consolidation list for this MAWB yet (any country)
                 if i.via_broker and not i.packing_lines_json:
                     continue                       # Tessa / Plazoleta: wait for the FARM invoice
+                if unpacked_mix(s, i):
+                    continue                       # «Mix Assorted» left in the lines: re-upload the invoice
                 if s.exec(select(Line).where(Line.invoice_id == i.id)).first():
                     out.append((i.id, i.farm, i.awb, k))
         return out
+
+
+MIX_RE = re.compile(r"\b(mix|assorted|select|surtido)\b", re.I)
+
+
+def unpacked_mix(s, inv) -> bool:
+    """Lines still say «Mix / Assorted»: the invoice was read before mixes were unpacked -> don't send it."""
+    if getattr(inv, "packing_lines_json", None):
+        return any(MIX_RE.search(d.get("name") or "") for d in json.loads(inv.packing_lines_json))
+    return any(MIX_RE.search(l.name or "") for l in s.exec(select(Line).where(Line.invoice_id == inv.id)).all())
 
 
 def awbs_in_transit() -> list[dict]:
@@ -215,6 +227,9 @@ def in_transit_all(awb_key: str | None = None) -> tuple[list, list]:
                 continue
             if i.via_broker and not i.packing_lines_json:
                 skipped.append(f"{i.farm} (нет инвойса фермы)")
+                continue
+            if unpacked_mix(s, i):
+                skipped.append(f"{i.farm} (микс не разложен по сортам — удали инвойс и загрузи заново)")
                 continue
             if s.exec(select(Line).where(Line.invoice_id == i.id)).first():
                 from .calc import norm_awb

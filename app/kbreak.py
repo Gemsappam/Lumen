@@ -288,6 +288,9 @@ def caption(awb_key: str, packing_farms: list[str]) -> str:
         lines.append(f"🛬 Ориентировочное прибытие: {st['arrive']}")
     if packing_farms:
         lines.append("📦 В файле: детализация + пакинг-листы (" + ", ".join(packing_farms) + ")")
+        absent = [f["farm"] for f in st.get("farms", []) if f["farm"] not in packing_farms]
+        if absent:
+            lines.append("⏳ Пакинг позже (ждём инвойс): " + ", ".join(absent))
     return "\n".join(lines)[:1024]
 
 
