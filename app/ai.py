@@ -16,12 +16,12 @@ from .config import AI_PROVIDER, ANTHROPIC_API_KEY, AUDIT_MODEL, OPENROUTER_API_
 # so the official SDK works with just a different base_url + Bearer key.
 if AI_PROVIDER == "openrouter":
     client = AsyncAnthropic(base_url="https://openrouter.ai/api", auth_token=OPENROUTER_API_KEY,
-                            timeout=110, max_retries=1,
+                            timeout=300, max_retries=1,
                             api_key=None,
                             default_headers={"HTTP-Referer": WEBAPP_URL or "https://t.me", "X-Title": "Lumen Uchet"}) \
         if OPENROUTER_API_KEY else None
 else:
-    client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY, timeout=110, max_retries=1) if ANTHROPIC_API_KEY else None
+    client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY, timeout=300, max_retries=1) if ANTHROPIC_API_KEY else None
 
 
 def model_id(name: str) -> str:
@@ -38,12 +38,15 @@ async def _structured(model: str, system: str, content, tool: dict, max_tokens: 
     tool_choice=auto + explicit instruction, check, retry once, last resort: JSON from text."""
     last = ""
     for attempt in range(2):
-        msg = await client.messages.create(
-            model=model_id(model), max_tokens=max_tokens,
-            system=system + f"\n\nОтветь ОДНИМ вызовом инструмента {tool['name']} — без текста вокруг.",
-            tools=[tool], tool_choice={"type": "auto"},
-            messages=[{"role": "user", "content": content}],
-        )
+        kw = dict(model=model_id(model), max_tokens=max_tokens,
+                  system=system + f"\n\nОтветь ОДНИМ вызовом инструмента {tool['name']} — без текста вокруг.",
+                  tools=[tool], tool_choice={"type": "auto"},
+                  messages=[{"role": "user", "content": content}])
+        try:                                   # stream: long multi-page invoices don't hit the read timeout
+            async with client.messages.stream(**kw) as st:
+                msg = await st.get_final_message()
+        except AttributeError:
+            msg = await client.messages.create(**kw)
         for b in msg.content:                      # response may start with a thinking block
             if getattr(b, "type", "") == "tool_use" and b.name == tool["name"]:
                 return b.input
@@ -70,8 +73,8 @@ DOMAIN = """Ты — бухгалтер-логист оптовой компан
     документом. Вес из счёта (chargeable / оплачиваемый) пиши в total_weight_kg — от него считается ставка за кг.
   • Floratrack (Флоратрак) — leg=msk: для Кении это Амстердам → Москва, для Эквадора, Колумбии и прочих — весь путь.
   Счёт перевозчика — это НЕ цветы, это логистика (doc_type=freight_invoice).
-- MAWB vs HAWB: нас интересует ТОЛЬКО MAWB (master, обычно формат 3 цифры-8 цифр, напр. 065-4053 8245).
-  HAWB (house) игнорируй полностью. В поле awb пиши только MAWB. Если в документе только HAWB — awb=null и warning.
+- MAWB vs HAWB: в поле awb пиши только MAWB (master, обычно 3 цифры-8 цифр, напр. 065-4053 8245).
+  HAWB (house, напр. CEVB2311731) пиши ОТДЕЛЬНО в поле hawb — по нему система найдёт верный MAWB консолидации.
 - Консолидационный лист отправки (SHIPPING LIST / prealerta / breakdown агента: одна AWB, таблица SHIPPER/EXPORTER
   с количеством коробок PCS и весом) — doc_type=consolidation: awb, origin (BOG/UIO/NBO), eta (YYYY-MM-DD),
   rows: shipper (как в документе), boxes = PCS (штук коробок), weight (кг, если есть), hawb (номер HAWB строки).
@@ -103,6 +106,8 @@ DOMAIN = """Ты — бухгалтер-логист оптовой компан
   price_usd = цена строки коробки. Количество коробок = число перед «QB» в PCS («2QBx35» = 2 коробки),
   а не BXS (0,250 — это доля фулл-бокса). Строка «HYD SUPER BLUE» + следующая строка «LIGHT BLUE» — один сорт:
   «Hydrangea Super Blue», 70 ст, $0.70. НИКОГДА не пиши «Assorted», «Mix», «Select» как номенклатуру.
+- boxes_detail заполняй ВСЕГДА, для любого инвойса (склад считает по коробкам). У American Flowers каждая строка
+  «1QBx35 HYD ASSORTED SELECT» + строка состава — это отдельная коробка со своим составом (qty=1).
 - boxes_detail — укладка по коробкам ровно как в инвойсе: на каждую строку коробки (в т.ч. MIX) запись
   {qty: число коробок, pack: QB/HB/FB, content: [{name, stems_per_box}]}. Для MIX content = подстроки с числом
   стеблей В ОДНОЙ коробке (20 Light Pink, 15 White); для обычной коробки — один сорт (Light Blue, 35).
@@ -249,6 +254,8 @@ def find_mawb(text: str | None) -> str | None:
 async def parse_document(data: bytes, mime: str, farms: list[dict], catalog: list[str], note: str = "") -> dict:
     if not client:
         raise RuntimeError(f"Нет ключа для AI_PROVIDER={AI_PROVIDER} (ANTHROPIC_API_KEY / OPENROUTER_API_KEY)")
+    # old wrong names («Hydrangea Mix Assorted Premium») must not pull new invoices back into «mix» lines
+    catalog = [c for c in catalog if not re.search(r"\b(mix|assorted|select|surtido)\b", c or "", re.I)]
     ctx = ("Известные плантации (name / country / aliases / notes):\n"
            + "\n".join(f"- {f['name']} / {f['country']} / {f['aliases']} / {f['notes']}" for f in farms)
            + "\n\nНоменклатура, которую мы уже использовали (приводи названия к этому виду, если это то же самое):\n"

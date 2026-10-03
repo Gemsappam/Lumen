@@ -340,9 +340,35 @@ def attach_broker_packing(d: dict) -> str:
     return txt
 
 
+def _boxes_from_raw(lines: list) -> list:
+    """Box-by-box from the invoice lines as read (before merging): a line with N boxes opens N boxes,
+    lines right below it without a box count ride in the same box. Whole stems only."""
+    out = []
+    for l in lines:
+        n = int(float(l.get("boxes") or 0))
+        st = float(l.get("stems") or 0)
+        if n > 0:
+            out.append({"qty": n, "pack": "", "content": [{"name": l.get("name"), "stems_total": st}]})
+        elif out:
+            out[-1]["content"].append({"name": l.get("name"), "stems_total": st})
+    for b in out:                                 # per box only if it divides evenly; else keep the group total
+        q = b["qty"] or 1
+        even = all(abs(c["stems_total"] / q - round(c["stems_total"] / q)) < 1e-6 for c in b["content"])
+        for c in b["content"]:
+            if even:
+                c["stems_per_box"] = int(round(c["stems_total"] / q))
+            c.pop("stems_total") if even else None
+        b["even"] = even
+    return out
+
+
 def merge_lines(out: dict) -> dict:
     """Same variety, same length, same price -> one line («Julietta Honey 60cm — 115 ст»), boxes added up."""
     lines = out.get("lines") or []
+    for l in lines:                              # «Hydrangea Green Premium» -> «Hydrangea Green»
+        l["name"] = re.sub(r"\s+\b(premium|standard|std)\b", "", l.get("name") or "", flags=re.I).strip()
+    if not out.get("boxes_detail"):
+        out["boxes_detail"] = _boxes_from_raw(lines)  # BEFORE merging: box structure is still intact
     mixes = [l.get("name") for l in lines if re.search(r"\b(mix|assorted|select|surtido)\b", l.get("name") or "", re.I)]
     if mixes:
         out.setdefault("warnings", []).append(

@@ -354,14 +354,28 @@ async def _parse_and_reply(m: Message, data: bytes, mime: str):
     """Guard: never leave the user staring at 'Читаю документ…'."""
     import asyncio, logging, traceback
     note_holder = {}
+    async def _ticker():
+        for n, txt in enumerate(["Читаю документ… (большой инвойс — раскладываю коробки по сортам)",
+                                 "Ещё читаю… много позиций, обычно до 3–5 минут",
+                                 "Почти… проверяю, что сорта сходятся с итогом"]):
+            await asyncio.sleep(60)
+            if note_holder.get("note") and not note_holder.get("done"):
+                try:
+                    await note_holder["note"].edit_text(txt)
+                except Exception:
+                    pass
+    tick = asyncio.create_task(_ticker())
     try:
-        await asyncio.wait_for(_parse_and_reply_inner(m, data, mime, note_holder), timeout=240)
+        await asyncio.wait_for(_parse_and_reply_inner(m, data, mime, note_holder), timeout=480)
     except asyncio.TimeoutError:
-        await _say(m, note_holder, "⏱ AI не ответил за 4 минуты. Пришли документ ещё раз — обычно со второго раза проходит.")
+        await _say(m, note_holder, "⏱ AI не ответил за 8 минут. Пришли документ ещё раз — обычно со второго раза проходит.")
     except Exception as e:
         logging.exception("parse failed")
         tb = traceback.format_exc().strip().splitlines()[-1]
         await _say(m, note_holder, f"❌ Ошибка при разборе: {tb[:300]}\nПерешли это сообщение мне (разработчику) — починю.")
+    finally:
+        note_holder["done"] = True
+        tick.cancel()
 
 
 async def _say(m: Message, holder: dict, text: str):

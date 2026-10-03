@@ -68,10 +68,15 @@ def _boxes_from_lines(lines) -> list:
     for l in lines:
         n = int(float(getattr(l, "boxes", None) or 0))
         if n > 0:
-            out.append({"qty": n, "pack": "", "content": [{"name": l.name, "stems_per_box": round(l.stems / n, 1)}]})
+            out.append({"qty": n, "pack": "", "content": [{"name": l.name, "stems_total": l.stems}]})
         elif out:
-            per = out[-1]["qty"] or 1
-            out[-1]["content"].append({"name": l.name, "stems_per_box": round(l.stems / per, 1)})
+            out[-1]["content"].append({"name": l.name, "stems_total": l.stems})
+    for b in out:
+        q = b["qty"] or 1
+        b["even"] = all(abs(c["stems_total"] / q - round(c["stems_total"] / q)) < 1e-6 for c in b["content"])
+        if b["even"]:
+            for c in b["content"]:
+                c["stems_per_box"] = int(round(c.pop("stems_total") / q))
     return out
 
 
@@ -84,7 +89,21 @@ def _boxes_section(ws, r0: int, boxes: list):
         x.fill = PatternFill("solid", fgColor="D9E1F2")
     r, n = r0 + 2, 0
     for b in boxes:
-        for _ in range(int(b.get("qty") or 1)):
+        q = int(b.get("qty") or 1)
+        if b.get("even") is False or any("stems_per_box" not in c for c in b.get("content") or []):
+            label = f"{n + 1}–{n + q}" if q > 1 else str(n + 1)
+            first = True
+            for item in b.get("content") or []:
+                st = item.get("stems_total", item.get("stems_per_box"))
+                vals = [label if first else "", (b.get("pack") or "") if first else "", item.get("name"),
+                        f"{st:g} на {q} кор." if q > 1 else st]
+                for c, v in enumerate(vals, 1):
+                    x = ws.cell(r, c, v); x.font = Font(name=F, bold=(c == 1)); x.border = BOX
+                first = False
+                r += 1
+            n += q
+            continue
+        for _ in range(q):
             n += 1
             first = True
             for item in b.get("content") or []:
