@@ -585,8 +585,9 @@ async transit({seg}={}){
     try{await api('/transit/export',{method:'POST'});toast('Excel по грузам в пути отправлен в чат')}catch(x){toast(x.message)}
     e.target.disabled=false;e.target.textContent='📊 Excel по грузам в пути'};
   document.getElementById('pushP').onclick=async()=>{
-    const aw=await api('/packing/awbs');
+    const [aw, tgs]=await Promise.all([api('/packing/awbs'), api('/packing/targets')]);
     if(!aw.length) return toast('Грузов в пути с MAWB нет');
+    if(!tgs.length) return toast('Нет чатов для пакингов: добавь бота-читателя в чат и напиши там /packing_here');
     const wrap=document.createElement('div');
     wrap.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:20;display:flex;align-items:flex-end';
     wrap.innerHTML=`<div style="background:var(--bg2);width:100%;border-radius:18px 18px 0 0;padding:14px 0 calc(16px + env(safe-area-inset-bottom,0));max-height:80vh;overflow:auto">
@@ -595,12 +596,18 @@ async transit({seg}={}){
         <div class="t">${a.has_bd?'✅':'⏳'} MAWB ${esc(a.awb)} · ${esc(a.country)}</div>
         <div class="s">${esc(a.farms.join(', '))}${a.has_bd?'':' — нет консолидационного листа, не уйдёт'}</div></div></div>`).join('')}
         <div class="row" data-k="all" style="cursor:pointer"><div class="grow"><div class="t">📦 Все грузы в пути</div></div></div></div>
+      <h2>В какие чаты</h2>
+      <div class="group">${tgs.map(t=>`<label class="row"><input type="checkbox" class="tgc" value="${esc(t.key)}" checked>
+        <div class="grow"><div class="t">${esc(t.title)}${t.topic?' · тема':''}</div></div></label>`).join('')}</div>
+      <p class="hint" style="margin:4px 16px">Сначала отметь чаты, потом нажми на поставку.</p>
       <div class="actions"><button id="pcl">Отмена</button></div></div>`;
     document.body.appendChild(wrap);
     wrap.querySelector('#pcl').onclick=()=>wrap.remove();
     wrap.querySelectorAll('[data-k]').forEach(r=>r.onclick=async()=>{
+      const picked=[...wrap.querySelectorAll('.tgc:checked')].map(x=>x.value);
+      if(!picked.length) return toast('Отметь хотя бы один чат');
       wrap.remove(); toast('Отправляю…');
-      try{ const res=await api('/packing/push'+(r.dataset.k==='all'?'':'?awb='+r.dataset.k),{method:'POST'});
+      try{ const res=await api('/packing/push'+(r.dataset.k==='all'?'':'?awb='+r.dataset.k),{method:'POST',body:{targets:picked}});
            toast(res.text.split('\n')[0]); if(res.text.includes('\n')) alert(res.text) }catch(x){toast(x.message)}
     });
   };

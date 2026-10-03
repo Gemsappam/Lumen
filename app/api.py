@@ -306,10 +306,12 @@ def attach_broker_packing(d: dict) -> str:
         ddate = _d(d.get("invoice_date") or "")
         cands = [i for i in s.exec(select(Invoice)).all()
                  if i.farm == farm and i.via_broker and not i.packing_lines_json and not i.arrived_at]
+        want = norm_awb(d.get("awb") or "")
         if ddate:
-            cands.sort(key=lambda i: abs(((_d(i.invoice_date) or ddate) - ddate).days))
+            cands.sort(key=lambda i: (norm_awb(i.awb) != want if want else 0,
+                                      abs(((_d(i.invoice_date) or ddate) - ddate).days)))
         else:
-            cands.sort(key=lambda i: -i.id)
+            cands.sort(key=lambda i: (norm_awb(i.awb) != want if want else 0, -i.id))
         inv = cands[0] if cands else None
         made = inv is None
         if made:                                 # statement not loaded yet: placeholder
@@ -1639,10 +1641,21 @@ def api_packing_awbs(uid: int = Depends(writer)):
     return awbs_in_transit()
 
 
+@router.get("/packing/targets")
+def api_packing_targets(uid: int = Depends(writer)):
+    from .packing import targets
+    return [{"key": f"{t['chat_id']}:{t.get('thread_id') or ''}", "title": t.get("title") or str(t["chat_id"]),
+             "topic": bool(t.get("thread_id"))} for t in targets()]
+
+
+class PushIn(BaseModel):
+    targets: list[str] = []
+
+
 @router.post("/packing/push")
-async def api_push_packing(awb: str | None = None, uid: int = Depends(writer)):
+async def api_push_packing(awb: str | None = None, body: PushIn | None = None, uid: int = Depends(writer)):
     from .bot import push_packing_all, push_text
-    r = await push_packing_all(awb or None)
+    r = await push_packing_all(awb or None, (body.targets if body and body.targets else None))
     return {"ok": not r.get("error"), "text": push_text(r)}
 
 

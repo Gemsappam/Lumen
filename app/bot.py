@@ -1352,11 +1352,13 @@ async def pay_cmd(m: Message):
 REMINDER_SLOTS = [(1, 10), (2, 10)]   # (weekday Mon=0, hour MSK): Tuesday 10:00 and Wednesday 10:00
 
 
-async def push_packing_all(awb_key: str | None = None) -> dict:
+async def push_packing_all(awb_key: str | None = None, only: list[str] | None = None) -> dict:
     """«Push»: packing lists of ALL goods in transit (with a MAWB) -> every packing chat, again."""
     from aiogram.types import BufferedInputFile
     from . import packing, reader
     tg, sender = packing.targets(), reader.RBOT
+    if only:                                   # chats picked in the app: "chat_id:thread_id"
+        tg = [t for t in tg if f"{t['chat_id']}:{t.get('thread_id') or ''}" in only]
     if not sender:
         return {"error": "бот-читатель выключен (нет READER_BOT_TOKEN)"}
     if not tg:

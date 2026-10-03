@@ -107,11 +107,47 @@ def _fix_double_broker():
             if getattr(i, "via_broker", False) and i.awb:
                 by.setdefault((norm_awb(i.awb), i.farm), []).append(i)
         for (_k, _f), invs in by.items():
-            if len(invs) > 1:
-                invs.sort(key=lambda i: (_d(i.invoice_date) or __import__("datetime").datetime.min, i.id))
+            if len(invs) > 1:   # keep the one that HAS the farm invoice (packing), else the newest
+                invs.sort(key=lambda i: (bool(i.packing_lines_json),
+                                         _d(i.invoice_date) or __import__("datetime").datetime.min, i.id))
                 for old in invs[:-1]:
                     old.awb, old.packing_sent = "", False
                     s.add(old)
+        s.commit()
+    _repair_broker_packing()
+
+
+def _repair_broker_packing():
+    """A Tessa/Plazoleta farm invoice (packing) that lost its MAWB: put it back on its consolidation MAWB via HAWB,
+    merging into the statement purchase there (money from the statement, packing from the farm invoice)."""
+    from .models import Invoice, Line
+    from .calc import norm_awb
+    from . import kbreak
+    st = kbreak._state()
+    hawb_to = {(f.get("hawb") or "").upper(): (k, v.get("awb") or k) for k, v in st.items()
+               for f in v.get("farms", []) if f.get("hawb")}
+    with session() as s:
+        invs = s.exec(select(Invoice)).all()
+        for src in [i for i in invs if i.via_broker and i.packing_lines_json and not (i.awb or "").strip()]:
+            hit = hawb_to.get((src.hawb or "").upper())
+            if not hit:
+                continue
+            k, awb = hit
+            tgt = next((i for i in invs if i.id != src.id and i.via_broker and i.farm == src.farm
+                        and norm_awb(i.awb) == k and not i.packing_lines_json), None)
+            if tgt:                                    # statement purchase on that MAWB gets the packing
+                tgt.packing_lines_json, tgt.boxes_json, tgt.hawb = src.packing_lines_json, src.boxes_json, src.hawb
+                tgt.packing_sent = False
+                s.add(tgt)
+                if not src.ext_id:                     # placeholder without money -> remove
+                    for l in s.exec(select(Line).where(Line.invoice_id == src.id)).all():
+                        s.delete(l)
+                    s.delete(src)
+                else:
+                    src.packing_lines_json = None; s.add(src)
+            else:
+                src.awb, src.packing_sent = awb, False
+                s.add(src)
         s.commit()
 
 
