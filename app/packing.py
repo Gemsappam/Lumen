@@ -17,8 +17,16 @@ thin = Side(style="thin", color="BFBFBF")
 BOX = Border(left=thin, right=thin, top=thin, bottom=thin)
 
 
+class _PL:                                   # a packing line from the farm invoice (broker farms)
+    def __init__(self, d):
+        self.name, self.stems, self.boxes = d.get("name") or "", float(d.get("stems") or 0), d.get("boxes")
+
+
 def write_sheet(ws, inv, lines):
-    """One packing list on a worksheet: farm, MAWB, items and quantities — no prices."""
+    """One packing list on a worksheet: farm, MAWB, items and quantities — no prices.
+    Broker farms (Tessa / Plazoleta): items come from the farm's own invoice, not from the broker statement."""
+    if getattr(inv, "packing_lines_json", None):
+        lines = [_PL(d) for d in json.loads(inv.packing_lines_json)]
     ws["A1"] = "PACKING LIST"
     ws["A1"].font = Font(name=F, bold=True, size=14)
     ws["A3"], ws["B3"] = "Ферма", inv.farm
@@ -48,6 +56,48 @@ def write_sheet(ws, inv, lines):
         ws.cell(r, c).fill = PatternFill("solid", fgColor="FCE4D6")
     ws.column_dimensions["A"].width = 44
     ws.column_dimensions["B"].width = 18
+    boxes = json.loads(inv.boxes_json) if inv.boxes_json else _boxes_from_lines(lines)
+    if boxes:
+        _boxes_section(ws, r + 3, boxes)
+
+
+def _boxes_from_lines(lines) -> list:
+    """No box-by-box data from the invoice: a line with N boxes = N boxes of that variety;
+    following lines without a box count ride in the previous box (mixed box)."""
+    out = []
+    for l in lines:
+        n = int(float(getattr(l, "boxes", None) or 0))
+        if n > 0:
+            out.append({"qty": n, "pack": "", "content": [{"name": l.name, "stems_per_box": round(l.stems / n, 1)}]})
+        elif out:
+            per = out[-1]["qty"] or 1
+            out[-1]["content"].append({"name": l.name, "stems_per_box": round(l.stems / per, 1)})
+    return out
+
+
+def _boxes_section(ws, r0: int, boxes: list):
+    """«По коробкам»: every physical box numbered, its content one variety per row."""
+    ws.cell(r0, 1, "ПО КОРОБКАМ").font = Font(name=F, bold=True, size=12)
+    hdr = ["Коробка №", "Упаковка", "Сорт", "Стеблей"]
+    for c, h in enumerate(hdr, 1):
+        x = ws.cell(r0 + 1, c, h); x.font = Font(name=F, bold=True); x.border = BOX
+        x.fill = PatternFill("solid", fgColor="D9E1F2")
+    r, n = r0 + 2, 0
+    for b in boxes:
+        for _ in range(int(b.get("qty") or 1)):
+            n += 1
+            first = True
+            for item in b.get("content") or []:
+                vals = [n if first else "", (b.get("pack") or "") if first else "", item.get("name"), item.get("stems_per_box")]
+                for c, v in enumerate(vals, 1):
+                    x = ws.cell(r, c, v); x.font = Font(name=F, bold=(c == 1)); x.border = BOX
+                    if n % 2 == 0:
+                        x.fill = PatternFill("solid", fgColor="F2F2F2")
+                first = False
+                r += 1
+    ws.cell(r, 1, f"Всего коробок: {n}").font = Font(name=F, bold=True)
+    ws.column_dimensions["C"].width = 30
+    ws.column_dimensions["D"].width = 10
 
 
 def _sheet_title(name: str, used: set) -> str:
@@ -124,6 +174,8 @@ def pending() -> list:
                 k = norm_awb(i.awb)
                 if not kbreak.has(k):
                     continue                       # hold: no consolidation list for this MAWB yet (any country)
+                if i.via_broker and not i.packing_lines_json:
+                    continue                       # Tessa / Plazoleta: wait for the FARM invoice
                 if s.exec(select(Line).where(Line.invoice_id == i.id)).first():
                     out.append((i.id, i.farm, i.awb, k))
         return out
@@ -160,6 +212,9 @@ def in_transit_all(awb_key: str | None = None) -> tuple[list, list]:
                 continue
             if not (i.awb and i.awb.strip()):
                 skipped.append(i.farm)
+                continue
+            if i.via_broker and not i.packing_lines_json:
+                skipped.append(f"{i.farm} (нет инвойса фермы)")
                 continue
             if s.exec(select(Line).where(Line.invoice_id == i.id)).first():
                 from .calc import norm_awb

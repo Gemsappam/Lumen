@@ -91,6 +91,8 @@ class InvoiceIn(BaseModel):
     farm_usd: float | None = None      # $ that reached the farm (None = exactly the invoice total)
     box_mismatch: list[dict] = []      # mixed boxes: varieties ≠ box stems (from the AI)
     stems_total: float | None = None   # TOTAL row of the invoice (any farm) — checked against the lines
+    hawb: str | None = None
+    boxes_detail: list[dict] = []      # box by box (warehouse detail)
     country: str = ""
     client_code: str = ""              # empty -> default marking (LUMEN)
     invoice_no: str = ""
@@ -285,6 +287,59 @@ def _apply_box_rules(body):
             l.weight_kg = round(total * l.stems / st, 3)
 
 
+def is_broker_farm(farm: str) -> bool:
+    from . import calc
+    with session() as s:
+        _all(s)                                   # refresh calc.RULES
+        f = resolve_farm(s, farm)
+    return bool(f and (calc.RULES.get(f.name.strip().lower()) or {}).get("account"))
+
+
+def attach_broker_packing(d: dict) -> str:
+    """Tessa / Plazoleta invoice from the farm -> packing data for the statement purchase (money stays from the statement).
+    No statement purchase yet -> a placeholder purchase; the next statement links to it by farm and date."""
+    from .calc import _d
+    with session() as s:
+        f = resolve_farm(s, d.get("farm") or "")
+        farm = f.name if f else (d.get("farm") or "")
+        pl = [{"name": l.get("name"), "stems": l.get("stems"), "boxes": l.get("boxes")} for l in d.get("lines") or []]
+        ddate = _d(d.get("invoice_date") or "")
+        cands = [i for i in s.exec(select(Invoice)).all()
+                 if i.farm == farm and i.via_broker and not i.packing_lines_json and not i.arrived_at]
+        if ddate:
+            cands.sort(key=lambda i: abs(((_d(i.invoice_date) or ddate) - ddate).days))
+        else:
+            cands.sort(key=lambda i: -i.id)
+        inv = cands[0] if cands else None
+        made = inv is None
+        if made:                                 # statement not loaded yet: placeholder
+            inv = Invoice(topup_id=0, farm=farm, country=f.country if f else "", client_code=marking(),
+                          invoice_no=d.get("invoice_no") or "", invoice_date=(ddate.strftime("%d.%m.%Y") if ddate else ""),
+                          usd_paid=0, paid=True, via_broker=True, invoice_total_usd=d.get("invoice_total_usd"),
+                          note="инвойс фермы; деньги — из выписки брокера")
+            s.add(inv); s.flush()
+            for l in d.get("lines") or []:
+                s.add(Line(invoice_id=inv.id, name=l.get("name") or "", stems=l.get("stems") or 0,
+                           boxes=l.get("boxes"), price_usd=l.get("price_usd") or 0))
+        inv.packing_lines_json = json.dumps(pl, ensure_ascii=False)
+        if d.get("boxes_detail"):
+            inv.boxes_json = json.dumps(d["boxes_detail"], ensure_ascii=False)
+        if d.get("hawb"):
+            inv.hawb = d["hawb"]
+        if d.get("awb") and not inv.awb:
+            inv.awb = d["awb"]
+        inv.packing_sent = False
+        s.add(inv); s.commit()
+        st = sum(x["stems"] or 0 for x in pl)
+        txt = (f"🌸 {farm}: инвойс фермы принят для ПАКИНГА ({st:g} ст, {len(pl)} поз.). Деньги и себестоимость — из выписки брокера."
+               + (f"\nПривязал к закупке из выписки от {inv.invoice_date}." if not made else
+                  "\nВыписки по этой закупке ещё нет — привяжу, когда загрузишь выписку BiFlorica.")
+               + (f"\nMAWB {inv.awb}" if inv.awb else "\nMAWB встанет из консолидационного листа."))
+    from .backup import mark_dirty
+    mark_dirty()
+    return txt
+
+
 def merge_lines(out: dict) -> dict:
     """Same variety, same length, same price -> one line («Julietta Honey 60cm — 115 ст»), boxes added up."""
     lines = out.get("lines") or []
@@ -388,6 +443,7 @@ def book_document(out: dict, topup_id: int, usd, rub, uid: int, paid: bool = Tru
                          usd_paid=usd if paid else 0, rub_paid_override=rub, paid_date=today if paid else "",
                          paid=paid, est_usd=None if paid else usd, farm_usd=farm_usd if paid else None,
                          box_mismatch=out.get("box_mismatch") or [], stems_total=out.get("stems_total"),
+                         hawb=out.get("hawb"), boxes_detail=out.get("boxes_detail") or [],
                          note=out.get("mawb_note") or "", source_file=out.get("source_file"), lines=lines)
         return save_invoice(body, None, uid), "invoice"
     if out.get("doc_type") == "freight_invoice":
@@ -847,7 +903,7 @@ def save_invoice(body: InvoiceIn, inv_id: int | None = None, uid: int = Depends(
     if not body.awb:
         body.awb = infer_mawb(body.farm)[0] or ""      # typed by hand without MAWB -> take it from the breakdown
     with session() as s:
-        data = body.model_dump(exclude={"lines", "box_mismatch", "stems_total"})
+        data = body.model_dump(exclude={"lines", "box_mismatch", "stems_total", "boxes_detail"})
         inv = s.get(Invoice, inv_id) if inv_id else Invoice(**data)
         if inv_id:
             for k, v in data.items():
@@ -861,6 +917,9 @@ def save_invoice(body: InvoiceIn, inv_id: int | None = None, uid: int = Depends(
         s.commit()
         if not inv.topup_id:
             inv.paid = False
+            s.add(inv); s.commit()
+        if body.boxes_detail and not inv.boxes_json:
+            inv.boxes_json = json.dumps(body.boxes_detail, ensure_ascii=False)
             s.add(inv); s.commit()
         dis = [{**x, "resolved": False} for x in (body.box_mismatch or [])]
         lines_sum = sum(l.stems for l in body.lines)
@@ -1745,8 +1804,11 @@ def assign_awb_by_farms(awb: str, farms: list[str]) -> list[str]:
     awb = find_mawb(awb) or awb
     done = []
     with session() as s:
-        for i in sorted(s.exec(select(Invoice)).all(), key=lambda x: -x.id):
-            if not (i.awb or "").strip() and not i.arrived_at and i.farm in farms and i.farm not in done:
+        allinv = s.exec(select(Invoice)).all()
+        on_awb = {i.farm for i in allinv if norm_awb(i.awb) == norm_awb(awb)}      # already has one -> skip
+        for i in sorted(allinv, key=lambda x: -x.id):
+            if (not (i.awb or "").strip() and not i.arrived_at and i.farm in farms
+                    and i.farm not in done and i.farm not in on_awb):
                 i.awb = awb; s.add(i); done.append(i.farm)
         s.commit()
     from .backup import mark_dirty
@@ -1796,8 +1858,20 @@ DRAFTS.mkdir(exist_ok=True)
 
 
 def fill_mawb(out: dict, topup_id: int | None = None):
-    """Parsed farm invoice without MAWB -> take it from the forwarder breakdown that lists this farm."""
-    if out.get("doc_type") != "farm_invoice" or out.get("awb"):
+    """Parsed farm invoice without MAWB -> take it from the forwarder breakdown that lists this farm.
+    HAWB in the invoice that is in a consolidation list -> that list's MAWB wins (farms print other MAWBs)."""
+    if out.get("doc_type") != "farm_invoice":
+        return
+    hb = (out.get("hawb") or "").strip().upper()
+    if hb:
+        from . import kbreak
+        for k, st in kbreak._state().items():
+            if any((f.get("hawb") or "").upper() == hb for f in st.get("farms", [])):
+                if norm_awb(out.get("awb") or "") != k:
+                    out["mawb_note"] = f"MAWB по HAWB {hb} из консолидационного листа (в инвойсе фермы был {out.get('awb') or '—'})"
+                out["awb"] = st.get("awb") or k
+                return
+    if out.get("awb"):
         return
     awb, kg, n = infer_mawb(out.get("farm") or "", topup_id)
     if not awb:

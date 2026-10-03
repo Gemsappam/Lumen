@@ -106,12 +106,21 @@ def import_statement(data: bytes) -> dict:
             elif o["kind"] == "buy" and o["ext"] not in seen_buy:
                 dd = datetime.strptime(o["date"], "%Y-%m-%d").strftime("%d.%m.%Y") if o["date"] else ""
                 # an invoice you uploaded yourself with this number -> link it
-                same = next((i for i in invs if o["doc"] and i.invoice_no and o["doc"].split("#")[-1] in i.invoice_no
-                             and i.farm == o["farm"] and not i.ext_id), None)
-                if same:
-                    same.via_broker, same.ext_id, same.topup_id, same.usd_paid = True, o["ext"], 0, 0
-                    same.invoice_total_usd = same.invoice_total_usd or o["amount"]
+                from .calc import _d
+                od = _d(o["date"])
+                ph = [i for i in invs if i.farm == o["farm"] and i.via_broker and not i.ext_id
+                      and (not od or not _d(i.invoice_date) or abs((_d(i.invoice_date) - od).days) <= 7)]
+                ph.sort(key=lambda i: abs(((_d(i.invoice_date) or od) - od).days) if od else 0)
+                same = ph[0] if ph else None
+                if same:                       # farm invoice uploaded first: money now from the statement
+                    same.ext_id, same.topup_id, same.usd_paid = o["ext"], 0, 0
+                    same.invoice_total_usd, same.invoice_date = o["amount"], dd or same.invoice_date
+                    for l in s.exec(select(Line).where(Line.invoice_id == same.id)).all():
+                        s.delete(l)
+                    s.add(Line(invoice_id=same.id, name=o["item"], boxes=o["hb"] or None, stems=o["stems"],
+                               price_usd=o["price"] or (o["amount"] / o["stems"] if o["stems"] else 0)))
                     s.add(same); linked.append(same.id)
+                    invs = [i for i in invs if i.id != same.id]
                     continue
                 inv = Invoice(topup_id=0, farm=o["farm"], country=countries.get(o["farm"], ""), client_code=marking(),
                               invoice_no=o["doc"], invoice_date=dd, awb=o["awb"], usd_paid=0, paid=True,

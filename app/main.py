@@ -97,8 +97,27 @@ def upsert_forwarders():
         s.commit()
 
 
+def _fix_double_broker():
+    """Older bug: two Plazoleta/Tessa purchases got the same MAWB. Keep the newest, free the older one."""
+    from .models import Invoice
+    from .calc import norm_awb, _d
+    with session() as s:
+        by = {}
+        for i in s.exec(select(Invoice)).all():
+            if getattr(i, "via_broker", False) and i.awb:
+                by.setdefault((norm_awb(i.awb), i.farm), []).append(i)
+        for (_k, _f), invs in by.items():
+            if len(invs) > 1:
+                invs.sort(key=lambda i: (_d(i.invoice_date) or __import__("datetime").datetime.min, i.id))
+                for old in invs[:-1]:
+                    old.awb, old.packing_sent = "", False
+                    s.add(old)
+        s.commit()
+
+
 def seed():
     _seed_farms()
+    _fix_double_broker()
     upsert_forwarders()          # forwarders + aliases for existing farms (idempotent)
     _seed_box_dims()
 

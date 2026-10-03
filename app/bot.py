@@ -263,7 +263,8 @@ async def _consolidation(m: Message, awb_raw: str, country: str, rows: list, eta
         for r in rows:
             f = resolve_farm(s, r["farm_raw"])
             r["farm"] = f.name if f else r["farm_raw"].title()
-    farms = [{"farm": r["farm"], "packs": int(r.get("packs") or 0), "kg": float(r.get("kg") or 0)} for r in rows]
+    farms = [{"farm": r["farm"], "packs": int(r.get("packs") or 0), "kg": float(r.get("kg") or 0),
+              "hawb": (r.get("hawb") or "").strip().upper() or None} for r in rows]
     w = None
     if any(f["kg"] for f in farms):
         w = store_breakdown(awb, [{"farm": f["farm"], "kg": f["kg"]} for f in farms if f["kg"]])
@@ -418,7 +419,8 @@ async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dic
             eta = _dt.strptime(cons.get("eta") or "", "%Y-%m-%d")
         except ValueError:
             eta = None
-        rows = [{"farm_raw": r.get("shipper") or "", "packs": r.get("boxes") or 0, "kg": r.get("weight") or 0}
+        rows = [{"farm_raw": r.get("shipper") or "", "packs": r.get("boxes") or 0, "kg": r.get("weight") or 0,
+                 "hawb": r.get("hawb")}
                 for r in cons.get("rows") or [] if r.get("shipper")]
         try:
             await note.delete()
@@ -446,6 +448,19 @@ async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dic
 
     # farm invoice / freight bill -> «оплачен?» flow
     subs = split_by_farm(out) if out.get("doc_type") == "farm_invoice" else [out]
+    if out.get("doc_type") == "farm_invoice":
+        from .api import attach_broker_packing, is_broker_farm
+        broker = [d for d in subs if is_broker_farm(d.get("farm") or "")]
+        if broker:
+            for d in broker:
+                fill_mawb(d, None)
+            msg = "\n\n".join(attach_broker_packing(d) for d in broker)
+            subs = [d for d in subs if d not in broker]
+            if not subs:
+                await note.edit_text(msg)
+                await send_packing_lists()
+                return
+            await m.answer(msg)
     t = topup_from_text(m.caption or "")
     if out.get("doc_type") == "farm_invoice":
         for d in subs:
@@ -1443,9 +1458,10 @@ async def missing_reminder(uid_list=None):
     lines, rows = ["❗️ Где инвойсы? По разбивке они есть, а в боте их нет:"], []
     for (k, awb, country), xs in by.items():
         from .kbreak import flag
-        lines.append(f"\n✈️ {flag(country)} · MAWB {awb}:")
+        lines.append(f"\n✈️ {flag(country)} · " + ("закупки брокера (MAWB ещё нет):" if k == "broker" else f"MAWB {awb}:"))
         for x in xs:
-            lines.append(f"• {x['farm']} — {x['packs']} кор." if x.get("packs") else f"• {x['farm']}")
+            lines.append((f"• {x['farm']} — {x['packs']} кор." if x.get("packs") else f"• {x['farm']}")
+                         + (f" ({x['note']})" if x.get("note") else ""))
             rows.append([(f"🚫 {x['farm']} ({awb[-4:]}) — инвойса не будет", f"miss:{k}:{x['farm'][:40]}")])
     lines.append("\nКинь инвойсы сюда — сами привяжутся к MAWB. Пока их нет, пакинг этих ферм не уйдёт, а я буду спрашивать каждый день 🙂")
     for uid in uid_list or _money_people():

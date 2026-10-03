@@ -316,6 +316,16 @@ def missing_invoices(max_days: int = 21) -> list[dict]:
                 if not (keys & have.get(k, set())):
                     out.append({"awb_key": k, "awb": st.get("awb") or k, "farm": f["farm"], "packs": f.get("packs"),
                                 "country": st.get("country", ""), "since": st.get("ts", "")})
+        # Tessa / Plazoleta: statement purchase without the farm invoice (needed for the packing list)
+        for i in s.exec(select(Invoice)).all():
+            if getattr(i, "via_broker", False) and not getattr(i, "packing_lines_json", None) and not i.arrived_at:
+                k = norm_awb(i.awb) if i.awb else "broker"
+                if i.farm in (_state().get(k, {}).get("skip") or []):
+                    continue
+                if not any(x["farm"] == i.farm and x["awb_key"] == k for x in out):
+                    out.append({"awb_key": k, "awb": i.awb or "без MAWB", "farm": i.farm,
+                                "packs": None, "country": i.country or "", "since": i.invoice_date,
+                                "note": f"закупка по выписке брокера от {i.invoice_date} — нужен инвойс фермы для пакинга"})
     return out
 
 

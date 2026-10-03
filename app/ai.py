@@ -74,7 +74,7 @@ DOMAIN = """Ты — бухгалтер-логист оптовой компан
   HAWB (house) игнорируй полностью. В поле awb пиши только MAWB. Если в документе только HAWB — awb=null и warning.
 - Консолидационный лист отправки (SHIPPING LIST / prealerta / breakdown агента: одна AWB, таблица SHIPPER/EXPORTER
   с количеством коробок PCS и весом) — doc_type=consolidation: awb, origin (BOG/UIO/NBO), eta (YYYY-MM-DD),
-  rows: shipper (как в документе), boxes = PCS (штук коробок), weight (кг, если есть).
+  rows: shipper (как в документе), boxes = PCS (штук коробок), weight (кг, если есть), hawb (номер HAWB строки).
 - Скрин покупки валюты («Покупка 1 732,5887 USDT за 152 000,01 RUB», «Запрос на вывод средств, Сумма ...»)
   — это пополнение: doc_type=topup_receipt, заполни topup (rub, usd_bought, usd_withdrawn, order_no = номер заявки).
   Числа в русском формате: пробел — разделитель тысяч, запятая — десятичная.
@@ -90,6 +90,15 @@ DOMAIN = """Ты — бухгалтер-логист оптовой компан
   name = «Rose <сорт> <длина>cm» (например «Rose Julietta Cerise 60cm»), stems = Units, price_usd = цена строки
   коробки, boxes = Qty коробки только у ПЕРВОЙ подстроки этой коробки (у остальных null).
   Обычная строка без подстрок (Roses Apricot Lace 60 CM, 200 ст) — как есть: «Rose Apricot Lace 60cm».
+  ТО ЖЕ для гортензий/любых ферм (Кондор): строка «2,00 QB 35 HYD MIX ASSORTED PREMIUM … 70» и под ней подстроки
+  «20 HYD LIGHT PINK … 40», «15 HYD WHITE … 30» — первое число подстроки = стеблей В ОДНОЙ коробке, колонка STEMS =
+  всего за все коробки. В lines бери колонку STEMS подстроки (40, 30), имя «Hydrangea Light Pink», «Hydrangea White»
+  (без слова Premium/Mix). Строку «HYD MIX ASSORTED» как номенклатуру НЕ пиши. Инвойс может быть на нескольких
+  страницах — это один инвойс, бери строки со всех страниц. Одинаковые сорта можно не объединять — система объединит.
+- boxes_detail — укладка по коробкам ровно как в инвойсе: на каждую строку коробки (в т.ч. MIX) запись
+  {qty: число коробок, pack: QB/HB/FB, content: [{name, stems_per_box}]}. Для MIX content = подстроки с числом
+  стеблей В ОДНОЙ коробке (20 Light Pink, 15 White); для обычной коробки — один сорт (Light Blue, 35).
+- hawb — номер HAWB (House bill), если есть (например CEVB2311731).
   Если сумма Units подстрок ≠ Stems коробки — добавь warning «MIX 365: по сортам 250 ст, а в коробке 240» И запись
   в box_mismatch: box="MIX 365", box_stems=240, units=250, varieties = имена строк lines этой коробки (как ты их назвал).
 - stems_total — число стеблей в строке TOTAL/ИТОГО инвойса, как напечатано (не пересчитывай сам).
@@ -127,7 +136,8 @@ PARSE_TOOL = {
                 "origin": {"type": ["string", "null"], "description": "airport code: BOG / UIO / NBO"},
                 "eta": {"type": ["string", "null"], "description": "arrival date YYYY-MM-DD"},
                 "rows": {"type": "array", "items": {"type": "object", "properties": {
-                    "shipper": {"type": "string"}, "boxes": {"type": ["number", "null"]}, "weight": {"type": ["number", "null"]}}}}}},
+                    "shipper": {"type": "string"}, "boxes": {"type": ["number", "null"]}, "weight": {"type": ["number", "null"]},
+                    "hawb": {"type": ["string", "null"]}}}}}},
             "topup": {"type": ["object", "null"], "description": "only for topup_receipt", "properties": {
                 "rub": {"type": ["number", "null"], "description": "RUB paid"},
                 "usd_bought": {"type": ["number", "null"], "description": "USDT/USD bought"},
@@ -158,6 +168,13 @@ PARSE_TOOL = {
                     "farm": {"type": "string"}, "kg": {"type": "number"}, "boxes": {"type": ["number", "null"]}}}}}},
             "warnings": {"type": "array", "items": {"type": "string"}},
             "stems_total": {"type": ["number", "null"], "description": "stems in the invoice TOTAL row, as printed"},
+            "hawb": {"type": ["string", "null"], "description": "HAWB / house bill number, e.g. CEVB2311731"},
+            "boxes_detail": {"type": "array", "description": "box by box, as packed: one entry per invoice box line",
+                             "items": {"type": "object", "properties": {
+                                 "qty": {"type": "number", "description": "how many identical boxes"},
+                                 "pack": {"type": ["string", "null"], "description": "QB / HB / FB / Jumbo"},
+                                 "content": {"type": "array", "items": {"type": "object", "properties": {
+                                     "name": {"type": "string"}, "stems_per_box": {"type": "number"}}}}}}},
             "box_mismatch": {"type": "array", "description": "mixed boxes whose variety Units don't add up to the box Stems",
                              "items": {"type": "object", "properties": {
                                  "box": {"type": "string"}, "box_stems": {"type": "number"}, "units": {"type": "number"},

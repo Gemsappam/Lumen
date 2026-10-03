@@ -61,6 +61,9 @@ class Invoice(SQLModel, table=True):
     farm_usd: Optional[float] = None       # $ that actually reached the farm with this payment (None = exactly the invoice)
     via_broker: bool = False               # bought & paid from the broker balance (Tessa / Plazoleta statement)
     discrepancy_json: Optional[str] = None  # mixed box: varieties ≠ box stems -> check with the warehouse on arrival
+    hawb: Optional[str] = None             # house bill: matches the consolidation list row
+    boxes_json: Optional[str] = None       # box-by-box packing (warehouse detail)
+    packing_lines_json: Optional[str] = None  # broker farms: packing comes from the FARM invoice, money from the statement
     ext_id: Optional[str] = None           # BiFlorica operation ID
     client_done: bool = False              # «прибыл» already sent to client chats
 
@@ -181,7 +184,8 @@ def init_db():
         with engine.begin() as c:
             c.execute(text("ALTER TABLE invoice ADD COLUMN packing_sent BOOLEAN DEFAULT 0"))
             c.execute(text("UPDATE invoice SET packing_sent = 1"))
-    for col, typ in (("via_broker", "BOOLEAN DEFAULT 0"), ("ext_id", "VARCHAR"), ("discrepancy_json", "VARCHAR")):
+    for col, typ in (("via_broker", "BOOLEAN DEFAULT 0"), ("ext_id", "VARCHAR"), ("discrepancy_json", "VARCHAR"),
+                     ("hawb", "VARCHAR"), ("boxes_json", "VARCHAR"), ("packing_lines_json", "VARCHAR")):
         if col not in icols:
             with engine.begin() as c:
                 c.execute(text(f"ALTER TABLE invoice ADD COLUMN {col} {typ}"))
