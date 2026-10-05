@@ -16,7 +16,8 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import ChatMemberUpdated, Message
 
 READER_BOT_TOKEN = os.getenv("READER_BOT_TOKEN", "").strip()
-RBOT = None          # the reader Bot instance — it also posts statuses into client chats
+RBOT = None
+SEEN: list = []      # last group messages the reader actually received (for /status)          # the reader Bot instance — it also posts statuses into client chats
 
 
 def enabled() -> bool:
@@ -85,6 +86,11 @@ def build():
     async def _take(m: Message):
         from .bot import process_group_text
         text = m.text or m.caption or ""
+        SEEN.append({"chat": m.chat.title or str(m.chat.id), "chat_id": m.chat.id,
+                     "from": (m.from_user.full_name if m.from_user else (m.sender_chat.title if m.sender_chat else "?")),
+                     "bot": bool(m.from_user and m.from_user.is_bot),
+                     "at": (m.date.replace(tzinfo=None) + timedelta(hours=3)).strftime("%d.%m %H:%M"), "text": text[:60]})
+        del SEEN[:-15]
         await process_group_text(m.chat.id, m.chat.title or "", text, m.date.replace(tzinfo=None) + timedelta(hours=3))
 
     @rdp.message(F.chat.type.in_({"group", "supergroup"}))

@@ -1407,6 +1407,28 @@ async def packing_cmd(m: Message):
                          "(в супергруппе — внутри нужной темы). Убрать: /packing_off там же.")
 
 
+@dp.message(pv, sysf, Command("status"))
+async def status_cmd(m: Message):
+    """Why didn't a truck message reach the staff chat? Shows what the reader really sees and where it posts."""
+    from . import reader, staffnotify, packing
+    from .api import _settings
+    ft = _settings().get("ft_chats") or []
+    lines = [f"👀 Бот-читатель: {'включён' if reader.RBOT else 'ВЫКЛЮЧЕН (нет READER_BOT_TOKEN)'}",
+             f"🚛 Чаты ТК МСК (читаю): {len(ft)} — " + (", ".join(map(str, ft)) or "нет — добавь читателя и подтверди «Да, это ТК МСК»"),
+             "📣 Уведомления по грузам → " + (", ".join(t['title'] + (' · тема' if t.get('thread_id') else '') for t in staffnotify.targets())
+                                           or "НЕТ чатов — напиши /notify_here в чате склада"),
+             "📦 Пакинги → " + (", ".join(t['title'] for t in packing.targets()) or "нет"),
+             "", "Последнее, что читатель реально получил из групп:"]
+    if reader.SEEN:
+        for x in reader.SEEN[-8:]:
+            lines.append(f"• {x['at']} «{x['chat']}» от {x['from']}{' (БОТ)' if x['bot'] else ''}: {x['text']}")
+    else:
+        lines.append("— ничего с последнего перезапуска")
+    lines.append("\nℹ️ Telegram не показывает ботам сообщения других ботов. Если FloraMailing — бот, читатель его не видит: "
+                 "тогда пересылай мне их сообщения или включим невидимого читателя-аккаунт (Telethon).")
+    await m.answer("\n".join(lines)[:4000])
+
+
 @dp.message(pv, sysf, Command("archive"))
 async def archive_cmd(m: Message):
     """Last documents anyone sent — with a button to get each original back."""
