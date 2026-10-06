@@ -1671,6 +1671,30 @@ def _last_kenya_rpk(res, leg: str, skip_awb: str, kenya_awbs: set):
     return best[0], (f"{a[:3]}-{a[3:]}" if len(a) == 11 else a)
 
 
+def _dt(s: str):
+    from datetime import datetime
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime((s or "").strip()[:16].strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def stays_in_transit(i) -> bool:
+    """«В пути» shows a shipment until it has ARRIVED and is PAID, and 2 more days have passed after both.
+    An unpaid shipment never leaves the list just because it arrived."""
+    from datetime import datetime, timedelta
+    if not i.arrived_at:
+        return True
+    paid = bool(i.topup_id or getattr(i, "via_broker", False))
+    if not paid:
+        return True
+    arr = _dt(re.sub(r"\s*\(.*\)$", "", i.arrived_at or "")) or datetime.now()
+    pay = _dt(i.paid_date or "") or arr
+    return datetime.now() - max(arr, pay) < timedelta(days=2)
+
+
 def transit_view(s=None) -> dict:
     """Everything not arrived yet: paid (in a top-up) and unpaid, with ≈ cost per stem.
     Missing freight is estimated per leg:
@@ -1687,7 +1711,7 @@ def transit_view(s=None) -> dict:
         by_inv = defaultdict(list)
         for l in lines:
             by_inv[l.invoice_id].append(l)
-        moving = [i for i in invs if not i.arrived_at]
+        moving = [i for i in invs if stays_in_transit(i)]
         ft_rate = None
         out = []
         for i in sorted(moving, key=lambda x: (norm_awb(x.awb), x.id)):

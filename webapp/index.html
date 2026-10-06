@@ -613,7 +613,7 @@ async transit({seg}={}){
       ${awb!=='без MAWB'&&ME.can_write?`<span class="pill" data-mk="${esc(awb)}" style="cursor:pointer;margin-left:6px">🏷 ${esc([...new Set(list.flatMap(i=>(i.client_code||'').split(',').map(x=>x.trim()).filter(Boolean)))].join(', ')||'маркировки')}</span>`:''}</h2>
     <div class="group">${list.map(i=>`<div class="row" data-ti="${i.id}"><div class="grow">
       <div class="t">${esc(i.farm)}</div>
-      <div style="margin:3px 0"><span class="pill ${i.paid_state==='paid'?'ok':'warn'}">${i.paid_state==='paid'?'оплачен · '+esc(i.topup):'не оплачен'}</span></div>
+      <div style="margin:3px 0"><span class="pill ${i.paid_state==='paid'?'ok':'warn'}">${i.paid_state==='paid'?'оплачен · '+esc(i.topup):'не оплачен'}</span>${i.arrived_at?` <span class="pill">прибыл ${esc(String(i.arrived_at).slice(0,5))}</span>`:''}</div>
       <div class="s num">${fmt(i.stems)} ст${i.paid_state==='paid'?'':' · ≈$'+fmt(i.est_usd||0,0)}${i.truck?' · 🚚 '+esc(i.truck):''}</div>
       <div class="s num">${legsOf(i).map(l=>`${l.name} ${fmt(l.per,2)}`).join(' + ')} ₽/ст</div></div>
       <div class="v"><div class="num">${i.approx?'≈ ':''}${fmt(i.avg_rub,2)} ₽</div><div class="s">${i.approx?'±10% · ':''}за стебель</div></div></div>`).join('')}</div>`).join('')
