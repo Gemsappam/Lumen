@@ -101,6 +101,28 @@ button.primary{box-shadow:0 4px 14px color-mix(in srgb,var(--rose) 35%,transpare
 .tabbar{backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);background:color-mix(in srgb,var(--bg) 82%,transparent)}
 .tabbar button.on .i{transform:translateY(-1px) scale(1.08)}
 table.lines th{font-weight:700;text-transform:uppercase;font-size:10px;letter-spacing:.04em}
+
+/* ---- v2: quieter, product-like ---- */
+:root{--rose:#8e2f52;--rose-soft:color-mix(in srgb,var(--rose) 9%,transparent);--r:12px;
+  --line:color-mix(in srgb,var(--tg-theme-text-color,#000) 9%,transparent)}
+body{background:var(--bg2)}
+h1{font-size:26px;font-weight:700;letter-spacing:-.025em;margin-top:18px}
+h2{font-size:11px;font-weight:600;letter-spacing:.08em;opacity:.55;margin-top:22px}
+.sub{opacity:.6}
+.group{border-radius:var(--r);box-shadow:none;border:1px solid var(--line);background:var(--bg)}
+.row{border-color:var(--line)}
+.flow{border-radius:var(--r);background:linear-gradient(135deg,#2a1520,#5a1f38);box-shadow:none}
+button{border-radius:10px;font-weight:600}
+button.primary{box-shadow:none;background:var(--rose)}
+button:not(.primary):not(.ghost):not(.x){background:var(--bg);border:1px solid var(--line)}
+.pill{background:transparent;border:1px solid currentColor;font-weight:600;font-size:11px;padding:1px 7px;opacity:.85}
+.tabbar{border-top:1px solid var(--line)}
+.tabbar button{background:transparent!important;border:0!important;font-size:11px;font-weight:600;opacity:.5}
+.tabbar button.on{opacity:1;color:var(--rose)}
+.tabbar .i{display:block;line-height:0;margin:0 auto 3px}
+.tabbar button.on .i{transform:none}
+input,select,textarea{border-radius:8px}
+.num{font-weight:600}
 </style>
 </head>
 <body>
@@ -129,7 +151,8 @@ const stack=[];
 function go(view, args={}, push=true){ if(push) stack.push([view,args]); render(view,args) }
 function back(){ stack.pop(); const [v,a]=stack[stack.length-1]||['home',{}]; render(v,a) }
 tg?.BackButton.onClick(back);
-const TABS=[['home','💐','Откупы'],['transit','🚚','В пути'],['stock','📦','Остатки'],['more','⋯','Ещё']];
+const ICONS={"home": "<svg viewBox=\"0 0 24 24\" width=\"22\" height=\"22\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M4 7h16v12a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z\"/><path d=\"M8 7V5a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2\"/><path d=\"M4 12h16\"/></svg>", "transit": "<svg viewBox=\"0 0 24 24\" width=\"22\" height=\"22\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M3 6h11v10H3z\"/><path d=\"M14 9h4l3 3v4h-7\"/><circle cx=\"7\" cy=\"17.5\" r=\"1.6\"/><circle cx=\"17\" cy=\"17.5\" r=\"1.6\"/></svg>", "stock": "<svg viewBox=\"0 0 24 24\" width=\"22\" height=\"22\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M12 3 3 7.5 12 12l9-4.5z\"/><path d=\"M3 7.5V16.5L12 21l9-4.5V7.5\"/><path d=\"M12 12v9\"/></svg>", "more": "<svg viewBox=\"0 0 24 24\" width=\"22\" height=\"22\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"5\" cy=\"12\" r=\"1.3\"/><circle cx=\"12\" cy=\"12\" r=\"1.3\"/><circle cx=\"19\" cy=\"12\" r=\"1.3\"/></svg>"};
+const TABS=[['home',ICONS.home,'Откупы'],['transit',ICONS.transit,'В пути'],['stock',ICONS.stock,'Остатки'],['more',ICONS.more,'Ещё']];
 const TAB_OF={archive:'more',ledger:'more',marks:'more',home:'home',topup:'home',topupForm:'home',draft:'home',invoice:null,logistics:null,weights:'home',
   transit:'transit',transitInv:'transit',stock:'stock',more:'more',farms:'more',farm:'more',users:'more'};
 let CUR_TAB='home';
