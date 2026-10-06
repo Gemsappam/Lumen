@@ -291,6 +291,7 @@ async topup({id, snap}){
 async invoice({t, inv, draft}){
   const TOPS = await api('/topups');
   let LED = {farms:[]}; try{ LED = await api('/ledger') }catch(e){}
+  let BB = null; if(inv?.id){ try{ BB = await api(`/invoices/${inv.id}/balance_before`) }catch(e){} }
   if(!t.id){ t={...t, rate:(TOPS[0]||{}).rate||0, date:t.date||'в пути'} }        // unpaid: ≈ at the last top-up rate
   inv = inv || {topup_id:t.id,country:'',client_code:'',invoice_no:'',invoice_date:'',awb:'',farm:'',weight_kg:null,
     invoice_total_usd:null,usd_paid:'',rub_paid_override:null,alloc_mode:'value',paid:true,paid_date:t.id?t.date:'',note:'',lines:[]};
@@ -368,11 +369,12 @@ async invoice({t, inv, draft}){
     const F = numOrNull(p.farm_usd.value) || T;
     // advance the farm already had: for a saved invoice — what it actually used; for a new one — current advance
     const fl = LED.farms.find(x=>x.farm.toLowerCase()===(f.farm.value||'').trim().toLowerCase());
-    const A = inv.id ? (inv.ledger?.from_advance||0) : (fl?.advance_usd||0);
+    const A = inv.id ? (BB?.advance||0) : (fl?.advance_usd||0);
     const fb = document.getElementById('farmBal');
     if(fb){
       const d = F + A - T;
-      const how = `инвойс $${fmt(T,2)} − дошло $${fmt(F,2)}` + (A>0.005?` − аванс фермы $${fmt(A,2)}`:'');
+      const why = BB && A>0.005 ? ' ← ' + (BB.from.length ? BB.from.join('; ') : BB.advances.map(x=>`$${fmt(x.usd,2)} от ${x.from}`).join('; ')) : '';
+      const how = `инвойс $${fmt(T,2)} − дошло $${fmt(F,2)}` + (A>0.005?` − аванс фермы $${fmt(A,2)}${why}`:'');
       fb.innerHTML = !T ? '' : Math.abs(d) < 0.01 ? `<span style="color:var(--ok)">✓ Инвойс закрыт полностью</span> <span class="s">(${how.replace(' − дошло',' = дошло').replace('инвойс ','')})</span>`
         : d < 0 ? `<span style="color:var(--err)">Долг ферме: $${fmt(-d,2)}</span> <span class="s">(${how})</span>`
         : `<span style="color:var(--ok)">Аванс у фермы: $${fmt(d,2)}</span> <span class="s">(${how}; зачтётся в следующий инвойс)</span>`;

@@ -3,7 +3,7 @@ import re
 import asyncio
 import shutil
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
@@ -491,6 +491,17 @@ async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dic
                 await send_packing_lists()
                 return
             await m.answer(msg)
+    if out.get("doc_type") == "farm_invoice" and any(not d.get("farm") for d in subs):
+        raw = out.get("supplier") or next((mm.group(1) for w in out.get("warnings", [])
+                                           for mm in [re.search(r"[Пп]оставщик\s+['«\"]([^'»\"]+)", w)] if mm), "")
+        if raw:
+            NEWFARM[m.from_user.id] = {"raw": raw, "subs": subs, "out": out, "caption": m.caption or "",
+                                       "head": _flow_head(subs)}
+            await _send(m.from_user.id, f"🌱 Новая ферма: «{raw}» — её нет в списке плантаций.\nДобавить? Выбери страну:",
+                        _kb([[("🇰🇪 Кения", "nf:Кения"), ("🇪🇨 Эквадор", "nf:Эквадор")],
+                             [("🇨🇴 Колумбия", "nf:Колумбия"), ("🇳🇱 Нидерланды", "nf:Нидерланды")],
+                             [("Не добавлять", "nf:skip")]]), note)
+            return
     if out.get("doc_type") == "farm_invoice":
         from .api import find_same_invoice
         same = [(d, find_same_invoice(d)) for d in subs]
@@ -509,6 +520,39 @@ async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dic
 
 
 CORR: dict = {}       # user -> pending «is it a correction?»
+NEWFARM: dict = {}    # user -> invoice from a farm we don't know yet
+
+
+def _clean_farm_name(raw: str) -> str:
+    """«FLORA DELIGHT LTD» -> «Flora Delight»."""
+    n = re.sub(r"[,.]?\s*\b(ltd|limited|s\.?a\.?s\.?|s\.?a\.?|llc|inc|b\.?v\.?|co)\b\.?", "", raw, flags=re.I).strip(" ,.-")
+    return " ".join(w.capitalize() if w.isupper() or w.islower() else w for w in n.split()) or raw.strip()
+
+
+@dp.callback_query(F.data.startswith("nf:"), wr)
+async def new_farm_answer(c: CallbackQuery):
+    from .api import resolve_farm
+    p = NEWFARM.pop(c.from_user.id, None)
+    await c.answer()
+    if not p:
+        await c.message.edit_text("Устарело — пришли инвойс ещё раз.")
+        return
+    country = c.data.split(":", 1)[1]
+    head = p["head"]
+    if country != "skip":
+        name = _clean_farm_name(p["raw"])
+        with session() as s:
+            f = resolve_farm(s, name, create_country=country)
+            if p["raw"].upper() not in (f.aliases or "").upper():
+                f.aliases = ",".join(x for x in [f.aliases, p["raw"].upper()] if x)
+            s.add(f); s.commit()
+            name = f.name
+        for d in p["subs"]:
+            if not d.get("farm"):
+                d["farm"], d["country"] = name, d.get("country") or country
+                d["warnings"] = [w for w in d.get("warnings", []) if "не найден" not in w]
+        head = f"🌱 Ферма «{name}» ({country}) добавлена в плантации.\n\n" + _flow_head(p["subs"])
+    await _start_flow(c.from_user.id, p["subs"], p["out"], p["caption"], c.message, head)
 BOXWAIT: dict = {}    # user -> invoice id waiting for its box breakdown file
 
 
@@ -1415,7 +1459,8 @@ async def status_cmd(m: Message):
     ft = _settings().get("ft_chats") or []
     lines = [f"👀 Бот-читатель: {'включён' if reader.RBOT else 'ВЫКЛЮЧЕН (нет READER_BOT_TOKEN)'}",
              f"🚛 Чаты ТК МСК (читаю): {len(ft)} — " + (", ".join(map(str, ft)) or "нет — добавь читателя и подтверди «Да, это ТК МСК»"),
-             "📣 Уведомления по грузам → " + (", ".join(t['title'] + (' · тема' if t.get('thread_id') else '') for t in staffnotify.targets())
+             "📣 Уведомления по грузам → " + (", ".join(f"{t['title']} [{t['chat_id']}" + (f" · тема {t['thread_id']}" if t.get('thread_id') else '') + "]"
+                                                      for t in staffnotify.targets())
                                            or "НЕТ чатов — напиши /notify_here в чате склада"),
              "📦 Пакинги → " + (", ".join(t['title'] for t in packing.targets()) or "нет"),
              "", "Последнее, что читатель реально получил из групп:"]
@@ -1427,6 +1472,13 @@ async def status_cmd(m: Message):
     lines.append("\nℹ️ Telegram не показывает ботам сообщения других ботов. Если FloraMailing — бот, читатель его не видит: "
                  "тогда пересылай мне их сообщения или включим невидимого читателя-аккаунт (Telethon).")
     await m.answer("\n".join(lines)[:4000])
+
+
+@dp.message(pv, sysf, Command("notify_reset"))
+async def notify_reset(m: Message):
+    from . import staffnotify
+    staffnotify.set_targets([])
+    await m.answer("Список чатов «Уведомления по грузам» очищен. Напиши /notify_here ОДИН раз в нужном чате (или теме).")
 
 
 @dp.message(pv, sysf, Command("archive"))
@@ -1902,7 +1954,8 @@ async def _truck_event(uid_list, text: str, sent_msk, notify_uid=None):
     from . import clients, reader
     fresh = clients.is_fresh(sent_msk, _msk_now())
     per_client = clients.messages_for(ev) if fresh else {}
-    if fresh:                                   # staff / warehouse chat: the message itself, in our wording
+    staff_ok = fresh or (notify_uid is not None and _msk_now() - sent_msk <= timedelta(days=3))
+    if staff_ok:                                # staff / warehouse chat: the message itself, in our wording
         from . import staffnotify
         await staffnotify.post(reader.RBOT, text)
     line = truck.apply(ev, _msk_now(), fresh=fresh)

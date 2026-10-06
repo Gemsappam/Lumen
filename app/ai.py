@@ -181,6 +181,7 @@ PARSE_TOOL = {
                     "farm": {"type": "string"}, "kg": {"type": "number"}, "boxes": {"type": ["number", "null"]}}}}}},
             "warnings": {"type": "array", "items": {"type": "string"}},
             "stems_total": {"type": ["number", "null"], "description": "stems in the invoice TOTAL row, as printed"},
+            "supplier": {"type": ["string", "null"], "description": "seller/grower name exactly as printed (even if not in the known farms list)"},
             "hawb": {"type": ["string", "null"], "description": "HAWB / house bill number, e.g. CEVB2311731"},
             "boxes_detail": {"type": "array", "description": "box by box, as packed: one entry per invoice box line",
                              "items": {"type": "object", "properties": {

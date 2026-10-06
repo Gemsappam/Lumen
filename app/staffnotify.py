@@ -20,6 +20,7 @@ def rewrite(text: str) -> str:
     """Raw TK MSK message -> HTML for the staff chat."""
     t = (text or "").replace("**", "").replace("*", "")
     t = re.sub(r"Уважаемый клиент", "Дорогой клиент", t, flags=re.I)
+    t = re.sub(r"^\s*Здравствуйте[.!]?", "Дорогой клиент!", t, flags=re.I)
     t = re.sub(r"С\s+уважением,?\s*FLORA\s*TRUCK[!.]*", "@@SIGN@@", t, flags=re.I)
     t = re.sub(r"\s+@@SIGN@@", "\n\n@@SIGN@@", t)
     t = re.sub(r"\s+([.,])", r"\1", t)          # «… NHS159/GY974 .» after removing the asterisks
@@ -28,6 +29,8 @@ def rewrite(text: str) -> str:
     t = re.sub(r"\b(NBO|BOG|MDE|UIO|GYE)\b(?=\s+AWB)", lambda m: CODES[m.group(1)], t)
     t = re.sub(TRUCK_RE, lambda m: f"<b><u>{m.group(0)}</u></b>", t)
     t = re.sub(AWB_RE, lambda m: f"<b><u>{m.group(0)}</u></b>", t)
+    if "@@SIGN@@" not in t:
+        t = t.rstrip() + "\n\n@@SIGN@@"
     return t.replace("@@SIGN@@", "С уважением, Lumen Flora").strip()
 
 

@@ -1229,6 +1229,35 @@ def adjust_farm_balance(farm: str, target_usd: float):
     mark_dirty()
 
 
+@router.get("/invoices/{inv_id}/balance_before")
+def balance_before(inv_id: int, uid: int = Depends(writer)):
+    """Farm balance right BEFORE this invoice (earlier invoices + payments + opening), and where the advance came from."""
+    from .calc import farm_ledger, rate_of
+    from collections import defaultdict
+    with session() as s:
+        tops, invs, lines, logs = _all(s)
+        me = s.get(Invoice, inv_id)
+        if not me:
+            raise HTTPException(404)
+        earlier = [i for i in invs if i.id < inv_id]
+        lbi = defaultdict(list)
+        for l in lines:
+            lbi[l.invoice_id].append(l)
+        est = rate_of(max(tops, key=lambda t: t.id)) if tops else 0
+        led = farm_ledger(tops, earlier, lbi, est)
+        acc = calc_rule_account(me.farm)
+        f = next((v for k, v in led["farms"].items() if k.lower() == me.farm.lower()
+                  or (acc and k.lower().startswith(acc.lower()))), None)
+        src = []
+        for i in earlier:
+            if i.farm == me.farm and i.id in led["inv"]:
+                r = led["inv"][i.id]
+                if r["farm_usd"] > r["total"] + 0.005:
+                    src.append(f"{i.invoice_date or ''} № {i.invoice_no or '—'}: дошло ${r['farm_usd']:g} при инвойсе ${r['total']:g}")
+    return {"advance": (f or {}).get("advance_usd", 0), "debt": (f or {}).get("debt_usd", 0),
+            "advances": (f or {}).get("advances", []), "from": src}
+
+
 @router.get("/ledger")
 def get_ledger(uid: int = Depends(writer)):
     return ledger_view()
