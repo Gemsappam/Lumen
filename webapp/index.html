@@ -417,6 +417,14 @@ async invoice({t, inv, draft}){
     const A = inv.id ? (BB?.advance||0) : (fl?.advance_usd||0);
     const fb = document.getElementById('farmBal');
     if(fb){
+      if(inv.id && inv.ledger && numOrNull(p.farm_usd.value)===(inv.farm_usd??null)){   // saved & unchanged: real ledger
+        const L=inv.ledger, parts=(L.parts||[]).map(x=>`$${fmt(x.usd,2)} × ${fmt(x.rate,2)} (${esc(x.src)})`).join(' + ');
+        fb.innerHTML = L.debt_usd>0.005
+          ? `<span style="color:var(--err)">Долг ферме: $${fmt(L.debt_usd,2)}</span> <span class="s">(закрыто: ${parts||'—'})</span>`
+            + ` <button type="button" class="ghost" onclick="payDebt('${esc(f.farm.value)}',${L.debt_usd.toFixed(2)})">Оплатить долг</button>`
+          : `<span style="color:var(--ok)">✓ Инвойс $${fmt(T,2)} закрыт полностью</span> <span class="s">= ${parts}</span>`;
+        if(rub && F){ const k=rub/F, r=rateNow(); if(k<r*0.98) fb.innerHTML+=`<div style="color:var(--warn);margin-top:4px">⚠️ ${fmt(k,2)} ₽ за 1 $ фермы — меньше курса пополнения ${fmt(r,2)}: проверь суммы.</div>` }
+      } else {
       const d = F + A - T;
       const why = BB && A>0.005 ? ' ← ' + (BB.from.length ? BB.from.join('; ') : BB.advances.map(x=>`$${fmt(x.usd,2)} от ${x.from}`).join('; ')) : '';
       const how = `инвойс $${fmt(T,2)} − дошло $${fmt(F,2)}` + (A>0.005?` − аванс фермы $${fmt(A,2)}${why}`:'');
@@ -427,6 +435,7 @@ async invoice({t, inv, draft}){
       if(rub && F){
         const k = rub / F, r = rateNow();
         if(k < r*0.98) fb.innerHTML += `<div style="color:var(--warn);margin-top:4px">⚠️ ${fmt(k,2)} ₽ за 1 $ фермы — это меньше курса пополнения ${fmt(r,2)}. Так не бывает: проверь «Оплачено, ₽» и «Дошло до фермы».</div>`;
+      }
       }
     }
     if(tr && rub && val && !perStem){

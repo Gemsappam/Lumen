@@ -119,7 +119,10 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
         lines_by[l.invoice_id].append(l)
 
     # logistics section goes after the blocks; we need its rows before writing line formulas
-    n_rows = sum(len(lines_by[i.id]) + 2 for i in own_invs if lines_by[i.id])
+    def _has_note(i):
+        led = res.inv_ledger.get(i.id) or {}
+        return not operator and (len(led.get("parts", [])) > 1 or led.get("debt_usd", 0) > 0.005)
+    n_rows = sum(len(lines_by[i.id]) + 2 + (1 if _has_note(i) else 0) for i in own_invs if lines_by[i.id])
     grand_row = 4 + n_rows
     leg_start = grand_row + 3
     leg_keys = []
@@ -196,7 +199,17 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
                 18: "да" if inv.paid else "нет", 19: inv.paid_date}
         for c, v in head.items():
             ws.cell(r0, c, v).font = BLUE if c == 16 else BLACK
-        if inv.rub_paid_override is not None:
+        # debt of THIS invoice paid later from another top-up -> part of what this invoice cost in money
+        dp = [p for p in (res.inv_ledger.get(inv.id) or {}).get("parts", []) if str(p.get("src", "")).startswith("оплата долга")]
+        dp_usd = sum(p["usd"] for p in dp)
+        dp_rub = sum(p["usd"] * p["rate"] for p in dp)
+        own_rub = inv.rub_paid_override if inv.rub_paid_override is not None else rub_paid
+        if dp:
+            ws.cell(r0, 16, round((inv.usd_paid or 0) + dp_usd, 2)).font = BLUE
+            ws.cell(r0, 17, round(own_rub + dp_rub)).font = BLUE
+            ws.cell(r0, 17).comment = Comment(
+                f"{own_rub:,.0f} ₽ (эта оплата) + {dp_rub:,.0f} ₽ оплата долга (${dp_usd:.2f}, другое пополнение)".replace(",", " "), "bot")
+        elif inv.rub_paid_override is not None:
             ws.cell(r0, 17, inv.rub_paid_override).font = BLUE
         else:
             ws.cell(r0, 17, rub_paid if operator else f"=ROUND(P{r0}*$B$2,0)")
@@ -214,17 +227,19 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
         # ИТОГО: коробки, стебли, вес плантации (весь её вес в MAWB), себестоимость партии
         t = r1 + 1
         ws.cell(t, 6, "ИТОГО").font = TOTAL_FONT
-        ws.cell(t, 7, f"=SUM(G{r0}:G{r1})").font = TOTAL_FONT
+        tot_box = sum(float(l.boxes or 0) for l in ls)
+        tot_st = sum(float(l.stems or 0) for l in ls)
+        ws.cell(t, 7, tot_box or 0).font = TOTAL_FONT
         ws.cell(t, 7).fill = ACC_TOT
-        ws.cell(t, 8, f"=SUM(H{r0}:H{r1})").font = TOTAL_FONT
+        ws.cell(t, 8, tot_st).font = TOTAL_FONT
         if inv.weight_kg:
             ws.cell(t, 9, inv.weight_kg).font = Font(name=F, bold=True, color="0000FF")
         elif any(l.weight_kg for l in ls):
-            ws.cell(t, 9, f"=SUM(I{r0}:I{r1})").font = TOTAL_FONT
+            ws.cell(t, 9, sum(float(l.weight_kg or 0) for l in ls)).font = TOTAL_FONT
         ws.cell(t, 9).fill = ACC_TOT
         ws.cell(t, 9).comment = Comment("Итого вес плантации в MAWB, кг", "bot")
         block_tot.append(t)
-        ws.cell(t, 10, f"=SUMPRODUCT(J{r0}:J{r1},H{r0}:H{r1})").font = GREY
+        ws.cell(t, 10, round(sum(l.price_usd * l.stems for l in ls), 2)).font = GREY
         ws.cell(t, 10).number_format = USD
         ws.cell(t, 10).comment = Comment("Сумма строк цветов, $", "bot")
         # истинный курс партии и косты оплаты
@@ -235,13 +250,23 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
         ws.cell(t, 12, round(res.cost_pct.get(inv.id, 0) / 100, 4)).number_format = "0.0%"
         ws.cell(t, 12).font = GREY
         ws.cell(t, 12).comment = Comment("Косты оплаты сверх строк цветов (комиссия, налог, doc fee), %", "bot")
-        r = t + 2
+        led = res.inv_ledger.get(inv.id) or {}
+        if not operator and (len(led.get("parts", [])) > 1 or led.get("debt_usd", 0) > 0.005):
+            parts = " + ".join(f"${p['usd']:.2f} × {p['rate']:.2f} ({p['src']})" for p in led.get("parts", []))
+            if led.get("debt_usd", 0) > 0.005:
+                parts += f" + долг ${led['debt_usd']:.2f} ≈ по последнему курсу"
+            ws.cell(t + 1, 6, f"Себестоимость {round(res.invoice_cost.get(inv.id, 0)):,} ₽ = ".replace(",", " ") + parts)
+            ws.cell(t + 1, 6).font = Font(name=F, italic=True, color="7F7F7F")
+            r = t + 3
+        else:
+            r = t + 2
 
     if block_tot:
         g = grand_row
         ws.cell(g, 6, "ИТОГО ПО ПОПОЛНЕНИЮ").font = TOTAL_FONT
         for c, fmt in ((7, "0"), (8, "#,##0"), (9, "#,##0.0")):
-            ws.cell(g, c, "=" + "+".join(f"{CL(c)}{t}" for t in block_tot)).font = TOTAL_FONT
+            ws.cell(g, c, sum(float(ws.cell(t, c).value or 0) for t in block_tot
+                              if isinstance(ws.cell(t, c).value, (int, float)))).font = TOTAL_FONT
             ws.cell(g, c).number_format = fmt
             ws.cell(g, c).fill = ACC_COST if c == 15 else ACC_GRAND
         for c in range(6, 16):
