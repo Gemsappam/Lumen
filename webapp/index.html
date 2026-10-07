@@ -136,6 +136,28 @@ const fmt = (n, d=0) => n==null||n==='' ? '—' : Number(n).toLocaleString('ru-R
 const esc = s => String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const numOrNull = v => v===''||v==null ? null : Number(String(v).replace(',','.').replace(/\s/g,''));
 const today = () => new Date().toLocaleDateString('ru-RU');
+async function payDebt(farm, debt){
+  const tops=await api('/topups');
+  const w=document.createElement('div');
+  w.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:20;display:flex;align-items:flex-end';
+  w.innerHTML=`<div style="background:var(--bg2);width:100%;border-radius:16px 16px 0 0;padding:14px 0 calc(16px + env(safe-area-inset-bottom,0))">
+    <h2 style="margin-top:4px">Оплата долга · ${esc(farm)}</h2>
+    <form class="group" id="pd">
+      <div class="field"><label>Из пополнения</label><select name="t">${tops.map(t=>`<option value="${t.id}">${esc(t.date)}${t.rate?' · курс '+fmt(t.rate,2):''}</option>`).join('')}</select></div>
+      <div class="two"><div class="field"><label>Оплачено, $ (с костами)</label><input name="u" inputmode="decimal" value="${debt}"></div>
+      <div class="field"><label>Дошло до фермы, $</label><input name="c" inputmode="decimal" value="${debt}"></div></div>
+      <div class="field"><label>₽ (пусто = $ × курс пополнения)</label><input name="r" inputmode="decimal"></div></form>
+    <p class="hint" style="margin:6px 16px">Долг закроется по курсу этого пополнения, и себестоимость тех стеблей пересчитается.</p>
+    <div class="actions"><button id="pdc">Отмена</button><button class="primary" id="pdo">Записать оплату</button></div></div>`;
+  document.body.appendChild(w);
+  w.querySelector('#pdc').onclick=()=>w.remove();
+  w.querySelector('#pdo').onclick=async()=>{const f=w.querySelector('#pd');
+    const b={farm,topup_id:+f.t.value,usd_sent:numOrNull(f.u.value),usd_credited:numOrNull(f.c.value),rub:numOrNull(f.r.value)};
+    if(!b.usd_sent) return toast('Укажи сумму');
+    try{const r=await api('/farm_payment',{method:'POST',body:b}); w.remove(); toast(r.text); if((document.querySelector('h1')?.textContent||'').includes('Расчёты')) render('ledger',{})}catch(e){toast(e.message)}};
+}
+
+
 function toast(t){const e=document.getElementById('toast');e.textContent=t;e.classList.add('on');setTimeout(()=>e.classList.remove('on'),2600)}
 
 async function api(path, opt={}){
@@ -400,6 +422,7 @@ async invoice({t, inv, draft}){
       const how = `инвойс $${fmt(T,2)} − дошло $${fmt(F,2)}` + (A>0.005?` − аванс фермы $${fmt(A,2)}${why}`:'');
       fb.innerHTML = !T ? '' : Math.abs(d) < 0.01 ? `<span style="color:var(--ok)">✓ Инвойс закрыт полностью</span> <span class="s">(${how.replace(' − дошло',' = дошло').replace('инвойс ','')})</span>`
         : d < 0 ? `<span style="color:var(--err)">Долг ферме: $${fmt(-d,2)}</span> <span class="s">(${how})</span>`
+          + (inv.id?` <button type="button" class="ghost" onclick="payDebt('${esc(f.farm.value)}',${(-d).toFixed(2)})">Оплатить долг</button>`:'')
         : `<span style="color:var(--ok)">Аванс у фермы: $${fmt(d,2)}</span> <span class="s">(${how}; зачтётся в следующий инвойс)</span>`;
       if(rub && F){
         const k = rub / F, r = rateNow();
@@ -610,7 +633,7 @@ async transit({seg}={}){
   <p class="sub">${SEG==='paid'?'Оплаченные грузы, которые ещё едут.':'Неоплаченные грузы в пути — себестоимость приблизительная (±10%).'}
     ${ME.can_write&&SEG!=='paid'?` ≈ по курсу ${fmt(v.est_rate,2)} (пополнение ${esc(v.est_topup||'—')}).`:''}</p>
   ${Object.keys(by).length?Object.entries(by).map(([awb,list])=>`<h2>${awb==='без MAWB'?'MAWB ещё не известен':'MAWB '+esc(awb)}${list.find(x=>x.eta)?' · '+eta(list.find(x=>x.eta)):''}
-      ${awb!=='без MAWB'&&ME.can_write?`<span class="pill" data-mk="${esc(awb)}" style="cursor:pointer;margin-left:6px">🏷 ${esc([...new Set(list.flatMap(i=>(i.client_code||'').split(',').map(x=>x.trim()).filter(Boolean)))].join(', ')||'маркировки')}</span>`:''}</h2>
+      ${awb!=='без MAWB'&&ME.can_write?`<span class="pill" data-px="${esc(awb)}" style="cursor:pointer;margin-left:6px">💳 оплаты</span><span class="pill" data-mk="${esc(awb)}" style="cursor:pointer;margin-left:6px">🏷 ${esc([...new Set(list.flatMap(i=>(i.client_code||'').split(',').map(x=>x.trim()).filter(Boolean)))].join(', ')||'маркировки')}</span>`:''}</h2>
     <div class="group">${list.map(i=>`<div class="row" data-ti="${i.id}"><div class="grow">
       <div class="t">${esc(i.farm)}</div>
       <div style="margin:3px 0"><span class="pill ${i.paid_state==='paid'?'ok':'warn'}">${i.paid_state==='paid'?'оплачен · '+esc(i.topup):'не оплачен'}</span>${i.arrived_at?` <span class="pill">прибыл ${esc(String(i.arrived_at).slice(0,5))}</span>`:''}</div>
@@ -656,6 +679,8 @@ async transit({seg}={}){
     });
   };
   $app.querySelectorAll('[data-ti]').forEach(e=>e.onclick=()=>go('transitInv',{i:v.invoices.find(x=>x.id==e.dataset.ti),v}));
+  $app.querySelectorAll('[data-px]').forEach(e=>e.onclick=async()=>{ toast('Собираю…');
+    try{ await api('/awb/'+encodeURIComponent(e.dataset.px)+'/payments_export',{method:'POST'}); toast('Оплаты по MAWB отправлены в чат') }catch(x){toast(x.message)} });
   $app.querySelectorAll('[data-mk]').forEach(e=>e.onclick=async()=>{
     const cur=[...new Set(v.invoices.filter(i=>i.awb===e.dataset.mk).flatMap(i=>(i.client_code||'').split(',').map(x=>x.trim()).filter(Boolean)))].join(', ');
     const nv=prompt('Чьи маркировки в этой поставке? Через запятую, например: LUMEN, ABC',cur); if(nv===null) return;
@@ -748,7 +773,8 @@ async ledger(){
   <p class="sub">В $, по тому, что дошло до фермы. Аванс — деньги лежат у фермы и зачтутся в следующий инвойс по курсу той оплаты. Долг — мы должны; пока не оплачен, считается ≈ по курсу последнего пополнения.</p>
   <div class="group">${r.farms.length?r.farms.map(f=>`<div class="row"><div class="grow"><div class="t">${esc(f.farm)}</div>
       <div class="s num">${f.advances.map(a=>`аванс $${fmt(a.usd,2)} по ${fmt(a.rate,2)} ₽/$ (оплата ${esc(a.from)})`).join('<br>')}${f.debts.length?(f.advances.length?'<br>':'')+`долг $${fmt(f.debt_usd,2)}`:''}</div></div>
-      <div class="v"><div class="num" style="color:${f.balance_usd<0?'var(--err)':'var(--ok)'}"><b>${f.balance_usd<0?'долг ':'аванс '}$${fmt(Math.abs(f.balance_usd),2)}</b></div></div></div>`).join('')
+      <div class="v"><div class="num" style="color:${f.balance_usd<0?'var(--err)':'var(--ok)'}"><b>${f.balance_usd<0?'долг ':'аванс '}$${fmt(Math.abs(f.balance_usd),2)}</b></div>
+        ${f.balance_usd<0?`<button class="ghost" onclick="payDebt('${esc(f.farm.replace(/ \(.*\)$/,''))}',${Math.abs(f.balance_usd).toFixed(2)})">Оплатить</button>`:''}</div></div>`).join('')
     :'<div class="empty">Со всеми фермами расчёты закрыты: ни авансов, ни долгов.</div>'}</div>
   <h2>Баланс, который был до бота</h2>
   <form id="op" class="group"><div class="field"><label>Ферма</label><input name="farm" list="opf" placeholder="Agriflora"><datalist id="opf">${FARMS.map(f=>`<option value="${esc(f.name)}">`).join('')}</datalist></div>

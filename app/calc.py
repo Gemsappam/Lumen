@@ -103,6 +103,10 @@ def _d(s: str):
     return None
 
 
+def _lbl(src: str) -> str:
+    return src if src.startswith(("оплата", "пополнение", "начальный")) else f"оплата {src}"
+
+
 def _rule(farm: str) -> dict:
     return RULES.get((farm or "").strip().lower(), {})
 
@@ -151,7 +155,8 @@ def farm_ledger(topups, invoices, lines_by_inv, est_rate) -> dict:
                 rub = inv.rub if inv.rub else (inv.usd_sent * rate_of(t) if t else inv.usd_sent * est_rate)
                 if inv.usd_credited > 0:
                     rpu = rub / inv.usd_credited
-                    credits.append([inv.usd_credited, rpu, f"пополнение брокера {inv.date}"])
+                    lbl = "оплата долга" if (inv.ext_id or "").startswith("pay-") else "пополнение брокера"
+                    credits.append([inv.usd_credited, rpu, f"{lbl} {inv.date}"])
                     while debts and credits:
                         d0, c0 = debts[0], credits[0]
                         take = min(d0[1], c0[0])
@@ -192,7 +197,7 @@ def farm_ledger(topups, invoices, lines_by_inv, est_rate) -> dict:
                             old = out_inv[d[0]]
                             old["rub_cost"] += take * c[1]
                             old["debt_usd"] -= take
-                            old["parts"].append({"usd": take, "rate": c[1], "src": f"оплата {c[2]}"})
+                            old["parts"].append({"usd": take, "rate": c[1], "src": _lbl(c[2])})
                         d[1] -= take; c[0] -= take
                         if d[1] <= 1e-6: debts.popleft()
                         if c[0] <= 1e-6: credits.popleft()
@@ -201,7 +206,7 @@ def farm_ledger(topups, invoices, lines_by_inv, est_rate) -> dict:
                 c = credits[0]
                 take = min(need, c[0])
                 rec["rub_cost"] += take * c[1]
-                rec["parts"].append({"usd": take, "rate": c[1], "src": f"оплата {c[2]}"})
+                rec["parts"].append({"usd": take, "rate": c[1], "src": _lbl(c[2])})
                 need -= take; c[0] -= take
                 if c[0] <= 1e-6:
                     credits.popleft()

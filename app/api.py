@@ -1258,6 +1258,122 @@ def balance_before(inv_id: int, uid: int = Depends(writer)):
             "advances": (f or {}).get("advances", []), "from": src}
 
 
+class FarmPayIn(BaseModel):
+    farm: str
+    topup_id: int
+    usd_sent: float                    # left the top-up (with costs)
+    usd_credited: float | None = None  # reached the farm (None = same as sent)
+    rub: float | None = None
+
+
+@router.post("/farm_payment")
+def farm_payment(body: FarmPayIn, uid: int = Depends(writer)):
+    """Pay a farm's debt (or put an advance) from a top-up, without a new invoice.
+    The ledger settles the oldest debt first at THIS payment's rate -> those stems' cost is recalculated."""
+    import uuid
+    from datetime import date
+    from .models import BrokerDeposit
+    with session() as s:
+        f = resolve_farm(s, body.farm)
+        name = f.name if f else body.farm
+        acc = calc_rule_account(name) or name
+        s.add(BrokerDeposit(ext_id=f"pay-{uuid.uuid4().hex[:10]}", account=acc, date=date.today().isoformat(),
+                            usd_sent=body.usd_sent, usd_credited=body.usd_credited or body.usd_sent,
+                            topup_id=body.topup_id, rub=body.rub))
+        s.commit()
+    from .backup import mark_dirty
+    mark_dirty()
+    return {"text": farm_balance_text(name)}
+
+
+def awb_payments_xlsx(awb: str) -> tuple[bytes, str]:
+    """Everything paid for one MAWB, whatever top-ups it came from: farm invoices, debt payments, logistics."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Border, Font, PatternFill, Side
+    from .models import BrokerDeposit
+    k = norm_awb(awb)
+    with session() as s:
+        tops, invs, lines, logs = _all(s)
+        res = compute(0, tops, invs, lines, logs, _awb_kg(s))
+        tmap = {t.id: t for t in tops}
+        mine = [i for i in invs if norm_awb(i.awb) == k]
+        deps = s.exec(select(BrokerDeposit)).all()
+    if not mine:
+        raise HTTPException(404, "По этому MAWB инвойсов нет")
+    disp = mine[0].awb
+    thin = Side(style="thin", color="BFBFBF"); box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    hdr = lambda ws, r, cols: [setattr(ws.cell(r, c, h), "font", Font(bold=True)) or
+                               setattr(ws.cell(r, c), "fill", PatternFill("solid", fgColor="D9E1F2")) or
+                               setattr(ws.cell(r, c), "border", box) for c, h in enumerate(cols, 1)]
+    wb = Workbook(); ws = wb.active; ws.title = "Оплаты по MAWB"
+    ws["A1"] = f"Оплаты по MAWB {disp}"; ws["A1"].font = Font(bold=True, size=14)
+    r = 3
+    ws.cell(r, 1, "ЦВЕТЫ (инвойсы ферм)").font = Font(bold=True); r += 1
+    cols = ["Ферма", "Инвойс №", "Дата", "Пополнение", "Курс пополн.", "Оплачено $", "Оплачено ₽", "Дошло до фермы $",
+            "Итог инвойса $", "Себестоимость товара ₽", "Из чего (части оплаты)", "Статус"]
+    hdr(ws, r, cols); r += 1
+    t_usd = t_rub = t_cost = 0
+    for i in sorted(mine, key=lambda x: x.farm):
+        led = res.inv_ledger.get(i.id) or {}
+        t = tmap.get(i.topup_id)
+        rub = res.invoice_rub.get(i.id, 0) if i.topup_id else 0
+        parts = "; ".join(f"${p['usd']:.2f} × {p['rate']:.2f} ({p['src']})" for p in led.get("parts", []))
+        if led.get("debt_usd", 0) > 0.005:
+            parts += f"; долг ${led['debt_usd']:.2f} ≈"
+        status = ("брокер (выписка)" if getattr(i, "via_broker", False) else "оплачен" if i.topup_id else "НЕ оплачен")
+        row = [i.farm, i.invoice_no or "", i.invoice_date or "", t.date if t else ("брокер" if i.via_broker else "—"),
+               round(rate_of(t), 4) if t else None, i.usd_paid if i.topup_id else None, rub or None,
+               led.get("farm_usd") or None, round(led.get("total", 0), 2), round(res.invoice_cost.get(i.id, 0)), parts, status]
+        for c, v in enumerate(row, 1):
+            ws.cell(r, c, v).border = box
+        t_usd += i.usd_paid if i.topup_id else 0; t_rub += rub; t_cost += res.invoice_cost.get(i.id, 0)
+        r += 1
+    for c, v in ((1, "ИТОГО"), (6, round(t_usd, 2)), (7, round(t_rub)), (10, round(t_cost))):
+        ws.cell(r, c, v).font = Font(bold=True)
+    r += 2
+    farms = {i.farm.lower() for i in mine}
+    dp = [d for d in deps if (d.ext_id or "").startswith("pay-") and (d.account or "").lower() in farms]
+    if dp:
+        ws.cell(r, 1, "ОПЛАТЫ ДОЛГОВ ФЕРМАМ (без инвойса)").font = Font(bold=True); r += 1
+        hdr(ws, r, ["Ферма", "Дата", "Пополнение", "Оплачено $", "Дошло $", "₽"]); r += 1
+        for d in dp:
+            t = tmap.get(d.topup_id)
+            for c, v in enumerate([d.account, d.date, t.date if t else "—", d.usd_sent, d.usd_credited,
+                                   round(d.rub or (d.usd_sent * rate_of(t) if t else 0))], 1):
+                ws.cell(r, c, v).border = box
+            r += 1
+        r += 1
+    ws.cell(r, 1, "ЛОГИСТИКА").font = Font(bold=True); r += 1
+    hdr(ws, r, ["ТК", "Счёт №", "Пополнение", "$", "₽", "Оплачен"]); r += 1
+    l_rub = 0
+    for lg in [x for x in logs if norm_awb(x.awb) == k]:
+        t = tmap.get(lg.topup_id)
+        rub = lg.rub if lg.rub is not None else ((lg.usd or 0) * rate_of(t) if t else None)
+        name = "ТК Кения" if lg.leg == "air" else "ТК МСК"
+        for c, v in enumerate([name, lg.invoice_no, t.date if t else "—", lg.usd, round(rub) if rub else None,
+                               "да" if lg.paid else "нет (≈)"], 1):
+            ws.cell(r, c, v).border = box
+        l_rub += rub or 0
+        r += 1
+    ws.cell(r, 1, "ИТОГО логистика").font = Font(bold=True); ws.cell(r, 5, round(l_rub)).font = Font(bold=True)
+    r += 2
+    ws.cell(r, 1, "ВСЕГО ПО MAWB, ₽ (товар + логистика)").font = Font(bold=True, size=12)
+    ws.cell(r, 5, round(t_cost + l_rub)).font = Font(bold=True, size=12)
+    for col, w in zip("ABCDEFGHIJKL", (22, 12, 12, 13, 11, 12, 13, 14, 13, 18, 60, 14)):
+        ws.column_dimensions[col].width = w
+    buf = io.BytesIO(); wb.save(buf)
+    return buf.getvalue(), f"Оплаты_MAWB_{re.sub(r'[^0-9-]', '', disp)}.xlsx"
+
+
+@router.post("/awb/{awb}/payments_export")
+async def awb_payments_export(awb: str, uid: int = Depends(writer)):
+    from aiogram.types import BufferedInputFile
+    data, fname = awb_payments_xlsx(awb)
+    if BOT:
+        await BOT.send_document(uid, BufferedInputFile(data, fname), caption=f"💳 Оплаты по MAWB {awb}")
+    return {"ok": True}
+
+
 @router.get("/ledger")
 def get_ledger(uid: int = Depends(writer)):
     return ledger_view()

@@ -1474,6 +1474,22 @@ async def status_cmd(m: Message):
     await m.answer("\n".join(lines)[:4000])
 
 
+@dp.message(pv, wr, Command("awb"))
+async def awb_export_cmd(m: Message):
+    from aiogram.types import BufferedInputFile
+    from .api import awb_payments_xlsx
+    awb = ai.find_mawb(m.text or "")
+    if not awb:
+        await m.answer("Напиши так: /awb 074-48014901")
+        return
+    try:
+        data, fname = awb_payments_xlsx(awb)
+    except Exception as e:
+        await m.answer(f"Не получилось: {getattr(e, 'detail', e)}")
+        return
+    await m.answer_document(BufferedInputFile(data, fname), caption=f"💳 Оплаты по MAWB {awb}")
+
+
 @dp.message(pv, sysf, Command("notify_reset"))
 async def notify_reset(m: Message):
     from . import staffnotify
