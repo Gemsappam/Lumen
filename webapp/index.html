@@ -633,7 +633,7 @@ async transit({seg}={}){
   <p class="sub">${SEG==='paid'?'Оплаченные грузы, которые ещё едут.':'Неоплаченные грузы в пути — себестоимость приблизительная (±10%).'}
     ${ME.can_write&&SEG!=='paid'?` ≈ по курсу ${fmt(v.est_rate,2)} (пополнение ${esc(v.est_topup||'—')}).`:''}</p>
   ${Object.keys(by).length?Object.entries(by).map(([awb,list])=>`<h2>${awb==='без MAWB'?'MAWB ещё не известен':'MAWB '+esc(awb)}${list.find(x=>x.eta)?' · '+eta(list.find(x=>x.eta)):''}
-      ${awb!=='без MAWB'&&ME.can_write?`<span class="pill" data-px="${esc(awb)}" style="cursor:pointer;margin-left:6px">💳 оплаты</span><span class="pill" data-mk="${esc(awb)}" style="cursor:pointer;margin-left:6px">🏷 ${esc([...new Set(list.flatMap(i=>(i.client_code||'').split(',').map(x=>x.trim()).filter(Boolean)))].join(', ')||'маркировки')}</span>`:''}</h2>
+      ${awb!=='без MAWB'&&ME.can_write?`<span class="pill" data-px="${esc(awb)}" style="cursor:pointer;margin-left:6px">💳 Excel MAWB</span><span class="pill" data-mk="${esc(awb)}" style="cursor:pointer;margin-left:6px">🏷 ${esc([...new Set(list.flatMap(i=>(i.client_code||'').split(',').map(x=>x.trim()).filter(Boolean)))].join(', ')||'маркировки')}</span>`:''}</h2>
     <div class="group">${list.map(i=>`<div class="row" data-ti="${i.id}"><div class="grow">
       <div class="t">${esc(i.farm)}</div>
       <div style="margin:3px 0"><span class="pill ${i.paid_state==='paid'?'ok':'warn'}">${i.paid_state==='paid'?'оплачен · '+esc(i.topup):'не оплачен'}</span>${i.arrived_at?` <span class="pill">прибыл ${esc(String(i.arrived_at).slice(0,5))}</span>`:''}</div>
@@ -680,7 +680,9 @@ async transit({seg}={}){
   };
   $app.querySelectorAll('[data-ti]').forEach(e=>e.onclick=()=>go('transitInv',{i:v.invoices.find(x=>x.id==e.dataset.ti),v}));
   $app.querySelectorAll('[data-px]').forEach(e=>e.onclick=async()=>{ toast('Собираю…');
-    try{ await api('/awb/'+encodeURIComponent(e.dataset.px)+'/payments_export',{method:'POST'}); toast('Оплаты по MAWB отправлены в чат') }catch(x){toast(x.message)} });
+    try{ await api('/awb/'+encodeURIComponent(e.dataset.px)+'/payments_export',{method:'POST'});
+         await api('/awb/'+encodeURIComponent(e.dataset.px)+'/operator_export',{method:'POST'}).catch(x=>toast(x.message));
+         toast('Оплаты и учёт по MAWB отправлены в чат') }catch(x){toast(x.message)} });
   $app.querySelectorAll('[data-mk]').forEach(e=>e.onclick=async()=>{
     const cur=[...new Set(v.invoices.filter(i=>i.awb===e.dataset.mk).flatMap(i=>(i.client_code||'').split(',').map(x=>x.trim()).filter(Boolean)))].join(', ');
     const nv=prompt('Чьи маркировки в этой поставке? Через запятую, например: LUMEN, ABC',cur); if(nv===null) return;

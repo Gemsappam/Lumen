@@ -1365,6 +1365,40 @@ def awb_payments_xlsx(awb: str) -> tuple[bytes, str]:
     return buf.getvalue(), f"Оплаты_MAWB_{re.sub(r'[^0-9-]', '', disp)}.xlsx"
 
 
+def awb_operator_xlsx(awb: str) -> tuple[bytes, str, list]:
+    """The operator's usual sheet (nomenclature, ₽ per stem, logistics), only for this MAWB —
+    one sheet per top-up that paid for it. Unpaid invoices are listed separately."""
+    import tempfile
+    from pathlib import Path
+    k = norm_awb(awb)
+    with session() as s:
+        tops, invs, lines, logs = _all(s)
+        kg, bd = _awb_kg(s), _awb_breakdown(s)
+        mine = [i for i in invs if norm_awb(i.awb) == k]
+        if not mine:
+            raise HTTPException(404, "По этому MAWB инвойсов нет")
+        tmap = {t.id: t for t in tops}
+        path = Path(tempfile.mkdtemp()) / "op.xlsx"
+        for tid in sorted({i.topup_id for i in mine if i.topup_id in tmap}):
+            excel.build(path, tmap[tid], tops, invs, lines, logs, awb_kg=kg, awb_breakdown=bd, operator=True, only_awb=k)
+        s.rollback()                                   # build() renames top-up sheets in memory — never save that
+        unpaid = sorted({i.farm for i in mine if not i.topup_id and not getattr(i, "via_broker", False)})
+    if not path.exists():
+        raise HTTPException(400, "По этому MAWB ещё ничего не оплачено — листу оператора нечего показать")
+    return path.read_bytes(), f"Учет_MAWB_{re.sub(r'[^0-9-]', '', mine[0].awb)}.xlsx", unpaid
+
+
+@router.post("/awb/{awb}/operator_export")
+async def awb_operator_export(awb: str, uid: int = Depends(writer)):
+    from aiogram.types import BufferedInputFile
+    data, fname, unpaid = awb_operator_xlsx(awb)
+    if BOT:
+        await BOT.send_document(uid, BufferedInputFile(data, fname),
+                                caption=f"📊 Учёт по MAWB {awb} (формат оператора)"
+                                        + (f"\nНе оплачены, в файл не вошли: {', '.join(unpaid)}" if unpaid else ""))
+    return {"ok": True}
+
+
 @router.post("/awb/{awb}/payments_export")
 async def awb_payments_export(awb: str, uid: int = Depends(writer)):
     from aiogram.types import BufferedInputFile

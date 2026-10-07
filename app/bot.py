@@ -1488,6 +1488,13 @@ async def awb_export_cmd(m: Message):
         await m.answer(f"Не получилось: {getattr(e, 'detail', e)}")
         return
     await m.answer_document(BufferedInputFile(data, fname), caption=f"💳 Оплаты по MAWB {awb}")
+    from .api import awb_operator_xlsx
+    try:
+        d2, f2, unpaid = awb_operator_xlsx(awb)
+        await m.answer_document(BufferedInputFile(d2, f2), caption=f"📊 Учёт по MAWB {awb} (формат оператора)"
+                                + (f"\nНе оплачены, в файл не вошли: {', '.join(unpaid)}" if unpaid else ""))
+    except Exception as e:
+        await m.answer(f"Учёт в формате оператора: {getattr(e, 'detail', e)}")
 
 
 @dp.message(pv, sysf, Command("notify_reset"))

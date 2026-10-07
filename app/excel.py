@@ -82,7 +82,7 @@ def _topups_row(wb, topup):
 
 
 def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg=None, awb_breakdown=None,
-          operator=False):
+          operator=False, only_awb=None):
     """operator=True: version for the 1С operator — plain numbers instead of formulas, no «Пополнения» sheet,
     no ТК share columns."""
     try:
@@ -93,7 +93,7 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
 
     res = compute(topup.id, topups, invoices, lines, logistics, awb_kg)
     trow = None if operator else _topups_row(wb, topup)
-    name = _sheet_name(wb, topup)
+    name = f"Пополнение {topup.date[:5]} · MAWB {only_awb[-4:]}" if only_awb else _sheet_name(wb, topup)
     if name in wb.sheetnames:
         idx = wb.sheetnames.index(name)
         del wb[name]
@@ -113,7 +113,7 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
     ws["A2"].font = BOLD
     ws["B2"].font = Font(name=F, color="008000")
 
-    own_invs = [i for i in invoices if i.topup_id == topup.id]
+    own_invs = [i for i in invoices if i.topup_id == topup.id and (not only_awb or norm_awb(i.awb) == only_awb)]
     lines_by = defaultdict(list)
     for l in lines:
         lines_by[l.invoice_id].append(l)
@@ -129,6 +129,8 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
             if k in res.legs and k not in leg_keys:
                 leg_keys.append(k)
     for (awb, leg), g in res.legs.items():   # freight paid in this top-up for AWBs of older top-ups
+        if only_awb and awb != only_awb:
+            continue
         if (awb, leg) not in leg_keys and any(lg.topup_id == topup.id for lg in logistics if lg.id in g["ids"]):
             leg_keys.append((awb, leg))
     awb_breakdown = awb_breakdown or {}
