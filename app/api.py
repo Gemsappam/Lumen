@@ -1521,7 +1521,7 @@ def awb_spread(awb: str) -> list[dict]:
                 if i.topup_id == tid and norm_awb(i.awb) == k:
                     ls = [l for l in lines if l.invoice_id == i.id]
                     st = sum(l.stems for l in ls) or 1
-                    out.append({"farm": i.farm, "topup_id": tid, "topup": tmap[tid].date, "stems": st,
+                    out.append({"farm": i.farm, "topup_id": tid, "topup": (tmap[tid].date if tid in tmap else ("брокер" if getattr(i, "via_broker", False) else "в пути, не оплачен")), "stems": st,
                                 "air": sum(res.lines[l.id].air_rub_stem * l.stems for l in ls) / st,
                                 "msk": sum(res.lines[l.id].msk_rub_stem * l.stems for l in ls) / st})
         return out
