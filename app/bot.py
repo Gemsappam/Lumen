@@ -249,6 +249,17 @@ async def broker_dep_topup_set(c: CallbackQuery):
     await c.message.edit_text(txt + "\nСебестоимость Tessa / Plazoleta пересчитана.")
 
 
+def _farm_label(raw: str) -> str:
+    """Unknown shipper on a consolidation list: «Buitron Martin Stefania Renee (B&M Fiori)» -> «B&M Fiori»,
+    «FLORICULTORA X S. A.» -> «X»."""
+    m = re.search(r"\(([^)]+)\)", raw or "")
+    if m:
+        return m.group(1).strip()
+    n = re.sub(r"[,.]?\s*\b(s\.?\s?a\.?\s?s?\.?|ltd|limited|llc|inc|b\.?v\.?|cia\.?|ltda\.?)\s*$", "", raw or "", flags=re.I)
+    n = re.sub(r"^\s*(floricultora|florícola|floricola|agricola|agrícola|hacienda)\s+", "", n, flags=re.I).strip(" ,.-")
+    return n.title() if n.isupper() or n.islower() else n
+
+
 async def _consolidation(m: Message, awb_raw: str, country: str, rows: list, eta=None):
     """Ecuador / Colombia consolidation list: boxes per farm (+kg if given) -> packing chats get it before packings."""
     from . import kbreak
@@ -262,7 +273,7 @@ async def _consolidation(m: Message, awb_raw: str, country: str, rows: list, eta
     with session() as s:
         for r in rows:
             f = resolve_farm(s, r["farm_raw"])
-            r["farm"] = f.name if f else r["farm_raw"].title()
+            r["farm"] = f.name if f else _farm_label(r["farm_raw"])
     farms = [{"farm": r["farm"], "packs": int(r.get("packs") or 0), "kg": float(r.get("kg") or 0),
               "hawb": (r.get("hawb") or "").strip().upper() or None} for r in rows]
     w = None
@@ -282,7 +293,9 @@ async def _consolidation(m: Message, awb_raw: str, country: str, rows: list, eta
     await send_packing_lists()
     await missing_reminder([m.from_user.id])
     if was_sent:                      # list changed after the shipment went out -> send the whole shipment again
-        await push_packing_all(norm_awb(awb))
+        from . import kbreak as _kb2
+        if norm_awb(awb) not in {x["awb_key"] for x in _kb2.missing_invoices()}:   # only a COMPLETE shipment
+            await push_packing_all(norm_awb(awb))
     await send_packing_lists()
 
 
@@ -300,14 +313,16 @@ async def _kenya_breakdown(m: Message, data: bytes):
     with session() as s:
         for r in info["rows"]:
             f = resolve_farm(s, r["farm_raw"])
-            r["farm"] = f.name if f else r["farm_raw"].title()
+            r["farm"] = f.name if f else _farm_label(r["farm_raw"])
     col = info["use"]
     per = [{"farm": r["farm"], "kg": round(r[col], 2), "boxes": r["packs"]} for r in info["rows"]]
     w = store_breakdown(awb, per)
     was_sent = kbreak.is_sent(norm_awb(awb))
     kbreak.store(data, info, norm_awb(awb), [{"farm": r["farm"], "packs": r["packs"], "kg": r[col]} for r in info["rows"]])
     if was_sent:                      # list changed after the shipment went out -> send the whole shipment again
-        await push_packing_all(norm_awb(awb))
+        from . import kbreak as _kb2
+        if norm_awb(awb) not in {x["awb_key"] for x in _kb2.missing_invoices()}:   # only a COMPLETE shipment
+            await push_packing_all(norm_awb(awb))
     lines = "\n".join(f"• {r['farm']}: {r['packs']} кор. · {r[col]:g} кг" for r in info["rows"])
     txt = (f"📋 Детализация MAWB {awb}: {info['packs']} кор., {info[col]:g} кг "
            f"({'реальный вес' if col == 'weight' else 'объёмный вес'} — он больше: {info['weight']:g} / VW {info['vw']:g})\n"
@@ -508,11 +523,11 @@ async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dic
         same = [(d, inv) for d, inv in same if inv]
         if same and "новый" not in (m.caption or "").lower():
             d, inv = same[0]
-            did = save_draft(d)
-            CORR[m.from_user.id] = {"draft": did, "inv": inv["id"], "subs": subs, "out": out, "caption": m.caption or "",
-                                    "head": _flow_head(subs) + warn}
+            CORR[m.from_user.id] = {"pairs": [(save_draft(dd), ii["id"]) for dd, ii in same],
+                                    "subs": subs, "out": out, "caption": m.caption or "", "head": _flow_head(subs) + warn}
+            who = ", ".join(ii["farm"] for _dd, ii in same)
             await _send(m.from_user.id,
-                        f"📝 Инвойс {inv['farm']} № {inv['invoice_no']} уже есть в учёте ({inv['where']}).\nЭто КОРРЕКТИРОВКА инвойса?",
+                        f"📝 Инвойс {who} № {inv['invoice_no']} уже есть в учёте ({inv['where']}).\nЭто КОРРЕКТИРОВКА инвойса?",
                         _kb([[("✅ Да, корректировка — заменить", "cor:yes")],
                              [("➕ Нет, это новый инвойс", "cor:no")]]), note)
             return
@@ -600,12 +615,16 @@ async def correction_answer(c: CallbackQuery):
     if c.data == "cor:no":
         await _start_flow(c.from_user.id, p["subs"], p["out"], p["caption"], c.message, p["head"])
         return
-    d = json.loads((DRAFTS / f"{p['draft']}.json").read_text())
-    before = invoice_costs(p["inv"])
-    r = correct_invoice(p["inv"], d)
-    (DRAFTS / f"{p['draft']}.json").unlink(missing_ok=True)
-    txt = (f"✅ Корректировка внесена: {r['farm']} № {r['invoice_no']}. Оплата, пополнение, MAWB и баланс фермы — как были.\n"
-           + ("\n".join("• " + x for x in r["changes"]) or "Строки не изменились."))
+    txt, done = "", []
+    for did, inv_id in p["pairs"]:
+        d = json.loads((DRAFTS / f"{did}.json").read_text())
+        before = invoice_costs(inv_id)
+        r = correct_invoice(inv_id, d)
+        (DRAFTS / f"{did}.json").unlink(missing_ok=True)
+        done.append((inv_id, before, r))
+        txt += (f"✅ Корректировка внесена: {r['farm']} № {r['invoice_no']}.\n"
+                + ("\n".join("• " + x for x in r["changes"]) or "Строки не изменились, обновлена разбивка по коробкам.") + "\n\n")
+    txt += "Оплата, пополнение, MAWB и баланс фермы — как были."
     edited = 0
     if r.get("awb_key"):
         edited = await refresh_shipment(r["awb_key"], f"{r['farm']} — корректировка инвойса № {r['invoice_no']}")
@@ -618,8 +637,9 @@ async def correction_answer(c: CallbackQuery):
         else:
             txt += "\n\nВ чаты эта поставка ещё не уходила — уйдёт уже исправленной."
     await c.message.edit_text(txt[:4000])
-    if r["changes"]:
-        await send_correction(p["inv"], before, f"Корректировка инвойса фермы № {r['invoice_no']}")
+    for inv_id, before, r in done:
+        if r["changes"]:
+            await send_correction(inv_id, before, f"Корректировка инвойса фермы № {r['invoice_no']}")
 
 
 # ---------- the «оплачен? → откуп → $» conversation --------------------------------------
@@ -1699,6 +1719,13 @@ async def send_packing_lists():
     if not tg or not sender:
         return
     items = packing.pending()
+    if not items:
+        return
+    # a shipment goes out automatically only when EVERY farm of its consolidation list has its invoice
+    # (or «🚫 Инвойса не будет» was pressed). Late invoices of an already-sent shipment go as before.
+    from . import kbreak
+    waiting = {x["awb_key"] for x in kbreak.missing_invoices()}
+    items = [it for it in items if it[3] not in waiting]       # incomplete shipment: send NOTHING
     if items:
         await _send_items(items, sender, tg)
 

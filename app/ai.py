@@ -106,6 +106,10 @@ DOMAIN = """Ты — бухгалтер-логист оптовой компан
   price_usd = цена строки коробки. Количество коробок = число перед «QB» в PCS («2QBx35» = 2 коробки),
   а не BXS (0,250 — это доля фулл-бокса). Строка «HYD SUPER BLUE» + следующая строка «LIGHT BLUE» — один сорт:
   «Hydrangea Super Blue», 70 ст, $0.70. НИКОГДА не пиши «Assorted», «Mix», «Select» как номенклатуру.
+- boxes в строке — ровно как напечатано в колонке Boxes/Qty этой строки; пусто в инвойсе -> null (НЕ ставь 1 сам).
+  У PjDave и похожих число коробок стоит на ПОСЛЕДНЕЙ строке микса: «Madam Red 700 (1 кор.)», «Belle Rose 350 ( )»,
+  «La Belle 350 (1 кор.)» = коробка 1 Madam Red 700, коробка 2 Belle Rose 350 + La Belle 350 (PackRate 700 = стеблей в
+  коробке). boxes_total — число коробок из строки Total (тут 2). Сумма коробок в boxes_detail должна равняться boxes_total.
 - boxes_detail заполняй ВСЕГДА, для любого инвойса (склад считает по коробкам). У American Flowers каждая строка
   «1QBx35 HYD ASSORTED SELECT» + строка состава — это отдельная коробка со своим составом (qty=1).
 - boxes_detail — укладка по коробкам ровно как в инвойсе: на каждую строку коробки (в т.ч. MIX) запись
@@ -181,6 +185,7 @@ PARSE_TOOL = {
                     "farm": {"type": "string"}, "kg": {"type": "number"}, "boxes": {"type": ["number", "null"]}}}}}},
             "warnings": {"type": "array", "items": {"type": "string"}},
             "stems_total": {"type": ["number", "null"], "description": "stems in the invoice TOTAL row, as printed"},
+            "boxes_total": {"type": ["number", "null"], "description": "number of boxes in the invoice TOTAL row, as printed"},
             "supplier": {"type": ["string", "null"], "description": "seller/grower name exactly as printed (even if not in the known farms list)"},
             "hawb": {"type": ["string", "null"], "description": "HAWB / house bill number, e.g. CEVB2311731"},
             "boxes_detail": {"type": "array", "description": "box by box, as packed: one entry per invoice box line",

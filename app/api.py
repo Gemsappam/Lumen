@@ -342,17 +342,41 @@ def attach_broker_packing(d: dict) -> str:
     return txt
 
 
-def _boxes_from_raw(lines: list) -> list:
-    """Box-by-box from the invoice lines as read (before merging): a line with N boxes opens N boxes,
-    lines right below it without a box count ride in the same box. Whole stems only."""
-    out = []
+def _group(lines: list, backward: bool):
+    """forward: a box count opens a box, rows below ride in it (Kikwetu, Agriflora).
+    backward: rows without a count ride in the NEXT row that has one (PjDave: count on the last row of a mix)."""
+    out, pend = [], []
     for l in lines:
         n = int(float(l.get("boxes") or 0))
-        st = float(l.get("stems") or 0)
-        if n > 0:
-            out.append({"qty": n, "pack": "", "content": [{"name": l.get("name"), "stems_total": st}]})
+        item = {"name": l.get("name"), "stems_total": float(l.get("stems") or 0)}
+        if backward:
+            pend.append(item)
+            if n > 0:
+                out.append({"qty": n, "pack": "", "content": pend}); pend = []
+        elif n > 0:
+            out.append({"qty": n, "pack": "", "content": [item]})
         elif out:
-            out[-1]["content"].append({"name": l.get("name"), "stems_total": st})
+            out[-1]["content"].append(item)
+        else:
+            return None                              # rows before any box: this reading doesn't fit
+    if backward and pend:
+        return None
+    return out
+
+
+def _boxes_from_raw(lines: list, boxes_total=None) -> list:
+    """Box-by-box from the invoice lines as read (before merging). Tries both ways farms write mixed boxes
+    and keeps the one that matches the invoice's box total and gives the most even boxes. Whole stems only."""
+    import statistics
+    cands = [g for g in (_group(lines, False), _group(lines, True)) if g]
+    if not cands:
+        return []
+    def score(g):
+        n = sum(b["qty"] for b in g)
+        per = [sum(c["stems_total"] for c in b["content"]) / (b["qty"] or 1) for b in g]
+        spread = statistics.pstdev(per) / (statistics.mean(per) or 1) if len(per) > 1 else 0
+        return (0 if not boxes_total or n == int(boxes_total) else 1, spread)
+    out = min(cands, key=score)
     for b in out:                                 # per box only if it divides evenly; else keep the group total
         q = b["qty"] or 1
         even = all(abs(c["stems_total"] / q - round(c["stems_total"] / q)) < 1e-6 for c in b["content"])
@@ -453,9 +477,19 @@ def merge_lines(out: dict) -> dict:
     lines = out.get("lines") or []
     for l in lines:                              # «Hydrangea Green Premium» -> «Hydrangea Green»
         l["name"] = re.sub(r"\s+\b(premium|standard|std)\b", "", l.get("name") or "", flags=re.I).strip()
+    farms_in = list(dict.fromkeys((l.get("farm") or "").strip() for l in lines))
+    if len(farms_in) > 1:                        # trader invoice (NextWave): boxes per farm, from that farm's rows
+        out["boxes_by_farm"] = {f: _boxes_from_raw([l for l in lines if (l.get("farm") or "").strip() == f])
+                                for f in farms_in}
+    bt = out.get("boxes_total")
+    if out.get("boxes_detail") and bt and sum(int(b.get("qty") or 1) for b in out["boxes_detail"]) != int(bt):
+        out["boxes_detail"] = None                   # AI layout contradicts the invoice total -> rebuild from rows
     out["boxes_from_ai"] = bool(out.get("boxes_detail"))
     if not out.get("boxes_detail"):
-        out["boxes_detail"] = _boxes_from_raw(lines)  # BEFORE merging: box structure is still intact
+        out["boxes_detail"] = _boxes_from_raw(lines, bt)  # BEFORE merging: box structure is still intact
+    nb = sum(int(b.get("qty") or 1) for b in out["boxes_detail"] or [])
+    if bt and nb and nb != int(bt):
+        out.setdefault("warnings", []).append(f"Коробок по строкам {nb}, а в итоге инвойса {int(bt)} — проверь разбивку по коробкам")
     mixes = [l.get("name") for l in lines if re.search(r"\b(mix|assorted|select|surtido)\b", l.get("name") or "", re.I)]
     if mixes:
         out.setdefault("warnings", []).append(
@@ -495,7 +529,8 @@ def split_by_farm(out: dict) -> list[dict]:
              "invoice_total_usd": round(sum((l.get("stems") or 0) * (l.get("price_usd") or 0) for l in ls), 2),
              "subtotal_usd": None, "fees_usd": None, "weight_kg": None, "mawb_note": None,
              "note": f"общий инвойс {out.get('invoice_no') or ''} ({', '.join(x for x in farms if x)})".strip(),
-             "warnings": [w for w in out.get("warnings", []) if "плантац" not in w.lower()]}
+             "warnings": [w for w in out.get("warnings", []) if "плантац" not in w.lower()],
+             "boxes_detail": (out.get("boxes_by_farm") or {}).get(f) or [], "boxes_by_farm": None}
         subs.append(d)
     return subs
 

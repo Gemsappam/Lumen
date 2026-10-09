@@ -17,7 +17,7 @@ from .models import Farm, init_db, session
 SEED = {
     "Кения": ["Zeeflora", "Tambuzi", "Heritage", "Agriflora", "Massai", "Mzurrie (Winchester farm)", "Subati",
               "Kikwetu", "Karen Roses", "Batian", "Black Tulip", "PjDave", "Primarosa", "Red Lands"],
-    "Эквадор": ["Tessa", "Nintanga", "Agroterranorte", "Josar Flor", "Tikan", "EC Blooms (Starroses)", "Sand Flowers",
+    "Эквадор": ["Tessa", "Nintanga", "B&M Fiori", "Agroterranorte", "Josar Flor", "Tikan", "EC Blooms (Starroses)", "Sand Flowers",
                 "Allegro Farms", "Dayka", "Guaisa (Sunrite)", "Meral Flowers", "Monterosas", "Rosaprima", "Rosas Del Viento"],
     "Колумбия": ["Кондор (Гортензия)", "American Flowers", "Plazoleta", "La Conejera", "Serrezuela Flowers"],
 }
@@ -37,7 +37,9 @@ FORWARDERS = {
 }
 
 
-FARM_ALIASES = {"Rosas Del Viento": "TIPANLUIZA LANCHIMBA JUAN MIGUEL,TIPANLUIZA,ROSAS DEL VENTO,Rosas del Viento",
+FARM_ALIASES = {"Josar Flor": "JOSARFLOR,FLORICULTORA JOSARFLOR,FLORICULTORA JOSARFLOR S. A.,FLORICULTORA JOSARFLOR S.A.",
+                "B&M Fiori": "B&M FIORI,BUITRON MARTIN STEFANIA RENEE,BUITRON MARTIN STEFANIA RENEE (B&M FIORI)",
+                "Rosas Del Viento": "TIPANLUIZA LANCHIMBA JUAN MIGUEL,TIPANLUIZA,ROSAS DEL VENTO,Rosas del Viento",
                 "Кондор (Гортензия)": "CONDOR ANDINO,CÓNDOR ANDINO,CONDOR ANDINO S.A.S,CÓNDOR ANDINO S.A.S,CONDOR",
                 "Plazoleta": "PLAZOLETA BAZZANI,PLAZOLETA BAZZANI S.A.S",
                 "Nintanga": "NINTANGA S.A.",
@@ -301,7 +303,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-03 · пакинги без повторов + детализация коробок"
+VERSION = "2026-10-09c · поставка уходит только целиком"
 
 
 async def _once_recalc_true_rate():

@@ -80,6 +80,19 @@ def _boxes_from_lines(lines) -> list:
     return out
 
 
+def _merge_box(content: list) -> list:
+    out = {}
+    for c in content or []:
+        k = c.get("name")
+        if k in out:
+            for f in ("stems_per_box", "stems_total"):
+                if f in c:
+                    out[k][f] = (out[k].get(f) or 0) + (c.get(f) or 0)
+        else:
+            out[k] = dict(c)
+    return list(out.values())
+
+
 def _boxes_section(ws, r0: int, boxes: list):
     """«По коробкам»: every physical box numbered, its content one variety per row."""
     ws.cell(r0, 1, "ПО КОРОБКАМ").font = Font(name=F, bold=True, size=12)
@@ -87,6 +100,7 @@ def _boxes_section(ws, r0: int, boxes: list):
     for c, h in enumerate(hdr, 1):
         x = ws.cell(r0 + 1, c, h); x.font = Font(name=F, bold=True); x.border = BOX
         x.fill = PatternFill("solid", fgColor="D9E1F2")
+    boxes = [{**b, "content": _merge_box(b.get("content"))} for b in boxes]
     r, n = r0 + 2, 0
     for b in boxes:
         q = int(b.get("qty") or 1)
