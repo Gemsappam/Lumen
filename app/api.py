@@ -304,9 +304,26 @@ def attach_broker_packing(d: dict) -> str:
         farm = f.name if f else (d.get("farm") or "")
         pl = [{"name": l.get("name"), "stems": l.get("stems"), "boxes": l.get("boxes")} for l in d.get("lines") or []]
         ddate = _d(d.get("invoice_date") or "")
-        cands = [i for i in s.exec(select(Invoice)).all()
-                 if i.farm == farm and i.via_broker and not i.packing_lines_json and not i.arrived_at]
         want = norm_awb(d.get("awb") or "")
+        allb = [i for i in s.exec(select(Invoice)).all() if i.farm == farm and i.via_broker]
+        # the SAME farm invoice sent again (re-send / correction): update that purchase, never a second one
+        tail = re.sub(r"\D", "", (d.get("invoice_no") or "").split("#")[-1])[-6:]
+        st_new = sum(float(l.get("stems") or 0) for l in d.get("lines") or [])
+        def _st(i):
+            try:
+                return sum(float(x.get("stems") or 0) for x in json.loads(i.packing_lines_json or "[]"))
+            except ValueError:
+                return 0
+        again = next((i for i in sorted(allb, key=lambda x: -x.id) if tail and len(tail) >= 4
+                      and re.sub(r"\D", "", i.invoice_no or "").endswith(tail)), None) or \
+            next((i for i in sorted(allb, key=lambda x: -x.id) if i.packing_lines_json and want
+                  and norm_awb(i.awb) == want and abs(_st(i) - st_new) < 1), None)
+        if again:
+            old_pl = again.packing_lines_json
+            cands = [again]
+        else:
+            old_pl = None
+            cands = [i for i in allb if not i.packing_lines_json and not i.arrived_at]
         if ddate:
             cands.sort(key=lambda i: (norm_awb(i.awb) != want if want else 0,
                                       abs(((_d(i.invoice_date) or ddate) - ddate).days)))
@@ -334,9 +351,23 @@ def attach_broker_packing(d: dict) -> str:
             w = s.get(AwbWeights, norm_awb(inv.awb))
             if w:
                 inv.weight_kg = _kg_for(s, inv.farm, json.loads(w.farm_kg_json or "{}")) or None
-        inv.packing_sent = False
+        new_pl = inv.packing_lines_json
+        if again and old_pl == new_pl:
+            s.add(inv); s.commit()
+            st = sum(x["stems"] or 0 for x in pl)
+            return (f"🌸 {farm}: этот инвойс фермы (№ {d.get('invoice_no') or '?'}) уже привязан к закупке от "
+                    f"{inv.invoice_date} — пакинг тот же ({st:g} ст). Ничего не менял, второй закупки не создаю.")
+        if again and inv.packing_sent and inv.awb:
+            d["_refresh_awb"] = norm_awb(inv.awb)
+        else:
+            inv.packing_sent = False
         s.add(inv); s.commit()
         st = sum(x["stems"] or 0 for x in pl)
+        if again:
+            from .backup import mark_dirty
+            mark_dirty()
+            return (f"🌸 {farm}: инвойс фермы № {d.get('invoice_no') or '?'} уже был — ОБНОВИЛ пакинг закупки от "
+                    f"{inv.invoice_date} ({st:g} ст, {len(pl)} поз.). Деньги — по-прежнему из выписки брокера.")
         txt = (f"🌸 {farm}: инвойс фермы принят для ПАКИНГА ({st:g} ст, {len(pl)} поз.). Деньги и себестоимость — из выписки брокера."
                + (f"\nПривязал к закупке из выписки от {inv.invoice_date}." if not made else
                   "\nВыписки по этой закупке ещё нет — привяжу, когда загрузишь выписку BiFlorica.")

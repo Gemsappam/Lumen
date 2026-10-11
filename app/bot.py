@@ -526,6 +526,9 @@ async def _route_invoice(uid: int, out: dict, caption: str, note, warn: str, pre
             for d in broker:
                 fill_mawb(d, None)
             msg = "\n\n".join(attach_broker_packing(d) for d in broker)
+            for k in {d.get("_refresh_awb") for d in broker if d.get("_refresh_awb")}:
+                if await refresh_shipment(k, "обновлён пакинг " + ", ".join(d.get("farm") or "" for d in broker)):
+                    msg += f"\n🔄 Пакинг MAWB {k} в чатах обновлён."
             subs = [d for d in subs if d not in broker]
             if not subs:
                 await _send(uid, pre + msg, _fix_kb(out), note)

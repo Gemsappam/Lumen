@@ -200,6 +200,36 @@ def _merge_broker_dupes():
                 s.delete(l)
             s.delete(d)
         s.commit()
+        # a placeholder made from a re-sent farm invoice next to the real statement purchase -> one purchase
+        from .calc import norm_awb
+        invs = s.exec(select(Invoice)).all()
+        gone = set()
+        def _st(i):
+            try:
+                return sum(float(x.get("stems") or 0) for x in json.loads(i.packing_lines_json or "[]"))
+            except ValueError:
+                return 0
+        for b in [i for i in invs if getattr(i, "via_broker", False) and i.ext_id]:
+            tail = _re.sub(r"\D", "", (b.invoice_no or "").split("#")[-1])
+            for d in invs:
+                if d.id == b.id or d.id in gone or d.ext_id or not getattr(d, "via_broker", False) or d.farm != b.farm:
+                    continue
+                same_no = tail and len(tail) >= 4 and _re.sub(r"\D", "", d.invoice_no or "").endswith(tail)
+                same_ship = (d.awb and norm_awb(d.awb) == norm_awb(b.awb) and b.packing_lines_json
+                             and abs(_st(d) - _st(b)) < 1)
+                if not (same_no or same_ship):
+                    continue
+                if d.packing_lines_json:
+                    b.packing_lines_json = d.packing_lines_json
+                for k in ("awb", "hawb", "weight_kg", "boxes_json", "truck", "eta", "arrived_at"):
+                    if getattr(d, k, None) and not getattr(b, k, None):
+                        setattr(b, k, getattr(d, k))
+                s.add(b)
+                for l in s.exec(select(Line).where(Line.invoice_id == d.id)).all():
+                    s.delete(l)
+                s.delete(d); gone.add(d.id)
+                print(f"[lumen] merged duplicate broker purchase {d.farm} #{d.id} into #{b.id}", flush=True)
+        s.commit()
         from .api import infer_mawb                 # statement purchases still without MAWB: from consolidation lists
         for b in s.exec(select(Invoice)).all():
             if getattr(b, "via_broker", False) and not (b.awb or "").strip() and not b.arrived_at:
@@ -369,7 +399,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-11h · отчёт Floratrack показывает взаиморасчёты, съевшие оплаты"
+VERSION = "2026-10-12a · повторный инвойс Tessa/Plazoleta не создаёт вторую закупку; дубль удаляется"
 
 
 async def _once_recalc_true_rate():
