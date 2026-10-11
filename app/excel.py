@@ -82,7 +82,7 @@ def _topups_row(wb, topup):
 
 
 def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg=None, awb_breakdown=None,
-          operator=False, only_awb=None):
+          operator=False, only_awb=None, broker=False):
     """operator=True: version for the 1С operator — plain numbers instead of formulas, no «Пополнения» sheet,
     no ТК share columns."""
     try:
@@ -93,7 +93,8 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
 
     res = compute(topup.id, topups, invoices, lines, logistics, awb_kg)
     trow = None if operator else _topups_row(wb, topup)
-    name = f"Пополнение {topup.date[:5]} · MAWB {only_awb[-4:]}" if only_awb else _sheet_name(wb, topup)
+    name = (f"Брокер · MAWB {only_awb[-4:]}" if broker else
+            f"Пополнение {topup.date[:5]} · MAWB {only_awb[-4:]}" if only_awb else _sheet_name(wb, topup))
     if name in wb.sheetnames:
         idx = wb.sheetnames.index(name)
         del wb[name]
@@ -110,10 +111,21 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
     ws.row_dimensions[1].height = 45
     ws["A2"], ws["B2"] = "Курс пополнения", (round(res.rate, 4) if operator else f"='Пополнения'!E{trow}")
     ws["B2"].number_format = "0.0000"
+    if broker:
+        ws["A2"], ws["B2"] = "Оплата", "с баланса брокера — пополнения брокера под эту закупку ещё нет (≈ по последнему курсу)"
     ws["A2"].font = BOLD
     ws["B2"].font = Font(name=F, color="008000")
 
-    own_invs = [i for i in invoices if i.topup_id == topup.id and (not only_awb or norm_awb(i.awb) == only_awb)]
+    if broker:
+        from .calc import broker_topup as _bt
+        own_invs = [i for i in invoices if getattr(i, "via_broker", False) and not i.topup_id
+                    and (not only_awb or norm_awb(i.awb) == only_awb) and not _bt(res, i)]
+    else:
+        own_invs = [i for i in invoices if i.topup_id == topup.id and (not only_awb or norm_awb(i.awb) == only_awb)]
+        # broker purchases (Tessa / Plazoleta / Geoflora): in the sheet of OUR top-up that funded the broker deposit
+        from .calc import broker_topup
+        own_invs += [i for i in invoices if getattr(i, "via_broker", False) and not i.topup_id
+                     and (not only_awb or norm_awb(i.awb) == only_awb) and broker_topup(res, i) == topup.id]
     lines_by = defaultdict(list)
     for l in lines:
         lines_by[l.invoice_id].append(l)
@@ -204,7 +216,16 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
         dp_usd = sum(p["usd"] for p in dp)
         dp_rub = sum(p["usd"] * p["rate"] for p in dp)
         own_rub = inv.rub_paid_override if inv.rub_paid_override is not None else rub_paid
-        if dp:
+        if getattr(inv, "via_broker", False) and not inv.topup_id:
+            led0 = res.inv_ledger.get(inv.id) or {}
+            ws.cell(r0, 16, round(led0.get("total") or sum(l.price_usd * l.stems for l in ls), 2)).font = BLUE
+            ws.cell(r0, 17, round(res.invoice_cost.get(inv.id, 0))).font = BLUE
+            ws.cell(r0, 17).comment = Comment("Закупка через брокера: $ по выписке BiFlorica (с комиссией); ₽ — по курсу "
+                                              "нашего пополнения, из которого пополнили брокера (+3% на входе): "
+                                              + "; ".join(f"${p['usd']:.2f} × {p['rate']:.2f} ({p['src']})"
+                                                          for p in led0.get("parts", [])), "bot")
+            ws.cell(r0, 18, "да (брокер)")
+        elif dp:
             ws.cell(r0, 16, round((inv.usd_paid or 0) + dp_usd, 2)).font = BLUE
             ws.cell(r0, 17, round(own_rub + dp_rub)).font = BLUE
             ws.cell(r0, 17).comment = Comment(

@@ -209,7 +209,8 @@ def _merge_broker_dupes():
                 return sum(float(x.get("stems") or 0) for x in json.loads(i.packing_lines_json or "[]"))
             except ValueError:
                 return 0
-        for b in [i for i in invs if getattr(i, "via_broker", False) and i.ext_id]:
+        for b, by_no in [(b, p) for p in (True, False)
+                         for b in invs if getattr(b, "via_broker", False) and b.ext_id]:   # number matches first
             tail = _re.sub(r"\D", "", (b.invoice_no or "").split("#")[-1])
             for d in invs:
                 if d.id == b.id or d.id in gone or d.ext_id or not getattr(d, "via_broker", False) or d.farm != b.farm:
@@ -217,11 +218,13 @@ def _merge_broker_dupes():
                 same_no = tail and len(tail) >= 4 and _re.sub(r"\D", "", d.invoice_no or "").endswith(tail)
                 same_ship = (d.awb and norm_awb(d.awb) == norm_awb(b.awb) and b.packing_lines_json
                              and abs(_st(d) - _st(b)) < 1)
-                if not (same_no or same_ship):
+                if not (same_no if by_no else same_ship):
                     continue
                 if d.packing_lines_json:
                     b.packing_lines_json = d.packing_lines_json
                 for k in ("awb", "hawb", "weight_kg", "boxes_json", "truck", "eta", "arrived_at"):
+                    if k in ("awb", "weight_kg", "truck", "eta") and b.arrived_at:
+                        continue          # purchase already arrived on its own shipment — don't move it
                     if getattr(d, k, None) and not getattr(b, k, None):
                         setattr(b, k, getattr(d, k))
                 s.add(b)
@@ -399,7 +402,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-12a · повторный инвойс Tessa/Plazoleta не создаёт вторую закупку; дубль удаляется"
+VERSION = "2026-10-12c · брокерские закупки в листе нашего пополнения, из которого пополнили брокера"
 
 
 async def _once_recalc_true_rate():

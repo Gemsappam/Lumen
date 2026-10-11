@@ -345,7 +345,7 @@ def attach_broker_packing(d: dict) -> str:
             inv.boxes_json = json.dumps(d["boxes_detail"], ensure_ascii=False)
         if d.get("hawb"):
             inv.hawb = d["hawb"]
-        if d.get("awb") and not inv.awb:
+        if d.get("awb") and not inv.awb and not inv.arrived_at:
             inv.awb = d["awb"]
         if inv.awb and not inv.weight_kg:
             w = s.get(AwbWeights, norm_awb(inv.awb))
@@ -1476,8 +1476,16 @@ def awb_operator_xlsx(awb: str) -> tuple[bytes, str, list]:
             raise HTTPException(404, "По этому MAWB инвойсов нет")
         tmap = {t.id: t for t in tops}
         path = Path(tempfile.mkdtemp()) / "op.xlsx"
-        for tid in sorted({i.topup_id for i in mine if i.topup_id in tmap}):
+        from .calc import compute, broker_topup
+        res0 = compute(0, tops, invs, lines, logs, kg)
+        btid = {i.id: broker_topup(res0, i) for i in mine if getattr(i, "via_broker", False) and not i.topup_id}
+        for tid in sorted({i.topup_id for i in mine if i.topup_id in tmap} | {t for t in btid.values() if t in tmap}):
             excel.build(path, tmap[tid], tops, invs, lines, logs, awb_kg=kg, awb_breakdown=bd, operator=True, only_awb=k)
+        if any(t not in tmap for t in btid.values()):          # broker purchase not covered by a deposit yet
+            from types import SimpleNamespace
+            pseudo = SimpleNamespace(id=-1, date="Брокер", usd=0, rub=0, sheet_name=None)
+            excel.build(path, pseudo, tops, invs, lines, logs, awb_kg=kg, awb_breakdown=bd, operator=True,
+                        only_awb=k, broker=True)
         s.rollback()                                   # build() renames top-up sheets in memory — never save that
         unpaid = sorted({i.farm for i in mine if not i.topup_id and not getattr(i, "via_broker", False)})
     if not path.exists():

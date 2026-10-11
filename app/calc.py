@@ -138,7 +138,7 @@ def farm_ledger(topups, invoices, lines_by_inv, est_rate) -> dict:
         cost_factor = []           # typical ₽/farm-$ ÷ top-up rate of this farm (to value debts)
         o_usd, o_rate = (OPENINGS.get(key) or (0, None))[:2]
         if o_usd > 0.005:
-            credits.append([o_usd, o_rate or est_rate, "начальный баланс"])
+            credits.append([o_usd, o_rate or est_rate, "начальный баланс", None])
         elif o_usd < -0.005:
             debts.append([None, -o_usd])
         if deps.get(key):     # broker: deposits and purchases in date order
@@ -156,14 +156,14 @@ def farm_ledger(topups, invoices, lines_by_inv, est_rate) -> dict:
                 if inv.usd_credited > 0:
                     rpu = rub / inv.usd_credited
                     lbl = "оплата долга" if (inv.ext_id or "").startswith("pay-") else "пополнение брокера"
-                    credits.append([inv.usd_credited, rpu, f"{lbl} {inv.date}"])
+                    credits.append([inv.usd_credited, rpu, f"{lbl} {inv.date}", inv.topup_id])
                     while debts and credits:
                         d0, c0 = debts[0], credits[0]
                         take = min(d0[1], c0[0])
                         if d0[0] is not None:
                             old = out_inv[d0[0]]
                             old["rub_cost"] += take * c0[1]; old["debt_usd"] -= take
-                            old["parts"].append({"usd": take, "rate": c0[1], "src": c0[2]})
+                            old["parts"].append({"usd": take, "rate": c0[1], "src": c0[2], "tid": c0[3]})
                         d0[1] -= take; c0[0] -= take
                         if d0[1] <= 1e-6: debts.popleft()
                         if c0[0] <= 1e-6: credits.popleft()
@@ -186,7 +186,7 @@ def farm_ledger(topups, invoices, lines_by_inv, est_rate) -> dict:
                 rec["farm_usd"] = f
                 if f > 0:
                     rpu = rub / f
-                    credits.append([f, rpu, tdate.get(inv.topup_id, "")])
+                    credits.append([f, rpu, tdate.get(inv.topup_id, ""), inv.topup_id])
                     if r:
                         cost_factor.append(rpu / r)
                     while debts and credits:                   # new money pays old debts first
@@ -197,7 +197,7 @@ def farm_ledger(topups, invoices, lines_by_inv, est_rate) -> dict:
                             old = out_inv[d[0]]
                             old["rub_cost"] += take * c[1]
                             old["debt_usd"] -= take
-                            old["parts"].append({"usd": take, "rate": c[1], "src": _lbl(c[2])})
+                            old["parts"].append({"usd": take, "rate": c[1], "src": _lbl(c[2]), "tid": c[3]})
                         d[1] -= take; c[0] -= take
                         if d[1] <= 1e-6: debts.popleft()
                         if c[0] <= 1e-6: credits.popleft()
@@ -206,7 +206,7 @@ def farm_ledger(topups, invoices, lines_by_inv, est_rate) -> dict:
                 c = credits[0]
                 take = min(need, c[0])
                 rec["rub_cost"] += take * c[1]
-                rec["parts"].append({"usd": take, "rate": c[1], "src": _lbl(c[2])})
+                rec["parts"].append({"usd": take, "rate": c[1], "src": _lbl(c[2]), "tid": c[3]})
                 need -= take; c[0] -= take
                 if c[0] <= 1e-6:
                     credits.popleft()
@@ -239,6 +239,15 @@ def farm_ledger(topups, invoices, lines_by_inv, est_rate) -> dict:
                        "advances": [{"usd": round(c[0], 2), "rate": round(c[1], 4), "from": c[2]} for c in credits],
                        "debts": [{"invoice_id": d[0], "usd": round(d[1], 2)} for d in debts]}
     return {"inv": out_inv, "farms": farms}
+
+
+def broker_topup(res, inv):
+    """Broker purchase (paid from the BiFlorica balance) -> OUR top-up whose money (via the broker deposit) covered most of it."""
+    by = {}
+    for p in (res.inv_ledger.get(inv.id) or {}).get("parts", []):
+        if p.get("tid"):
+            by[p["tid"]] = by.get(p["tid"], 0) + p["usd"]
+    return max(by, key=by.get) if by else None
 
 
 def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result:
