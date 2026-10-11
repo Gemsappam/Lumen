@@ -98,10 +98,14 @@ async def start(m: Message):
 
 @dp.message(pv, wr, F.document.file_name.lower().endswith(".xls"))
 async def excel_xls(m: Message):
-    """Old-format Excel = a farm invoice / freight bill."""
+    """Old-format Excel = a farm invoice / freight bill. A «.xls» that is really .xlsx (BiFlorica sends such) -> xlsx router."""
     from .xltext import excel_to_text
     f = await bot.download(m.document)
-    text = excel_to_text(f.read(), m.document.file_name)
+    data = f.read()
+    if data[:2] == b"PK":
+        await _xlsx_router(m, data)
+        return
+    text = excel_to_text(data, m.document.file_name)
     if not text.strip():
         await m.answer("Файл пустой или не читается. Пришли PDF или фото инвойса.")
         return
@@ -128,7 +132,10 @@ async def word_doc(m: Message):
 @dp.message(pv, wr, F.document.file_name.lower().endswith(".xlsx"))
 async def master(m: Message):
     f = await bot.download(m.document)
-    data = f.read()
+    await _xlsx_router(m, f.read())
+
+
+async def _xlsx_router(m: Message, data: bytes):
     from io import BytesIO
     from openpyxl import load_workbook
     from . import floratrack as ft
@@ -210,7 +217,8 @@ async def _broker_statement(m: Message, data: bytes):
         f = by_farm.setdefault(o["farm"], [0, 0.0])
         f[0] += o["stems"]; f[1] += o["amount"] + o["fee"]
     for farm, (st, usd) in by_farm.items():
-        lines.append(f"🌸 {farm}: {st:g} ст на ${fmt(usd)} (с 7%)")
+        fee = sum(o["fee"] for o in buys if o["farm"] == farm); base = sum(o["amount"] for o in buys if o["farm"] == farm)
+        lines.append(f"🌸 {farm}: {st:g} ст на ${fmt(usd)} (с комиссией {fee / base * 100 if base else 0:.0f}%)")
     tv = {i["id"]: i for i in transit_view()["invoices"]}
     new = [tv[i] for i in r["new_buy"] + r["linked"] if i in tv]
     if new:
@@ -219,6 +227,11 @@ async def _broker_statement(m: Message, data: bytes):
             l = i["lines"][0] if i["lines"] else None
             if l:
                 lines.append(f"• {i['farm']} {i['invoice_date']}: {l['name'][:40]} — {l['price_rub']:.2f} ₽/ст")
+    if r.get("new_farms"):
+        lines.append("\n🆕 Новые фермы у посредника: " + ", ".join(r["new_farms"])
+                     + " — добавил в плантации как «через посредника». Проверь название и страну в «Ещё» → «Плантации».")
+    if r.get("fee_fix"):
+        lines.append("ℹ️ Комиссия посредника по выписке: " + "; ".join(r["fee_fix"]))
     lines.append("\n" + farm_balance_text("Tessa"))
     await m.answer("\n".join(lines)[:4000], reply_markup=_kb(rows) if rows else None)
 
@@ -502,7 +515,7 @@ async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dic
             msg = "\n\n".join(attach_broker_packing(d) for d in broker)
             subs = [d for d in subs if d not in broker]
             if not subs:
-                await note.edit_text(msg)
+                await _send(m.from_user.id, msg, None, note)
                 await send_packing_lists()
                 return
             await m.answer(msg)
@@ -554,6 +567,13 @@ async def new_farm_answer(c: CallbackQuery):
         return
     country = c.data.split(":", 1)[1]
     head = p["head"]
+    if country != "skip" and not p.get("country"):
+        p["country"] = country
+        NEWFARM[c.from_user.id] = p
+        await c.message.edit_text(f"🌱 «{_clean_farm_name(p['raw'])}» ({country}) — как закупаем?",
+                                  reply_markup=_kb([[("Напрямую у фермы", f"nf:{country}")],
+                                                    [("Через посредника (BiFlorica)", "nfb:" + country)]]))
+        return
     if country != "skip":
         name = _clean_farm_name(p["raw"])
         with session() as s:
@@ -566,8 +586,38 @@ async def new_farm_answer(c: CallbackQuery):
             if not d.get("farm"):
                 d["farm"], d["country"] = name, d.get("country") or country
                 d["warnings"] = [w for w in d.get("warnings", []) if "не найден" not in w]
-        head = f"🌱 Ферма «{name}» ({country}) добавлена в плантации.\n\n" + _flow_head(p["subs"])
+        head = f"🌱 Ферма «{name}» ({country}) добавлена в плантации — закупка напрямую.\n\n" + _flow_head(p["subs"])
     await _start_flow(c.from_user.id, p["subs"], p["out"], p["caption"], c.message, head)
+
+
+@dp.callback_query(F.data.startswith("nfb:"), wr)
+async def new_farm_broker(c: CallbackQuery):
+    """New farm bought through the broker: same scheme as Tessa/Plazoleta — money from the BiFlorica statement,
+    this invoice only gives the packing list."""
+    from .api import resolve_farm, attach_broker_packing
+    p = NEWFARM.pop(c.from_user.id, None)
+    await c.answer()
+    if not p:
+        await c.message.edit_text("Устарело — пришли инвойс ещё раз.")
+        return
+    country = c.data.split(":", 1)[1]
+    name = _clean_farm_name(p["raw"])
+    with session() as s:
+        f = resolve_farm(s, name, create_country=country)
+        if p["raw"].upper() not in (f.aliases or "").upper():
+            f.aliases = ",".join(x for x in [f.aliases, p["raw"].upper()] if x)
+        f.in_fee_pct, f.markup_pct, f.account = f.in_fee_pct or 3, f.markup_pct or 7, "Брокер"
+        s.add(f); s.commit()
+        name = f.name
+    msgs = []
+    for d in p["subs"]:
+        if not d.get("farm"):
+            d["farm"], d["country"] = name, d.get("country") or country
+        fill_mawb(d, None)
+        msgs.append(attach_broker_packing(d))
+    await c.message.edit_text(f"🌱 Ферма «{name}» ({country}) добавлена — закупка через посредника "
+                              "(−3% на входе, комиссия по выписке BiFlorica).\n\n" + "\n\n".join(msgs))
+    await send_packing_lists()
 BOXWAIT: dict = {}    # user -> invoice id waiting for its box breakdown file
 
 

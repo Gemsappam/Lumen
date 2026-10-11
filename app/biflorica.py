@@ -58,7 +58,7 @@ def parse(data: bytes) -> dict:
             inner = re.search(r'"(.+)"', desc)
             parts = [p.strip() for p in (inner.group(1) if inner else desc).split(" - ")]
             code = parts[0].upper() if parts else ""
-            farm = CODES.get(code) or (code.title() if code else "?")
+            farm = CODES.get(code) or code
             price = next((float(p.replace("$", "")) for p in parts if p.startswith("$")), None)
             item = " ".join(p for p in parts[1:] if not p.startswith("$") and not p.upper().endswith("HB"))
             ops.append({"kind": "buy", "ext": ext, "date": date, "farm": farm, "item": item or desc,
@@ -90,7 +90,31 @@ def import_statement(data: bytes) -> dict:
     from .api import SETTINGS, _settings, marking
     from .backup import mark_dirty
     st = parse(data)
-    new_dep, new_buy, linked = [], [], []
+    new_dep, new_buy, linked, new_farms, fee_fix = [], [], [], [], []
+    from .api import resolve_farm
+    with session() as s:
+        for o in st["ops"]:                        # statement code (GEOF, TESSA, PLAZOL…) -> our farm, via aliases
+            if o["kind"] != "buy":
+                continue
+            f = resolve_farm(s, o["farm"])
+            if not f:                              # never seen: it is bought through the broker by definition
+                f = Farm(name=o["farm"].title(), country="", aliases=o["farm"].upper(),
+                         in_fee_pct=3, markup_pct=7, account="Брокер",
+                         notes="Новая ферма из выписки BiFlorica — проверь название и страну в «Плантации».")
+                s.add(f); s.flush()
+                new_farms.append(f.name)
+            elif not (f.account or "").strip():    # known farm, but the statement proves it's via the broker
+                f.account, f.in_fee_pct = "Брокер", f.in_fee_pct or 3
+                f.markup_pct = f.markup_pct or 7
+                s.add(f)
+            if o["amount"]:
+                pct = round(o["fee"] / o["amount"] * 100, 1)
+                if pct and abs((f.markup_pct or 0) - pct) >= 0.2:
+                    fee_fix.append(f"{f.name}: {f.markup_pct or 0:g}% → {pct:g}%")
+                    f.markup_pct = pct
+                    s.add(f)
+            o["farm"] = f.name
+        s.commit()
     with session() as s:
         tops = sorted(s.exec(select(TopUp)).all(), key=lambda t: t.id)
         seen_dep = {d.ext_id for d in s.exec(select(BrokerDeposit)).all()}
@@ -134,4 +158,5 @@ def import_statement(data: bytes) -> dict:
     if _settings().get("broker_opening") is None:            # first statement: balance before the bot
         SETTINGS.write_text(__import__("json").dumps({**_settings(), "broker_opening": {"usd": st["opening"], "rate": None}}))
     mark_dirty()
-    return {"new_dep": new_dep, "new_buy": new_buy, "linked": linked, "opening": st["opening"], "ops": st["ops"]}
+    return {"new_dep": new_dep, "new_buy": new_buy, "linked": linked, "opening": st["opening"], "ops": st["ops"],
+            "new_farms": new_farms, "fee_fix": sorted(set(fee_fix))}

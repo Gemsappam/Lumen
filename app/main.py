@@ -51,7 +51,9 @@ FARM_ALIASES = {"Josar Flor": "JOSARFLOR,FLORICULTORA JOSARFLOR,FLORICULTORA JOS
 BOX_RULES = {"Zeeflora": {"Spray Rose Reflex Bicolour 60cm": 25, "Spray Rose Fire Works Bi-Pink 60cm": 25}}
 
 
-BROKER = {"Tessa": ("Эквадор", "POSITANO,Позитано"), "Plazoleta": ("Колумбия", "")}
+BROKER = {"Tessa": ("Эквадор", "POSITANO,Позитано,TESSA"), "Plazoleta": ("Колумбия", "PLAZOL,PLAZOLETA"),
+          "Geoflora": ("Колумбия", "GEOF,GEOFLORA,GEOFLORA SAS")}
+BROKER_MARKUP = {"Geoflora": 9}              # BiFlorica charges 9 % on Geoflora (statement), 7 % on the others
 
 
 def upsert_forwarders():
@@ -70,10 +72,12 @@ def upsert_forwarders():
         for name, (country, aliases) in BROKER.items():   # bought through a broker: 3 % in, 7 % on the invoice
             f = s.exec(select(Farm).where(Farm.name == name)).first() or Farm(name=name, country=country)
             f.country = country
-            if aliases and "POSITANO" not in (f.aliases or ""):
-                f.aliases = ",".join(x for x in [f.aliases, aliases] if x)
+            have = {x.strip().upper() for x in (f.aliases or "").split(",") if x.strip()}
+            add = [x for x in aliases.split(",") if x.strip() and x.strip().upper() not in have]
+            if add:
+                f.aliases = ",".join(x for x in [f.aliases] + add if x)
             if not f.in_fee_pct and not f.markup_pct:
-                f.in_fee_pct, f.markup_pct, f.account = 3, 7, "Брокер"
+                f.in_fee_pct, f.markup_pct, f.account = 3, BROKER_MARKUP.get(name, 7), "Брокер"
                 f.notes = ((f.notes or "") + " Закупка через брокера: на биржу заходит 97% долларов (3% входящая комиссия), "
                            "к инвойсу фермы +7% комиссии брокера.").strip()
             s.add(f)
@@ -303,7 +307,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-09c · поставка уходит только целиком"
+VERSION = "2026-10-11 · Geoflora через посредника + вопрос «напрямую / посредник»"
 
 
 async def _once_recalc_true_rate():
