@@ -117,6 +117,8 @@ def _fix_double_broker():
                 invs.sort(key=lambda i: (bool(i.packing_lines_json),
                                          _d(i.invoice_date) or __import__("datetime").datetime.min, i.id))
                 for old in invs[:-1]:
+                    if old.ext_id:      # two real statement purchases can share a MAWB — never strip one
+                        continue
                     old.awb = ""
                     s.add(old)
         s.commit()
@@ -268,8 +270,46 @@ def _fix_swapped_dates():
             print(f"[lumen] fixed {n} swapped invoice dates", flush=True)
 
 
+def _fix_broker_swap():
+    """Once (12.10.2026): farm invoices Tessa № 90836926 and Plazoleta № 177858 were attached to the OLDER statement
+    purchases (90832981 / 177151) before invoice numbers were matched. Move MAWB, truck, arrival and packing to the
+    purchase with the same number; the older purchase goes back to what it was (arrived, no MAWB)."""
+    import re as _re
+    from .api import _settings, SETTINGS
+    from .models import Invoice
+    if _settings().get("fix_broker_swap_1012"):
+        return
+    pairs = [("Tessa", "90836926", "90832981"), ("Plazoleta", "177858", "177151")]
+    with session() as s:
+        invs = [i for i in s.exec(select(Invoice)).all() if getattr(i, "via_broker", False) and i.ext_id]
+        num = lambda i: _re.sub(r"\D", "", (i.invoice_no or "").split("#")[-1])
+        for farm, right_no, wrong_no in pairs:
+            right = next((i for i in invs if i.farm == farm and num(i).endswith(right_no)), None)
+            wrong = next((i for i in invs if i.farm == farm and num(i).endswith(wrong_no)), None)
+            if not right or not wrong or not wrong.packing_lines_json and not (wrong.awb or "").strip():
+                continue
+            awb = (wrong.awb or "").strip() or (right.awb or "").strip()
+            right_arr = right.arrived_at
+            right.awb = awb
+            for k in ("truck", "eta", "hawb", "weight_kg", "client_eta", "client_done"):
+                if getattr(wrong, k, None):
+                    setattr(right, k, getattr(wrong, k))
+            right.arrived_at = wrong.arrived_at
+            if wrong.packing_lines_json and not right.packing_lines_json:
+                right.packing_lines_json, right.boxes_json = wrong.packing_lines_json, wrong.boxes_json
+            right.packing_sent = right.packing_sent or wrong.packing_sent
+            wrong.awb, wrong.packing_lines_json, wrong.boxes_json, wrong.hawb = "", None, None, None
+            wrong.truck, wrong.eta, wrong.client_eta = None, None, None
+            wrong.arrived_at = right_arr or "до учёта в пути"
+            s.add(right); s.add(wrong)
+            print(f"[lumen] {farm}: MAWB {awb} moved from purchase {wrong.invoice_no} to {right.invoice_no}", flush=True)
+        s.commit()
+    SETTINGS.write_text(json.dumps({**_settings(), "fix_broker_swap_1012": True}))
+
+
 def seed():
     _seed_farms()
+    _fix_broker_swap()
     _fix_swapped_dates()
     _fix_double_broker()
     _merge_broker_dupes()
@@ -402,7 +442,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-12c · брокерские закупки в листе нашего пополнения, из которого пополнили брокера"
+VERSION = "2026-10-12d · Tessa 90836926 / Plazoleta 177858 на своих MAWB; без перекидывания MAWB между закупками"
 
 
 async def _once_recalc_true_rate():
