@@ -648,7 +648,7 @@ async transit({seg}={}){
       <div style="margin:3px 0"><span class="pill ${i.paid_state==='paid'?'ok':'warn'}">${i.paid_state==='paid'?'оплачен · '+esc(i.topup):'не оплачен'}</span>${i.arrived_at?` <span class="pill">прибыл ${esc(String(i.arrived_at).slice(0,5))}</span>`:''}</div>
       <div class="s num">${fmt(i.stems)} ст${i.paid_state==='paid'?'':' · ≈$'+fmt(i.est_usd||0,0)}${i.truck?' · 🚚 '+esc(i.truck):''}</div>
       <div class="s num">${legsOf(i).map(l=>`${l.name} ${fmt(l.per,2)}`).join(' + ')} ₽/ст</div></div>
-      <div class="v"><div class="num">${i.approx?'≈ ':''}${fmt(i.avg_rub,2)} ₽</div><div class="s">${i.approx?'±10% · ':''}за стебель</div></div></div>`).join('')}</div>`).join('')
+      <div class="v"><div class="num">${i.approx?'≈ ':''}${fmt(i.avg_rub,2)} ₽</div><div class="s">${i.approx?(i.approx_big?'±10% · ':'≈ курс ТК · '):''}за стебель</div></div></div>`).join('')}</div>`).join('')
     :`<div class="empty">${SEG==='paid'?'Оплаченных грузов в пути нет.':'Неоплаченных грузов в пути нет.'}</div>`}
   ${SEG!=='paid'&&v.unpaid_logistics.length?`<h2>Неоплаченная логистика</h2><div class="group">${v.unpaid_logistics.map(l=>`<div class="row"><div class="grow">
       <div class="t">${esc(l.provider||'Фрахт')}</div><div style="margin:3px 0"><span class="pill warn">не оплачен</span></div><div class="s">MAWB ${esc(l.awb)}</div></div>
@@ -704,7 +704,7 @@ async transit({seg}={}){
 async transitInv({i,v}){
   $app.innerHTML=`<h1>${esc(i.farm)}</h1>
   <p class="sub">MAWB ${esc(i.awb||'?')} · ${i.paid_state==='paid'?'оплачен из пополнения '+esc(i.topup):'не оплачен · ≈$'+fmt(i.est_usd||0,2)}
-    ${i.eta?' · прибытие '+esc(i.eta.replace('T',' ')):''}<br>Логистика: ${esc(i.logi_source)}${i.approx?' · приблизительно, ±10%':''}</p>
+    ${i.eta?' · прибытие '+esc(i.eta.replace('T',' ')):''}<br>Логистика: ${esc(i.logi_source)}${i.approx?' · приблизительно'+(i.approx_big?', ±10%':', ±1–3%')+(i.approx_why?' ('+esc(i.approx_why)+')':''):''}</p>
   <h2>Логистика</h2>
   <div class="group">${legsOf(i).map(l=>`<div class="row"><div class="grow"><div class="t">${esc(l.name)}</div><div class="s">${esc(l.src)}</div></div>
       <div class="v"><div class="num">${fmt(l.rub)} ₽</div><div class="s num">${fmt(l.per,2)} ₽/ст</div></div></div>`).join('')}

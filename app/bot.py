@@ -368,6 +368,10 @@ async def _floratrack(m: Message, data: bytes):
         txt += "\n\nНет наших инвойсов/разбивки с этими AWB (последние 3 недели):\n" + "\n".join(
             f"• …{c.last4} · {kinds[c.kind]} · {c.kg:g} кг · {c.sheet}" for c in fresh[:15])
         txt += "\nВнеси их и перекинь отчёт — привяжутся."
+    if r.get("offsets") and roles.sees_money(roles.role_of(m.from_user.id)):
+        txt += ("\n\n⚠️ Floratrack списал ваши оплаты не на машины:\n" + "\n".join(
+            f"• {d:%d.%m} · ${u:,.2f} · «{n or 'без пояснения'}»" for d, u, n in r["offsets"])
+            + "\nЭти деньги на ваши машины не пошли — поэтому последние машины «курс предв.» и долг перед Floratrack.")
     if r["ambiguous"]:
         txt += "\n\n⚠️ Несколько MAWB с такими 4 цифрами, взял по весу: " + ", ".join(r["ambiguous"][:10])
     affected = sorted({x["topup_id"] for awb, _c in r["matched"] for x in awb_spread(awb)})
@@ -464,6 +468,8 @@ async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dic
         await note.edit_text(f"Не смог прочитать: {e}")
         return
     warn = ("\n⚠️ " + "\n⚠️ ".join(out["warnings"])) if out.get("warnings") else ""
+    if warn and out.get("doc_type") == "farm_invoice":
+        warn += "\n✏️ Если бот ошибся — нажми «Исправить текстом» или ответь на это сообщение: «там 840 ст и 24 коробки»."
     from .api import update_upload
     update_upload(up_id, kind=out.get("doc_type", ""),
                   summary=f"{out.get('farm') or ''} {out.get('invoice_no') or ''} MAWB {out.get('awb') or '?'} ${out.get('invoice_total_usd') or ''}")
@@ -506,6 +512,12 @@ async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dic
         return
 
     # farm invoice / freight bill -> «оплачен?» flow
+    _fix_remember(m.from_user.id, up_id, data, mime, m.caption or "", note)
+    await _route_invoice(m.from_user.id, out, m.caption or "", note, warn)
+
+
+async def _route_invoice(uid: int, out: dict, caption: str, note, warn: str, pre: str = ""):
+    """Parsed farm invoice / freight bill -> broker packing, new farm, correction question or the «оплачен?» flow."""
     subs = split_by_farm(out) if out.get("doc_type") == "farm_invoice" else [out]
     if out.get("doc_type") == "farm_invoice":
         from .api import attach_broker_packing, is_broker_farm
@@ -516,17 +528,17 @@ async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dic
             msg = "\n\n".join(attach_broker_packing(d) for d in broker)
             subs = [d for d in subs if d not in broker]
             if not subs:
-                await _send(m.from_user.id, msg, None, note)
+                await _send(uid, pre + msg, _fix_kb(out), note)
                 await send_packing_lists()
                 return
-            await m.answer(msg)
+            await bot.send_message(uid, pre + msg, reply_markup=_fix_kb(out))
     if out.get("doc_type") == "farm_invoice" and any(not d.get("farm") for d in subs):
         raw = out.get("supplier") or next((mm.group(1) for w in out.get("warnings", [])
                                            for mm in [re.search(r"[Пп]оставщик\s+['«\"]([^'»\"]+)", w)] if mm), "")
         if raw:
-            NEWFARM[m.from_user.id] = {"raw": raw, "subs": subs, "out": out, "caption": m.caption or "",
+            NEWFARM[uid] = {"raw": raw, "subs": subs, "out": out, "caption": caption,
                                        "head": _flow_head(subs)}
-            await _send(m.from_user.id, f"🌱 Новая ферма: «{raw}» — её нет в списке плантаций.\nДобавить? Выбери страну:",
+            await _send(uid, f"🌱 Новая ферма: «{raw}» — её нет в списке плантаций.\nДобавить? Выбери страну:",
                         _kb([[("🇰🇪 Кения", "nf:Кения"), ("🇪🇨 Эквадор", "nf:Эквадор")],
                              [("🇨🇴 Колумбия", "nf:Колумбия"), ("🇳🇱 Нидерланды", "nf:Нидерланды")],
                              [("Не добавлять", "nf:skip")]]), note)
@@ -535,18 +547,375 @@ async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dic
         from .api import find_same_invoice
         same = [(d, find_same_invoice(d)) for d in subs]
         same = [(d, inv) for d, inv in same if inv]
-        if same and "новый" not in (m.caption or "").lower():
+        if same and "новый" not in caption.lower():
             d, inv = same[0]
-            CORR[m.from_user.id] = {"pairs": [(save_draft(dd), ii["id"]) for dd, ii in same],
-                                    "subs": subs, "out": out, "caption": m.caption or "", "head": _flow_head(subs) + warn}
+            CORR[uid] = {"pairs": [(save_draft(dd), ii["id"]) for dd, ii in same],
+                                    "subs": subs, "out": out, "caption": caption, "head": pre + _flow_head(subs) + warn}
             who = ", ".join(ii["farm"] for _dd, ii in same)
-            await _send(m.from_user.id,
+            await _send(uid,
                         f"📝 Инвойс {who} № {inv['invoice_no']} уже есть в учёте ({inv['where']}).\nЭто КОРРЕКТИРОВКА инвойса?",
                         _kb([[("✅ Да, корректировка — заменить", "cor:yes")],
-                             [("➕ Нет, это новый инвойс", "cor:no")]]), note)
+                             [("➕ Нет, это новый инвойс", "cor:no")]] + _fix_rows(out)), note)
             return
-    await _start_flow(m.from_user.id, subs, out, m.caption or "", note, _flow_head(subs) + warn)
+    await _start_flow(uid, subs, out, caption, note, pre + _flow_head(subs) + warn)
 
+
+
+# ---------- «✏️ бот ошибся — исправить текстом» ------------------------------------------
+FIXWAIT: dict = {}    # user -> upload id: the next text from him is a correction of that invoice
+MSG2UP: dict = {}     # (user, bot message id) -> upload id: a reply to that message = correction
+LASTUP: dict = {}     # user -> last invoice upload id (for /fix)
+
+
+def _fixdir():
+    from .api import DRAFTS
+    d = DRAFTS.parent / "fixsrc"
+    d.mkdir(exist_ok=True)
+    return d
+
+
+def _fix_rows(out) -> list:
+    up = out.get("upload_id") if isinstance(out, dict) else out
+    return [[("✏️ Бот ошибся — исправить текстом", f"fx:{up}")]] if up else []
+
+
+def _fix_kb(out):
+    rows = _fix_rows(out)
+    return _kb(rows) if rows else None
+
+
+def _fix_remember(uid: int, up_id: int, data: bytes, mime: str, caption: str, note=None):
+    """Keep what the AI read (bytes / extracted text) so a typed correction can re-read the same document."""
+    if not up_id:
+        return
+    LASTUP[uid] = up_id
+    if note is not None:
+        MSG2UP[(uid, note.message_id)] = up_id
+    try:
+        d = _fixdir()
+        (d / f"{up_id}.bin").write_bytes(data)
+        (d / f"{up_id}.json").write_text(json.dumps({"mime": mime, "caption": caption}, ensure_ascii=False))
+        old = sorted(d.glob("*.bin"), key=lambda p: p.stat().st_mtime)[:-80]
+        for p in old:
+            p.unlink(missing_ok=True)
+            p.with_suffix(".json").unlink(missing_ok=True)
+    except Exception as e:
+        print(f"[lumen] fixsrc: {e}", flush=True)
+
+
+async def _fix_load(up_id: int):
+    """-> (data, mime, caption) of the original document, or None."""
+    d = _fixdir()
+    if (d / f"{up_id}.bin").exists():
+        meta = json.loads((d / f"{up_id}.json").read_text()) if (d / f"{up_id}.json").exists() else {}
+        return (d / f"{up_id}.bin").read_bytes(), meta.get("mime") or "application/pdf", meta.get("caption") or ""
+    from .models import Upload
+    with session() as s:
+        u = s.get(Upload, up_id)
+        fid, name, mime = (u.tg_file_id, (u.filename or "").lower(), u.mime or "") if u else (None, "", "")
+    if not fid:
+        return None
+    f = await bot.download(fid)
+    data = f.read()
+    if name.endswith((".xls", ".xlsx")):
+        from .xltext import excel_to_text
+        return excel_to_text(data, name).encode(), "text/plain", ""
+    if name.endswith(".docx"):
+        from .xltext import docx_to_text
+        return docx_to_text(data).encode(), "text/plain", ""
+    if name.endswith(".doc"):
+        from .xltext import doc_to_text
+        return doc_to_text(data).encode(), "text/plain", ""
+    return data, ("image/jpeg" if mime.startswith("image") or name == "фото" else mime or "application/pdf"), ""
+
+
+def _boxes_text(boxes: list, limit: int = 30) -> str:
+    """boxes_detail -> «• 3 кор: Light Blue 25/кор» lines for checking the packing before it is applied."""
+    rows = []
+    for b in boxes or []:
+        parts = []
+        for c in b.get("content") or []:
+            n = c.get("stems_per_box")
+            parts.append(f"{c.get('name')} {n:g}/кор" if isinstance(n, (int, float)) else
+                         f"{c.get('name')} {float(c.get('stems_total') or c.get('stems') or 0):g} ст")
+        rows.append(f"• {int(b.get('qty') or 1)} кор{(' ' + b['pack']) if b.get('pack') else ''}: " + ", ".join(parts))
+    if len(rows) > limit:
+        rows = rows[:limit] + [f"… ещё {len(rows) - limit} строк"]
+    return "\n".join(rows)
+
+
+def _d_totals(d: dict):
+    stems = sum(l.get("stems") or 0 for l in d.get("lines") or [])
+    boxes = sum(int(b.get("qty") or 1) for b in d.get("boxes_detail") or []) or \
+        sum(l.get("boxes") or 0 for l in d.get("lines") or []) or (d.get("boxes_total") or 0)
+    return stems, boxes
+
+
+def _inv_totals(inv_id: int):
+    from .models import Invoice
+    with session() as s:
+        inv = s.get(Invoice, inv_id)
+        if inv.via_broker and inv.packing_lines_json:
+            lines = json.loads(inv.packing_lines_json)
+        else:
+            lines = [{"stems": l.stems, "boxes": l.boxes} for l in s.exec(select(Line).where(Line.invoice_id == inv_id)).all()]
+        bx = json.loads(inv.boxes_json) if inv.boxes_json else []
+    return _d_totals({"lines": lines, "boxes_detail": bx})
+
+
+def _booked_for(up_id: int, subs: list) -> list:
+    """[(sub, invoice id | None)] — which parts of this document are already in the books."""
+    from .models import Invoice
+    from .api import find_same_invoice, _norm_name
+    with session() as s:
+        invs = [(i.id, i.farm) for i in s.exec(select(Invoice).where(Invoice.source_file == f"up:{up_id}")).all()]
+    res = []
+    for d in subs:
+        hit = next((iid for iid, f in invs if _norm_name(f) == _norm_name(d.get("farm") or "")), None)
+        if hit is None and len(invs) == 1 and len(subs) == 1:
+            hit = invs[0][0]
+        if hit is None:
+            same = find_same_invoice(d)
+            hit = same["id"] if same else None
+        res.append((d, hit))
+    return res
+
+
+def _fmt_n(x) -> str:
+    return f"{x:g}" if isinstance(x, (int, float)) else str(x)
+
+
+def _want_numbers(text: str):
+    t = text.lower()
+    st = re.search(r"(\d[\d\s]*)\s*(?:ст\b|стеб|stem)", t)
+    bx = re.search(r"(\d+)\s*(?:кор|box|кб\b)", t)
+    return (int(re.sub(r"\D", "", st.group(1))) if st else None), (int(bx.group(1)) if bx else None)
+
+
+def _drop_pending(uid: int, up_id: int):
+    """The old reading of this document is still waiting in a flow / question -> throw it away."""
+    from .api import DRAFTS
+    fl = FLOW.get(uid)
+    if fl:
+        docs = _flow_docs(fl)
+        if docs and any(d.get("upload_id") == up_id for _p, d in docs):
+            for p, _d in docs:
+                p.unlink(missing_ok=True)
+            FLOW.pop(uid, None)
+    p = CORR.get(uid)
+    if p and (p.get("out") or {}).get("upload_id") == up_id:
+        for did, _iid in p.get("pairs") or []:
+            (DRAFTS / f"{did}.json").unlink(missing_ok=True)
+        CORR.pop(uid, None)
+    p = NEWFARM.get(uid)
+    if p and (p.get("out") or {}).get("upload_id") == up_id:
+        NEWFARM.pop(uid, None)
+
+
+async def _apply_fix(uid: int, up_id: int, text: str):
+    import asyncio, logging, traceback
+    note = await bot.send_message(uid, "✏️ Перечитываю инвойс с твоим исправлением… (до пары минут)")
+    MSG2UP[(uid, note.message_id)] = up_id
+    try:
+        await asyncio.wait_for(_apply_fix_inner(uid, up_id, text, note), timeout=480)
+    except asyncio.TimeoutError:
+        await _send(uid, "⏱ AI не ответил за 8 минут. Напиши исправление ещё раз.", _fix_kb(up_id), note)
+    except Exception:
+        logging.exception("fix failed")
+        tb = traceback.format_exc().strip().splitlines()[-1]
+        await _send(uid, f"❌ Ошибка при исправлении: {tb[:300]}", _fix_kb(up_id), note)
+
+
+async def _apply_fix_inner(uid: int, up_id: int, text: str, note):
+    from .api import merge_lines, correct_invoice, invoice_costs, DRAFTS
+    src = await _fix_load(up_id)
+    if not src:
+        await _send(uid, "Не нашёл исходный файл этого инвойса. Пришли его заново и напиши исправление в подписи к файлу.",
+                    None, note)
+        return
+    data, mime, caption = src
+    # what we read last time — from the books or from the drafts still waiting
+    prev = []
+    with session() as s:
+        from .models import Invoice
+        for i in s.exec(select(Invoice).where(Invoice.source_file == f"up:{up_id}")).all():
+            st, bx = _inv_totals(i.id)
+            prev.append(f"{i.farm}: {st:g} стеблей, {bx:g} коробок")
+    if not prev:
+        for p in DRAFTS.glob("*.json"):
+            try:
+                d = json.loads(p.read_text())
+            except ValueError:
+                continue
+            if d.get("upload_id") == up_id:
+                st, bx = _d_totals(d)
+                prev.append(f"{d.get('farm') or '?'}: {st:g} стеблей, {bx:g} коробок")
+    ai_note = ((caption + "\n\n") if caption else "") + (
+        "ИСПРАВЛЕНИЕ ОТ ОПЕРАТОРА — оно главнее твоего прошлого прочтения: «" + text.strip() + "».\n"
+        + (("В прошлый раз ты прочитал так: " + "; ".join(prev) + " — это неверно.\n") if prev else "")
+        + "Перечитай документ заново, строку за строкой, ничего не пропуская (строки на стыке страниц, "
+          "последнюю строку перед TOTAL, коробки с одной строкой). Итоговые стебли и коробки должны совпасть "
+          "с исправлением оператора и со строкой TOTAL. boxes_total и stems_total — как в исправлении, если оно их называет.\n"
+          "НЕ подгоняй цифры: не увеличивай стебли существующих строк, чтобы сойтись с итогом. Пропущенная строка — это "
+          "отдельная строка документа со своим сортом и своей коробкой. Если оператор сам описал строку или коробку "
+          "(сорт, длина, стебли) — добавь её ровно так. Если строку в документе так и не нашёл — не выдумывай, "
+          "а напиши в warnings, чего не нашёл. boxes_detail — что лежит в каждой коробке, как в документе.")
+    with session() as s:
+        fs = [f.model_dump() for f in s.exec(select(Farm)).all()]
+        catalog = sorted({l.name for l in s.exec(select(Line)).all()})
+    out = merge_lines(await ai.parse_document(data, mime, fs, catalog, note=ai_note))
+    out["upload_id"], out["source_file"] = up_id, f"up:{up_id}"
+    if out.get("doc_type") != "farm_invoice":
+        await _send(uid, "Перечитал, но это не похоже на инвойс фермы — исправлять текстом можно только инвойсы ферм.",
+                    None, note)
+        return
+    want_st, want_bx = _want_numbers(text)
+    new_st, new_bx = _d_totals(out)
+    check = ""
+    if (want_st and abs(new_st - want_st) >= 1) or (want_bx and new_bx != want_bx):
+        check = (f"\n\n⚠️ Ты написал {(_fmt_n(want_st) + ' ст') if want_st else ''}"
+                 f"{' и ' if want_st and want_bx else ''}{(_fmt_n(want_bx) + ' кор') if want_bx else ''}, "
+                 f"а у меня сейчас {new_st:g} ст / {new_bx:g} кор. Напиши подробнее, какой строки не хватает "
+                 "(сорт, длина, стеблей, в какой коробке) — ответь на это сообщение.")
+    subs = split_by_farm(out)
+    pairs = _booked_for(up_id, subs)
+    booked = [(d, iid) for d, iid in pairs if iid]
+    if not booked:
+        # not in the books yet: replace the old reading and continue the usual questions with the new one
+        _drop_pending(uid, up_id)
+        _fix_remember(uid, up_id, data, mime, caption, note)
+        pre = "✏️ Перечитал с исправлением.\n" + ("Было: " + "; ".join(prev) + "\n" if prev else "") + \
+              f"Стало: {new_st:g} стеблей, {new_bx:g} коробок.{check}\n" + \
+              (("По коробкам (так пойдёт в пакинг):\n" + _boxes_text(out.get("boxes_detail")) + "\n") if out.get("boxes_detail") else "") + "\n"
+        warn = ("\n⚠️ " + "\n⚠️ ".join(out["warnings"])) if out.get("warnings") else ""
+        await _route_invoice(uid, out, caption, note, warn, pre=pre)
+        return
+    rest = [d for d, iid in pairs if not iid]
+    FIXPEND[uid] = {"up": up_id, "pairs": [(save_draft(d), iid) for d, iid in booked]}
+    txt = "✏️ Перечитал инвойс с исправлением. Проверь, прежде чем применю:\n"
+    for d, iid in booked:
+        b_st, b_bx = _inv_totals(iid)
+        a_st, a_bx = _d_totals(d)
+        with session() as s:
+            from .models import Invoice
+            inv = s.get(Invoice, iid)
+            old = {l.name: l.stems for l in s.exec(select(Line).where(Line.invoice_id == iid)).all()}
+            if inv.via_broker and inv.packing_lines_json:
+                old = {x.get("name"): x.get("stems") for x in json.loads(inv.packing_lines_json)}
+            head = f"{inv.farm} № {inv.invoice_no}"
+        newl = {}
+        for l in d.get("lines") or []:
+            newl[l.get("name")] = newl.get(l.get("name"), 0) + (l.get("stems") or 0)
+        ch = [f"{n}: {_fmt_n(old.get(n, '—'))} → {_fmt_n(newl[n]) if n in newl else 'убран'}"
+              for n in sorted(set(old) | set(newl)) if old.get(n) != newl.get(n)]
+        txt += (f"\n📄 {head}: стеблей {b_st:g} → {a_st:g}, коробок {b_bx:g} → {a_bx:g}\n"
+                + ("\n".join("• " + x for x in ch[:25]) + "\n" if ch else "")
+                + (("По коробкам (так пойдёт в пакинг):\n" + _boxes_text(d.get("boxes_detail")) + "\n")
+                   if d.get("boxes_detail") else ""))
+    if rest:
+        txt += "\nНе нашёл в учёте: " + ", ".join(d.get("farm") or "?" for d in rest) + " — пришли их инвойс отдельно."
+    if out.get("warnings"):
+        txt += "\n⚠️ " + "\n⚠️ ".join(out["warnings"])
+    await _send(uid, (txt + check)[:4000],
+                _kb([[("✅ Применить", "fxok"), ("✏️ Ещё поправить", f"fx:{up_id}")], [("✖️ Не менять", "fxno")]]), note)
+
+
+FIXPEND: dict = {}    # user -> corrected reading waiting for «✅ Применить»
+
+
+@dp.callback_query(F.data.in_({"fxok", "fxno"}), wr)
+async def fix_apply(c: CallbackQuery):
+    from .api import correct_invoice, invoice_costs, DRAFTS
+    p = FIXPEND.pop(c.from_user.id, None)
+    await c.answer()
+    if not p:
+        await c.message.edit_text("Устарело — напиши исправление ещё раз.")
+        return
+    if c.data == "fxno":
+        for did, _iid in p["pairs"]:
+            (DRAFTS / f"{did}.json").unlink(missing_ok=True)
+        await c.message.edit_text(c.message.text.split("\n")[0] + "\n✖️ Ничего не менял.", reply_markup=_fix_kb(p["up"]))
+        return
+    txt, done, keys = "", [], set()
+    for did, iid in p["pairs"]:
+        f = DRAFTS / f"{did}.json"
+        if not f.exists():
+            continue
+        d = json.loads(f.read_text())
+        b_st, b_bx = _inv_totals(iid)
+        before = invoice_costs(iid)
+        r = correct_invoice(iid, d)
+        f.unlink(missing_ok=True)
+        a_st, a_bx = _inv_totals(iid)
+        done.append((iid, before, r))
+        txt += f"✅ {r['farm']} № {r['invoice_no']}: стеблей {b_st:g} → {a_st:g}, коробок {b_bx:g} → {a_bx:g}\n"
+        if r.get("awb_key"):
+            keys.add(r["awb_key"])
+    txt += "Оплата, пополнение, MAWB и баланс фермы — как были."
+    from . import kbreak
+    for k in keys:
+        edited = await refresh_shipment(k, "исправлен инвойс (" + ", ".join(r["farm"] for _i, _b, r in done) + ")")
+        if edited:
+            txt += f"\n🔄 Пакинг MAWB {k} в чатах обновлён ({edited} сообщ.)."
+        elif kbreak.is_sent(k):
+            txt += f"\n⚠️ Пакинг MAWB {k} уже ушёл старым сообщением — нажми «📦 Пакинги в чаты» → этот MAWB."
+    await c.message.edit_text(txt[:4000], reply_markup=_fix_kb(p["up"]))
+    for iid, before, r in done:
+        if r["changes"]:
+            await send_correction(iid, before, f"Исправление инвойса фермы № {r['invoice_no']}")
+    await send_packing_lists()
+
+
+@dp.callback_query(F.data.startswith("fx:"), wr)
+async def fix_button(c: CallbackQuery):
+    up = int(c.data.split(":")[1])
+    FIXWAIT[c.from_user.id] = up
+    await c.answer()
+    await bot.send_message(c.from_user.id,
+                           "✏️ Напиши одним сообщением, что не так. Например:\n"
+                           "• «там 840 стеблей и 24 коробки»\n"
+                           "• «не хватает коробки: Freedom 50 см 300 ст»\n"
+                           "• «Explorer не 60, а 70 см»\n"
+                           "Перечитаю инвойс с этим и покажу, что изменилось. /cancel — передумал.")
+
+
+@dp.message(pv, wr, F.from_user.id.func(lambda i: i in FIXWAIT),
+            F.text.func(lambda t: not t.startswith("/") or t.startswith("/cancel")))
+async def fix_text(m: Message):
+    up = FIXWAIT.pop(m.from_user.id)
+    if m.text.strip().lower() in ("/cancel", "отмена", "отменить"):
+        await m.answer("Ок, ничего не меняю.")
+        return
+    await _apply_fix(m.from_user.id, up, m.text)
+
+
+@dp.message(pv, wr, F.reply_to_message.func(lambda r: r is not None), F.text,
+            F.func(lambda m: (m.from_user.id, m.reply_to_message.message_id) in MSG2UP and not (m.text or "").startswith("/")
+                   and not any(money_from_text(m.text or "")) and not ai.find_mawb(m.text or "")))
+async def fix_reply(m: Message):
+    await _apply_fix(m.from_user.id, MSG2UP[(m.from_user.id, m.reply_to_message.message_id)], m.text)
+
+
+@dp.message(pv, wr, Command("fix"))
+async def fix_cmd(m: Message):
+    """/fix там 840 стеблей и 24 коробки — исправить последний присланный инвойс."""
+    from .models import Upload
+    uid = m.from_user.id
+    up = LASTUP.get(uid)
+    if not up:
+        with session() as s:
+            u = s.exec(select(Upload).where(Upload.uid == uid, Upload.kind == "farm_invoice")
+                       .order_by(Upload.id.desc())).first()
+            up = u.id if u else None
+    if not up:
+        await m.answer("Не нашёл твоего последнего инвойса. Пришли файл, потом нажми «✏️ Исправить текстом».")
+        return
+    text = (m.text or "").split(maxsplit=1)
+    if len(text) < 2:
+        FIXWAIT[uid] = up
+        await m.answer("✏️ Напиши, что не так в последнем инвойсе (например «там 840 стеблей и 24 коробки»).")
+        return
+    await _apply_fix(uid, up, text[1])
 
 CORR: dict = {}       # user -> pending «is it a correction?»
 NEWFARM: dict = {}    # user -> invoice from a farm we don't know yet
@@ -641,7 +1010,8 @@ async def _start_flow(uid: int, subs: list, out: dict, caption: str, note, head:
             fill_mawb(d, t.id if t else None)     # MAWB from the Expolanka breakdown right away
     cu, _cr = money_from_text(caption)
     flow = {"ids": [save_draft(d) for d in subs], "paid": None, "topup": t.id if t else None,
-            "pays": None, "kind": out.get("doc_type"), "ts": time.time(), "note": note}
+            "pays": None, "kind": out.get("doc_type"), "ts": time.time(), "note": note,
+            "up": out.get("upload_id") if out.get("doc_type") == "farm_invoice" else None}
     if "не оплач" in caption.lower():
         flow["paid"] = False
     elif cu or t:
@@ -755,7 +1125,7 @@ async def _step(uid: int, head: str = ""):
     head = (head + "\n\n") if head else ""
     freight = flow["kind"] == "freight_invoice"
     if flow["paid"] is None:
-        await _send(uid, head + "Оплачен?", _kb([[("✅ Оплачен", "fl:paid"), ("🚚 Не оплачен — в пути", "fl:unpaid")]] + ([[("↩️ Назад", "fl:back")]] if flow.get("hist") else []) + [[("✖️ Отменить (останется в черновиках)", "fl:cancel")]]), note)
+        await _send(uid, head + "Оплачен?", _kb([[("✅ Оплачен", "fl:paid"), ("🚚 Не оплачен — в пути", "fl:unpaid")]] + ([[("↩️ Назад", "fl:back")]] if flow.get("hist") else []) + _fix_rows(flow.get("up")) + [[("✖️ Отменить (останется в черновиках)", "fl:cancel")]]), note)
         return
     if flow["paid"] and not flow["topup"]:
         with session() as s:
@@ -767,6 +1137,11 @@ async def _step(uid: int, head: str = ""):
         await _send(uid, head + "Из какого пополнения оплачен?", _kbb(rows), note)
         return
     if not flow.get("awb_done"):
+        for p, d in docs:
+            if not d.get("awb") and d.get("doc_type") == "farm_invoice":
+                fill_mawb(d, flow.get("topup"))
+                if d.get("awb"):
+                    p.write_text(json.dumps(d, ensure_ascii=False))
         awbs = sorted({d.get("awb") for _p, d in docs if d.get("awb")})
         if awbs:
             await _send(uid, head + f"MAWB: {', '.join(awbs)}" + (" (из разбивки)" if any(d.get('mawb_note') for _p, d in docs) else "") + " — верно?",
@@ -1004,9 +1379,9 @@ def _doc_head(out: dict) -> str:
         fr = out.get("freight") or {}
         return f"✈️ Фрахт · {fr.get('provider') or out.get('farm') or '?'} · MAWB {out.get('awb') or '?'}" + (
             f" · ${fr['total_usd']:g}" if fr.get("total_usd") else "")
-    stems = sum(l.get("stems") or 0 for l in out.get("lines", []))
+    stems, boxes = _d_totals(out)
     return (f"📄 {out.get('farm') or '?'} · MAWB {out.get('awb') or '?'}\n"
-            f"Строк: {len(out.get('lines', []))}, стеблей: {stems:g}, итог: ${out.get('invoice_total_usd') or '?'}"
+            f"Строк: {len(out.get('lines', []))}, стеблей: {stems:g}, коробок: {boxes:g}, итог: ${out.get('invoice_total_usd') or '?'}"
             + (f"\n🔗 {out['mawb_note']}" if out.get("mawb_note") else ""))
 
 
@@ -1774,6 +2149,13 @@ async def send_packing_lists():
         _kbr.reconcile()                                  # names / MAWB / kg — the shipment completes by itself
     except Exception as e:
         print(f"[lumen] reconcile: {e}", flush=True)
+    while _kbr.MOVED:
+        txt = _kbr.MOVED.pop(0)
+        for uid in _money_people():
+            try:
+                await bot.send_message(uid, txt)
+            except Exception:
+                pass
     items = packing.pending()
     if not items:
         return
@@ -2016,6 +2398,81 @@ async def discrepancy_typed(m: Message):
 _STARTED = time.time()
 
 
+def _stale_transit() -> list:
+    """MAWBs still «в пути» with no arrival time from Floratrack and older than a normal trip -> ask."""
+    from datetime import datetime as _d, timedelta as _td
+    from .api import _settings, _dt
+    from .calc import norm_awb
+    from .models import Invoice
+    from . import kbreak
+    snooze = _settings().get("arr_snooze") or {}
+    lists = kbreak._state()
+    groups = {}
+    with session() as s:
+        for i in s.exec(select(Invoice)).all():
+            if i.arrived_at or i.eta or not (i.awb or "").strip():
+                continue
+            groups.setdefault(norm_awb(i.awb), []).append(i)
+    out = []
+    for k, invs in groups.items():
+        if snooze.get(k, "") > _d.now().strftime("%Y-%m-%d"):
+            continue
+        st = lists.get(k) or {}
+        start = _dt(st.get("ts") or "") or max((_dt(i.invoice_date or "") for i in invs if _dt(i.invoice_date or "")),
+                                                default=None)
+        if not start:
+            continue
+        country = st.get("country") or invs[0].country or ""
+        days = (_d.now() - start).days
+        if days >= (7 if country == "Кения" else 10):
+            out.append({"key": k, "awb": invs[0].awb, "days": days, "country": country,
+                        "farms": sorted({i.farm for i in invs})})
+    return out
+
+
+async def arrival_check(uid_only: int | None = None):
+    rows = _stale_transit()
+    if not rows and uid_only:
+        await bot.send_message(uid_only, "Все поставки «в пути» в норме — зависших без отметки о прибытии нет.")
+    for r in rows:
+        txt = (f"🛬 MAWB {r['awb']} ({r['country'] or '?'}: {', '.join(r['farms'])}) — в пути уже {r['days']} дн., "
+               "а сообщения Floratrack о прибытии не было. Прибыл?")
+        kb = _kb([[("✅ Да, прибыл", f"arq:{r['key']}:yes"), ("🚚 Ещё в пути", f"arq:{r['key']}:no")]])
+        for uid in ([uid_only] if uid_only else _money_people()):
+            try:
+                await bot.send_message(uid, txt, reply_markup=kb)
+            except Exception:
+                pass
+
+
+@dp.callback_query(F.data.startswith("arq:"), wr)
+async def arrival_answer(c: CallbackQuery):
+    from datetime import datetime as _d, timedelta as _td
+    from .api import _settings, SETTINGS
+    from .calc import norm_awb
+    from .models import Invoice
+    _, k, ans = c.data.split(":")
+    await c.answer()
+    if ans == "yes":
+        farms = []
+        with session() as s:
+            for i in s.exec(select(Invoice)).all():
+                if norm_awb(i.awb) == k and not i.arrived_at:
+                    i.arrived_at = _d.now().strftime("%d.%m.%Y %H:%M") + " (вручную)"
+                    s.add(i); farms.append(i.farm)
+            s.commit()
+        from .backup import mark_dirty
+        mark_dirty()
+        await c.message.edit_text(c.message.text.split(" — в пути")[0] + f" — ✅ отмечено прибывшим ({', '.join(farms)}). "
+                                  "Оплаченные уйдут из «В пути» через 2 дня, неоплаченные останутся до оплаты.")
+    else:
+        st = _settings()
+        sn = st.get("arr_snooze") or {}
+        sn[k] = (_d.now() + _td(days=3)).strftime("%Y-%m-%d")
+        SETTINGS.write_text(json.dumps({**st, "arr_snooze": sn}))
+        await c.message.edit_text(c.message.text.split(" Прибыл?")[0] + " — ок, спрошу через 3 дня.")
+
+
 async def scheduler_loop():
     from .api import _settings, SETTINGS, arrive_due
     while True:
@@ -2051,6 +2508,7 @@ async def scheduler_loop():
                 SETTINGS.write_text(json.dumps({**st, "last_missing": now.strftime("%Y-%m-%d")}))
                 st = _settings()
                 await missing_reminder()
+                await arrival_check()
             if now.weekday() == 1 and now.hour == 10 and now.minute < 15 and st.get("last_bf") != now.strftime("%Y-%m-%d"):
                 SETTINGS.write_text(json.dumps({**st, "last_bf": now.strftime("%Y-%m-%d")}))
                 st = _settings()
@@ -2250,6 +2708,11 @@ async def ft_chat_yes(c: CallbackQuery):
 async def ft_chat_no(c: CallbackQuery):
     await c.message.edit_text("Ок, этот чат игнорирую.")
     await c.answer()
+
+
+@dp.message(pv, wr, Command("arrivals"))
+async def arrivals_cmd(m: Message):
+    await arrival_check(m.from_user.id)
 
 
 # catch-all goes LAST so /pay and other commands above get a chance first

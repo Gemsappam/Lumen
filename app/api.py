@@ -476,8 +476,30 @@ def correct_invoice(inv_id: int, d: dict) -> dict:
     return out
 
 
+def fix_swapped_date(d: str, ref=None) -> str:
+    """«10.06.2026» on an invoice sent in October = US order (MM.DD) -> «06.10.2026». Only when the swapped
+    date is plausible (−40…+5 days around ref) and the printed one is not."""
+    from datetime import datetime, timedelta
+    m = re.fullmatch(r"\s*(\d{1,2})\.(\d{1,2})\.(\d{4})\s*", d or "")
+    if not m:
+        return d
+    a, b, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    ref = ref or datetime.now()
+    ok = lambda x: x is not None and timedelta(days=-5) <= ref - x <= timedelta(days=40)
+    def mk(dd, mm):
+        try:
+            return datetime(y, mm, dd)
+        except ValueError:
+            return None
+    if not ok(mk(a, b)) and ok(mk(b, a)):
+        return f"{b:02d}.{a:02d}.{y}"
+    return d
+
+
 def merge_lines(out: dict) -> dict:
     """Same variety, same length, same price -> one line («Julietta Honey 60cm — 115 ст»), boxes added up."""
+    if out.get("invoice_date"):
+        out["invoice_date"] = fix_swapped_date(out["invoice_date"])
     lines = out.get("lines") or []
     for l in lines:                              # «Hydrangea Green Premium» -> «Hydrangea Green»
         l["name"] = re.sub(r"\s+\b(premium|standard|std)\b", "", l.get("name") or "", flags=re.I).strip()
@@ -494,6 +516,10 @@ def merge_lines(out: dict) -> dict:
     nb = sum(int(b.get("qty") or 1) for b in out["boxes_detail"] or [])
     if bt and nb and nb != int(bt):
         out.setdefault("warnings", []).append(f"Коробок по строкам {nb}, а в итоге инвойса {int(bt)} — проверь разбивку по коробкам")
+    st_sum, st_tot = sum(float(l.get("stems") or 0) for l in lines), out.get("stems_total")
+    if st_tot and abs(st_sum - float(st_tot)) >= 1:
+        out.setdefault("warnings", []).append(f"Стеблей по строкам {st_sum:g}, а в итоге инвойса {float(st_tot):g} — "
+                                              "похоже, пропущена строка")
     mixes = [l.get("name") for l in lines if re.search(r"\b(mix|assorted|select|surtido)\b", l.get("name") or "", re.I)]
     if mixes:
         out.setdefault("warnings", []).append(
@@ -750,7 +776,8 @@ def import_floratrack(data: bytes) -> dict:
     from .backup import mark_dirty
     mark_dirty()
     return {"added": added, "updated": updated, "matched": matched, "unmatched": unmatched,
-            "ambiguous": ambiguous, "warnings": rep.warnings, "balance_usd": rep.balance_usd}
+            "ambiguous": ambiguous, "warnings": rep.warnings, "balance_usd": rep.balance_usd,
+            "offsets": rep.offsets}
 
 
 def infer_mawb(farm: str, topup_id: int | None = None):
@@ -832,7 +859,7 @@ def _store_weights(s, awb, farm_kg, source_file=None, replace=False):
     s.add(row)
     from .ai import find_mawb
     for inv in s.exec(select(Invoice).order_by(Invoice.id.desc())).all():
-        if not inv.awb and _kg_for(s, inv.farm, farm_kg):
+        if not inv.awb and not inv.arrived_at and _kg_for(s, inv.farm, farm_kg):
             taken = any(norm_awb(i.awb) == key and _norm_name(i.farm) == _norm_name(inv.farm)
                         for i in s.exec(select(Invoice)).all())
             if not taken:
@@ -1879,7 +1906,9 @@ def stays_in_transit(i) -> bool:
     paid = bool(i.topup_id or getattr(i, "via_broker", False))
     if not paid:
         return True
-    arr = _dt(re.sub(r"\s*\(.*\)$", "", i.arrived_at or "")) or datetime.now()
+    arr = _dt(re.sub(r"\s*\(.*\)$", "", i.arrived_at or ""))
+    if arr is None:                    # «до учёта в пути» etc. — arrived long ago, date unknown
+        return False
     pay = _dt(i.paid_date or "") or arr
     return datetime.now() - max(arr, pay) < timedelta(days=2)
 
@@ -1923,9 +1952,17 @@ def transit_view(s=None) -> dict:
                     kenya_awbs = {norm_awb(x.awb) for x in invs if x.awb and (x.country == "Кения")}
                     rpk, from_awb = _last_kenya_rpk(res, leg, norm_awb(i.awb), kenya_awbs)
                     if i.weight_kg and rpk:
-                        per = rpk * i.weight_kg / st
+                        # same split as the final calc: boxes with a known weight (Zeeflora spray = 25 kg box)
+                        # take their kg, the rest of the farm's kg is shared by the other lines per stem
+                        fixed = sum(l.weight_kg or 0 for l in ls)
+                        rest_st = sum(l.stems for l in ls if not l.weight_kg) or 1
+                        rest_kg = max(i.weight_kg - fixed, 0) if fixed < i.weight_kg else None
                         for l in ls:
-                            est[l.id][0 if leg == "air" else 1] = per
+                            if rest_kg is None:
+                                kg_l = i.weight_kg * l.stems / st
+                            else:
+                                kg_l = l.weight_kg if l.weight_kg else rest_kg * l.stems / rest_st
+                            est[l.id][0 if leg == "air" else 1] = rpk * kg_l / (l.stems or 1)
                         src[leg] = f"≈ {rpk:.0f} ₽/кг (последний счёт, MAWB {from_awb}) × {i.weight_kg:g} кг фермы"
                         notes.append(f"{label}: {src[leg]}")
                         approx_legs = True
@@ -1970,12 +2007,24 @@ def transit_view(s=None) -> dict:
                              "total_rub": round(c.price_rub + lg, 2)})
                 flower_rub += c.price_rub * l.stems
                 logi_rub += lg * l.stems
-            approx = (not i.topup_id) or legs_est or approx_legs
+            paid_now = bool(i.topup_id or getattr(i, "via_broker", False))
+            approx = (not paid_now) or legs_est or approx_legs
+            why = []
+            if not paid_now:
+                why.append("цветы не оплачены")
+            if (k, "msk") in res.estimated_legs:
+                why.append("курс ТК МСК предварительный")
+            if (k, "air") in res.estimated_legs:
+                why.append("ТК Кения ≈ по последнему курсу")
+            if approx_legs:
+                why.append("счёта ТК ещё нет — оценка")
+            approx_why = ", ".join(why)
             out.append({**i.model_dump(), "lines": rows, "stems": st, "country": country,
                         "paid_state": "paid" if (i.topup_id or getattr(i, "via_broker", False)) else "unpaid",
                         "topup": tdate.get(i.topup_id) or ("брокер" if getattr(i, "via_broker", False) else None),
                         "rub_goods": round(res.invoice_rub.get(i.id) or flower_rub), "rub_logi": round(logi_rub),
-                        "avg_rub": round((flower_rub + logi_rub) / st, 2), "approx": approx,
+                        "avg_rub": round((flower_rub + logi_rub) / st, 2), "approx": approx, "approx_why": approx_why,
+                        "approx_big": (not paid_now) or approx_legs,
                         "logi_source": ("; ".join(notes) or "нет данных").replace("Expolanka", "ТК Кения").replace("Floratrack", "ТК МСК"),
                         "legs": {"air": {"name": "ТК Кения", "rub": round(air_rub), "per": round(air_rub / st, 4), "src": src["air"]},
                                  "msk": {"name": "ТК МСК", "rub": round(msk_rub), "per": round(msk_rub / st, 4), "src": src["msk"]}},
@@ -2268,7 +2317,19 @@ def fill_mawb(out: dict, topup_id: int | None = None):
     if hb:
         from . import kbreak
         for k, st in kbreak._state().items():
-            if any((f.get("hawb") or "").upper() == hb for f in st.get("farms", [])):
+            row = next((f for f in st.get("farms", []) if (f.get("hawb") or "").upper() == hb), None)
+            if row:
+                if out.get("farm") and _norm_name(row["farm"]) != _norm_name(out["farm"]):
+                    try:                   # list said «C.I. CONDOR ANDINO», invoice is our Кондор -> remember
+                        with session() as s:
+                            ff = resolve_farm(s, out["farm"])
+                            if ff and row["farm"].upper() not in (ff.aliases or "").upper():
+                                ff.aliases = ",".join(x for x in [ff.aliases, row["farm"].upper()] if x)
+                                s.add(ff); s.commit()
+                        row["farm"] = out["farm"]
+                        kbreak._save_state(kbreak._state() | {k: st})
+                    except Exception as e:
+                        print(f"[lumen] hawb alias: {e}", flush=True)
                 if norm_awb(out.get("awb") or "") != k:
                     out["mawb_note"] = f"MAWB по HAWB {hb} из консолидационного листа (в инвойсе фермы был {out.get('awb') or '—'})"
                 out["awb"] = st.get("awb") or k

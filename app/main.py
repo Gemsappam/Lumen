@@ -210,8 +210,34 @@ def _merge_broker_dupes():
         s.commit()
 
 
+def _fix_swapped_dates():
+    """Invoice dates read in US order (10.06.2026 for 06.10.2026): fix by the other invoices of the same MAWB."""
+    from .api import fix_swapped_date, _dt
+    from .calc import norm_awb
+    from .models import Invoice
+    with session() as s:
+        invs = s.exec(select(Invoice)).all()
+        by = {}
+        for i in invs:
+            if (i.awb or "").strip():
+                by.setdefault(norm_awb(i.awb), []).append(i)
+        n = 0
+        for grp in by.values():
+            for i in grp:
+                sib = [_dt(x.invoice_date or "") for x in grp if x.id != i.id and _dt(x.invoice_date or "")]
+                if not sib:
+                    continue
+                new = fix_swapped_date(i.invoice_date or "", ref=max(sib))
+                if new != i.invoice_date:
+                    i.invoice_date = new; s.add(i); n += 1
+        if n:
+            s.commit()
+            print(f"[lumen] fixed {n} swapped invoice dates", flush=True)
+
+
 def seed():
     _seed_farms()
+    _fix_swapped_dates()
     _fix_double_broker()
     _merge_broker_dupes()
     _seed_packing_sigs()
@@ -343,7 +369,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-11c · поставка уходит сама, разбивку кидать один раз"
+VERSION = "2026-10-11h · отчёт Floratrack показывает взаиморасчёты, съевшие оплаты"
 
 
 async def _once_recalc_true_rate():

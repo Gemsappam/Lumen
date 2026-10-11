@@ -49,6 +49,7 @@ class Report:
     charges: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
     balance_usd: float = 0.0
+    offsets: list = field(default_factory=list)   # [(date, usd, note)] — your payment written off to someone else
 
 
 def _num(v) -> float:
@@ -191,6 +192,8 @@ def parse(data: bytes, today: tuple | None = None) -> Report:
     rates = _fifo(rows, rep.warnings)
     charges = [x for x in rows if x["type"] == "charge"]
     rep.balance_usd = sum(x["usd"] for x in rows if x["type"] == "payment") - sum(x["usd"] for x in charges)
+    rep.offsets = [(c["date"], c["usd"], c["note"].strip()) for c in charges
+                   if not c["truck"] and (datetime.now() - c["date"]).days <= 45]
     used_rows = set()
     for name in wb.sheetnames:
         if not SHEET_RE.match(name):

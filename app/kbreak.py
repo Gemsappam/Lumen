@@ -355,11 +355,46 @@ def reconcile() -> int:
         _save_state(st)
     for k, v in st.items():
         fixed += len(assign_awb_by_farms(v.get("awb") or k, [f["farm"] for f in v.get("farms", [])]))
+    fixed += _auto_move()
     with session() as s:
         for w in s.exec(select(AwbWeights)).all():
             _apply_farm_kg(s, w.awb, json.loads(w.farm_kg_json or "{}"))
         s.commit()
     return fixed
+
+
+MOVED: list = []      # texts for the bot: «invoice moved to the MAWB of its consolidation list»
+
+
+def _auto_move() -> int:
+    """Farm printed a wrong MAWB on its invoice (no HAWB to tell): the invoice sits on a MAWB that no list, no
+    weight report and no freight bill knows, while the farm is missing in exactly one recent list -> move it."""
+    from sqlmodel import select
+    from .calc import norm_awb
+    from .models import AwbWeights, Invoice, Logistics, session
+    miss = [x for x in missing_invoices() if x["awb_key"] != "broker"]
+    n = 0
+    for x in miss:
+        if sum(1 for y in miss if y["farm"] == x["farm"]) != 1:
+            continue
+        e = elsewhere(x["farm"], x["awb_key"])
+        if not e:
+            continue
+        bad = norm_awb(e["awb"])
+        with session() as s:
+            if s.get(AwbWeights, bad) or any(norm_awb(l.awb) == bad for l in s.exec(select(Logistics)).all()):
+                continue
+            others = [i for i in s.exec(select(Invoice)).all() if norm_awb(i.awb) == bad and i.id != e["id"]]
+            if others:                       # other farms on that MAWB too -> it is a real shipment, ask instead
+                continue
+            inv = s.get(Invoice, e["id"])
+            inv.awb = x["awb"]
+            inv.note = ((inv.note or "") + f" · MAWB по консолидационному листу (в инвойсе был {e['awb']})").strip(" ·")
+            s.add(inv); s.commit()
+        MOVED.append(f"🔗 {x['farm']}: в инвойсе был MAWB {e['awb']}, но ферма стоит в консолидационном листе "
+                     f"{x['awb']} — перенёс инвойс туда.")
+        n += 1
+    return n
 
 
 def elsewhere(farm: str, awb_key: str):
