@@ -175,9 +175,45 @@ def _seed_packing_sigs():
     SETTINGS.write_text(json.dumps({**_settings(), "packing_sigs_seeded": True}))
 
 
+def _merge_broker_dupes():
+    """A broker farm's invoice uploaded BEFORE the farm was marked «via broker» (booked as a normal unpaid invoice)
+    + its purchase from the BiFlorica statement = one purchase: money from the statement, packing/MAWB/kg from the invoice."""
+    import re as _re
+    from .models import Invoice, Line
+    with session() as s:
+        invs = s.exec(select(Invoice)).all()
+        for b in [i for i in invs if getattr(i, "via_broker", False) and i.ext_id]:
+            tail = _re.sub(r"\D", "", (b.invoice_no or "").split("#")[-1])
+            d = next((i for i in invs if i.id != b.id and i.farm == b.farm and not i.ext_id and not i.topup_id
+                      and not getattr(i, "via_broker", False) and tail
+                      and _re.sub(r"\D", "", i.invoice_no or "").endswith(tail)), None)
+            if not d:
+                continue
+            ls = s.exec(select(Line).where(Line.invoice_id == d.id)).all()
+            b.packing_lines_json = b.packing_lines_json or json.dumps(
+                [{"name": l.name, "stems": l.stems, "boxes": l.boxes} for l in ls], ensure_ascii=False)
+            for k in ("awb", "hawb", "weight_kg", "boxes_json", "truck", "eta", "arrived_at", "client_code"):
+                if getattr(d, k, None) and not getattr(b, k, None):
+                    setattr(b, k, getattr(d, k))
+            s.add(b)
+            for l in ls:
+                s.delete(l)
+            s.delete(d)
+        s.commit()
+        from .api import infer_mawb                 # statement purchases still without MAWB: from consolidation lists
+        for b in s.exec(select(Invoice)).all():
+            if getattr(b, "via_broker", False) and not (b.awb or "").strip() and not b.arrived_at:
+                a, kg, _n = infer_mawb(b.farm)
+                if a:
+                    b.awb, b.weight_kg = a, b.weight_kg or kg
+                    s.add(b)
+        s.commit()
+
+
 def seed():
     _seed_farms()
     _fix_double_broker()
+    _merge_broker_dupes()
     _seed_packing_sigs()
     upsert_forwarders()          # forwarders + aliases for existing farms (idempotent)
     _seed_box_dims()
@@ -307,7 +343,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-11 · Geoflora через посредника + вопрос «напрямую / посредник»"
+VERSION = "2026-10-11c · поставка уходит сама, разбивку кидать один раз"
 
 
 async def _once_recalc_true_rate():

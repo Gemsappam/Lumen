@@ -233,6 +233,7 @@ async def _broker_statement(m: Message, data: bytes):
     if r.get("fee_fix"):
         lines.append("ℹ️ Комиссия посредника по выписке: " + "; ".join(r["fee_fix"]))
     lines.append("\n" + farm_balance_text("Tessa"))
+    await send_packing_lists()
     await m.answer("\n".join(lines)[:4000], reply_markup=_kb(rows) if rows else None)
 
 
@@ -289,11 +290,11 @@ async def _consolidation(m: Message, awb_raw: str, country: str, rows: list, eta
             r["farm"] = f.name if f else _farm_label(r["farm_raw"])
     farms = [{"farm": r["farm"], "packs": int(r.get("packs") or 0), "kg": float(r.get("kg") or 0),
               "hawb": (r.get("hawb") or "").strip().upper() or None} for r in rows]
+    from .api import assign_awb_by_farms
+    assign_awb_by_farms(awb, [f["farm"] for f in farms])
     w = None
     if any(f["kg"] for f in farms):
         w = store_breakdown(awb, [{"farm": f["farm"], "kg": f["kg"]} for f in farms if f["kg"]])
-    from .api import assign_awb_by_farms
-    assign_awb_by_farms(awb, [f["farm"] for f in farms])
     was_sent = kbreak.is_sent(norm_awb(awb))
     kbreak.store_rows(norm_awb(awb), awb, country, farms, eta)
     lines = "\n".join(f"• {f['farm']}: {f['packs']} кор." + (f" · {f['kg']:g} кг" if f["kg"] else "") for f in farms)
@@ -1768,6 +1769,11 @@ async def send_packing_lists():
     tg, sender = packing.targets(), reader.RBOT          # the neutral bot posts; the finance bot never shows
     if not tg or not sender:
         return
+    from . import kbreak as _kbr
+    try:
+        _kbr.reconcile()                                  # names / MAWB / kg — the shipment completes by itself
+    except Exception as e:
+        print(f"[lumen] reconcile: {e}", flush=True)
     items = packing.pending()
     if not items:
         return
@@ -1777,7 +1783,14 @@ async def send_packing_lists():
     waiting = {x["awb_key"] for x in kbreak.missing_invoices()}
     items = [it for it in items if it[3] not in waiting]       # incomplete shipment: send NOTHING
     if items:
+        fresh = sorted({it[2] for it in items if it[3] and not kbreak.is_sent(it[3])})
         await _send_items(items, sender, tg)
+        for awb in fresh:
+            for uid in _money_people():
+                try:
+                    await bot.send_message(uid, f"✅ Все инвойсы по MAWB {awb} на месте — поставка ушла в чат пакингов.")
+                except Exception:
+                    pass
 
 
 async def missing_reminder(uid_list=None):
@@ -1796,6 +1809,10 @@ async def missing_reminder(uid_list=None):
         for x in xs:
             lines.append((f"• {x['farm']} — {x['packs']} кор." if x.get("packs") else f"• {x['farm']}")
                          + (f" ({x['note']})" if x.get("note") else ""))
+            el = kbreak.elsewhere(x["farm"], k) if k != "broker" else None
+            if el:
+                lines.append(f"   ↳ инвойс {x['farm']} есть, но на MAWB {el['awb']} (ферма написала свой)")
+                rows.append([(f"↪️ {x['farm']}: перенести на {awb}", f"mv:{el['id']}:{k}")])
             rows.append([(f"🚫 {x['farm']} ({awb[-4:]}) — инвойса не будет", f"miss:{k}:{x['farm'][:40]}")])
     lines.append("\nКинь инвойсы сюда — сами привяжутся к MAWB. Пока их нет, пакинг этих ферм не уйдёт, а я буду спрашивать каждый день 🙂")
     for uid in uid_list or _money_people():
@@ -1804,6 +1821,24 @@ async def missing_reminder(uid_list=None):
         except Exception:
             pass
     return True
+
+
+@dp.callback_query(F.data.startswith("mv:"), wr)
+async def move_to_awb(c: CallbackQuery):
+    from . import kbreak
+    from .models import Invoice
+    _, iid, k = c.data.split(":")
+    awb = (kbreak._state().get(k) or {}).get("awb") or k
+    with session() as s:
+        i = s.get(Invoice, int(iid))
+        old, i.awb, i.packing_sent = i.awb, awb, False
+        s.add(i); s.commit()
+        farm = i.farm
+    from .backup import mark_dirty
+    mark_dirty()
+    await c.answer("Перенёс")
+    await c.message.answer(f"↪️ {farm}: MAWB {old} → {awb}. Как только все инвойсы поставки будут на месте — она уйдёт сама.")
+    await send_packing_lists()
 
 
 @dp.callback_query(F.data.startswith("miss:"), wr)

@@ -330,6 +330,10 @@ def attach_broker_packing(d: dict) -> str:
             inv.hawb = d["hawb"]
         if d.get("awb") and not inv.awb:
             inv.awb = d["awb"]
+        if inv.awb and not inv.weight_kg:
+            w = s.get(AwbWeights, norm_awb(inv.awb))
+            if w:
+                inv.weight_kg = _kg_for(s, inv.farm, json.loads(w.farm_kg_json or "{}")) or None
         inv.packing_sent = False
         s.add(inv); s.commit()
         st = sum(x["stems"] or 0 for x in pl)
@@ -2199,6 +2203,11 @@ def assign_awb_by_farms(awb: str, farms: list[str]) -> list[str]:
     with session() as s:
         allinv = s.exec(select(Invoice)).all()
         on_awb = {i.farm for i in allinv if norm_awb(i.awb) == norm_awb(awb)}      # already has one -> skip
+        canon = set()
+        for f in farms:
+            ff = resolve_farm(s, f)
+            canon.add(ff.name if ff else f)
+        farms = canon
         for i in sorted(allinv, key=lambda x: -x.id):
             if (not (i.awb or "").strip() and not i.arrived_at and i.farm in farms
                     and i.farm not in done and i.farm not in on_awb):

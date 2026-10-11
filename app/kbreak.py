@@ -332,6 +332,50 @@ def missing_invoices(max_days: int = 21) -> list[dict]:
     return out
 
 
+def reconcile() -> int:
+    """Run all the time: list farm names -> our names, MAWB to invoices of list farms that have none, kg from the
+    breakdown. So a shipment completes by itself as invoices come in — no need to re-send the list."""
+    from datetime import datetime, timedelta
+    from sqlmodel import select
+    from .models import AwbWeights, session
+    from .api import resolve_farm, assign_awb_by_farms, _apply_farm_kg
+    st, changed, fixed = _state(), False, 0
+    with session() as s:
+        for k, v in st.items():
+            try:
+                if datetime.now() - datetime.strptime(v.get("ts") or "", "%Y-%m-%d") > timedelta(days=21):
+                    continue
+            except ValueError:
+                pass
+            for f in v.get("farms", []):
+                ff = resolve_farm(s, f["farm"])
+                if ff and ff.name != f["farm"]:
+                    f["farm"], changed = ff.name, True
+    if changed:
+        _save_state(st)
+    for k, v in st.items():
+        fixed += len(assign_awb_by_farms(v.get("awb") or k, [f["farm"] for f in v.get("farms", [])]))
+    with session() as s:
+        for w in s.exec(select(AwbWeights)).all():
+            _apply_farm_kg(s, w.awb, json.loads(w.farm_kg_json or "{}"))
+        s.commit()
+    return fixed
+
+
+def elsewhere(farm: str, awb_key: str):
+    """The farm's in-transit invoice that sits on a MAWB without its own consolidation list (farm printed another one)."""
+    from sqlmodel import select
+    from .calc import norm_awb
+    from .models import Invoice, session
+    lists = set(_state())
+    with session() as s:
+        for i in sorted(s.exec(select(Invoice)).all(), key=lambda x: -x.id):
+            if i.farm == farm and not i.arrived_at and (i.awb or "").strip() and norm_awb(i.awb) != awb_key \
+                    and norm_awb(i.awb) not in lists:
+                return {"id": i.id, "awb": i.awb}
+    return None
+
+
 def skip_farm(awb_key: str, farm: str):
     st = _state()
     if awb_key in st:

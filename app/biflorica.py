@@ -11,6 +11,7 @@ Rows:  Payment  -> money put on the exchange: $ credited (291) = $ sent (300) �
 - «Начальный остаток» of the very first statement = the broker balance before the bot.
 """
 import io
+import json
 import re
 from datetime import datetime
 
@@ -136,6 +137,15 @@ def import_statement(data: bytes) -> dict:
                       and (not od or not _d(i.invoice_date) or abs((_d(i.invoice_date) - od).days) <= 7)]
                 ph.sort(key=lambda i: abs(((_d(i.invoice_date) or od) - od).days) if od else 0)
                 same = ph[0] if ph else None
+                if not same:                    # uploaded before the farm was known as «via broker»: same invoice number
+                    tail = re.sub(r"\D", "", (o["doc"] or "").split("#")[-1])
+                    same = next((i for i in invs if tail and i.farm == o["farm"] and not i.ext_id and not i.topup_id
+                                 and re.sub(r"\D", "", i.invoice_no or "").endswith(tail)), None)
+                    if same and not same.packing_lines_json:
+                        same.packing_lines_json = json.dumps(
+                            [{"name": l.name, "stems": l.stems, "boxes": l.boxes}
+                             for l in s.exec(select(Line).where(Line.invoice_id == same.id)).all()], ensure_ascii=False)
+                        same.via_broker, same.paid = True, True
                 if same:                       # farm invoice uploaded first: money now from the statement
                     same.ext_id, same.topup_id, same.usd_paid = o["ext"], 0, 0
                     same.invoice_total_usd, same.invoice_date = o["amount"], dd or same.invoice_date
@@ -153,6 +163,12 @@ def import_statement(data: bytes) -> dict:
                 s.add(inv); s.flush()
                 s.add(Line(invoice_id=inv.id, name=o["item"], boxes=o["hb"] or None, stems=o["stems"],
                            price_usd=o["price"] or (o["amount"] / o["stems"] if o["stems"] else 0)))
+                if not inv.awb:                 # consolidation list sent earlier knows this farm's MAWB (and kg)
+                    from .api import infer_mawb
+                    a, kg, _n = infer_mawb(o["farm"])
+                    if a:
+                        inv.awb, inv.weight_kg = a, kg
+                        s.add(inv)
                 new_buy.append(inv.id)
         s.commit()
     if _settings().get("broker_opening") is None:            # first statement: balance before the bot
