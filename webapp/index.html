@@ -490,7 +490,8 @@ async invoice({t, inv, draft}){
     collect();
     if(!inv.farm) return toast('Укажи плантацию');
     if(inv.topup_id && (!inv.usd_paid||!inv.rub_paid_override)) return toast('Впиши оплату: $ и ₽');
-    if(!inv.topup_id && !inv.est_usd) return toast('Впиши примерную сумму в $');
+    if(!inv.topup_id && !inv.est_usd && !inv.via_broker) return toast('Впиши примерную сумму в $');
+    if(inv.via_broker){ inv.paid=true; inv.topup_id=0 }
     const lines=inv.lines.filter(l=>l.name&&numOrNull(l.stems)).map(l=>({name:l.name.trim(),boxes:numOrNull(l.boxes),stems:numOrNull(l.stems),weight_kg:numOrNull(l.weight_kg),price_usd:numOrNull(l.price_usd)||0,mrc:numOrNull(l.mrc)}));
     const {id,_warnings,rub_paid,...body}=inv; body.lines=lines; body.usd_paid=inv.usd_paid;
     const snap=await api('/invoices'+(id?'?inv_id='+id:''),{method:'POST',body});
@@ -715,12 +716,21 @@ async transitInv({i,v}){
   <tbody>${i.lines.map(l=>`<tr><td style="padding:8px 4px">${esc(l.name)}</td><td class="calc">${fmt(l.stems)}</td><td class="calc">${l.price_usd}</td>
     <td class="calc">${fmt(l.price_rub,2)}</td>${legsOf(i).map(g=>`<td class="calc">${fmt(g.k==='air'?l.air_rub:l.msk_rub,2)}</td>`).join('')}
     <td class="calc"><b>${i.approx?'≈':''}${fmt(l.total_rub,2)}</b></td></tr>`).join('')}</tbody></table></div>
+  <h2>MAWB</h2>
+  <div class="group" id="awbBox" style="padding:12px"><div class="field" style="margin:0"><label>Номер MAWB (можно с пробелами/без дефиса)</label>
+    <input id="awbIn" inputmode="numeric" value="${esc(i.awb||'')}" placeholder="369-99583094"></div>
+    <div class="actions" style="margin-top:10px"><button class="primary" id="awbSave">Сохранить MAWB</button></div></div>
   <div class="actions">${i.paid_state==='unpaid'?'<button class="primary" id="pay">Оплачен</button>':''}<button id="arr">Прибыл</button></div>
   <div class="actions"><button id="edit">Редактировать инвойс</button></div>`;
   document.getElementById('pay')?.addEventListener('click',()=>payForm({kind:'invoices',id:i.id,usd:i.est_usd}));
+  document.getElementById('awbSave').onclick=async()=>{
+    const b=document.getElementById('awbSave'); b.disabled=true;
+    try{ const r=await api(`/invoices/${i.id}/awb`,{method:'POST',body:{awb:document.getElementById('awbIn').value}});
+      toast(r.awb?'MAWB сохранён: '+r.awb:'MAWB убран'); tab('transit') }
+    catch(x){ toast(x.message); b.disabled=false } };
   document.getElementById('arr').onclick=async()=>{ if(!confirm('Отметить как прибывший?'))return; await api(`/invoices/${i.id}/arrived`,{method:'POST'}); toast('Прибыл'); tab('transit') };
   document.getElementById('edit').onclick=()=>go('invoice',{t:{id:i.topup_id||0,date:i.topup||'в пути'},inv:{...i}});
-  if(!ME.can_write) ['pay','arr','edit'].forEach(x=>{const b=document.getElementById(x); if(b) b.style.display='none'});
+  if(!ME.can_write) ['pay','arr','edit','awbBox'].forEach(x=>{const b=document.getElementById(x); if(b) b.style.display='none'});
 },
 
 // ======================= ТОВАРНЫЕ ОСТАТКИ (по инвойсам в пути) =======================

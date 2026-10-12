@@ -1129,7 +1129,7 @@ def save_invoice(body: InvoiceIn, inv_id: int | None = None, uid: int = Depends(
             s.add(Line(invoice_id=inv.id, **l.model_dump()))
         _fill_weight_from_logistics(s, inv)
         s.commit()
-        if not inv.topup_id:
+        if not inv.topup_id and not getattr(inv, "via_broker", False):
             inv.paid = False
             s.add(inv); s.commit()
         if body.boxes_detail and not inv.boxes_json:
@@ -1144,6 +1144,35 @@ def save_invoice(body: InvoiceIn, inv_id: int | None = None, uid: int = Depends(
             inv.discrepancy_json = json.dumps(dis, ensure_ascii=False)
             s.add(inv); s.commit()
         return snapshot(s, inv.topup_id)
+
+
+class AwbIn(BaseModel):
+    awb: str = ""
+
+
+@router.post("/invoices/{inv_id}/awb")
+def set_invoice_awb(inv_id: int, body: AwbIn, uid: int = Depends(writer)):
+    """Quick fix from «В пути»: put this invoice on a MAWB (or clear it). Nothing else changes."""
+    from .ai import find_mawb
+    raw = (body.awb or "").strip()
+    awb = find_mawb(raw) or (f"{re.sub(r'[^0-9]', '', raw)[:3]}-{re.sub(r'[^0-9]', '', raw)[3:]}"
+                             if len(re.sub(r"[^0-9]", "", raw)) == 11 else raw)
+    if raw and len(re.sub(r"[^0-9]", "", awb)) != 11:
+        raise HTTPException(400, "MAWB — 11 цифр, например 369-99583094")
+    with session() as s:
+        inv = s.get(Invoice, inv_id)
+        if not inv:
+            raise HTTPException(404, "Инвойс не найден")
+        inv.awb = awb
+        if awb:
+            old_kg, inv.weight_kg = inv.weight_kg, None
+            _fill_weight_from_logistics(s, inv)
+            inv.weight_kg = inv.weight_kg or old_kg
+        inv.note = ((inv.note or "") + " · MAWB указан вручную").strip(" ·") if "MAWB указан вручную" not in (inv.note or "") else inv.note
+        s.add(inv); s.commit()
+    from .backup import mark_dirty
+    mark_dirty()
+    return {"ok": True, "awb": awb}
 
 
 @router.delete("/invoices/{inv_id}")

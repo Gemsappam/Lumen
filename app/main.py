@@ -442,7 +442,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-12d · Tessa 90836926 / Plazoleta 177858 на своих MAWB; без перекидывания MAWB между закупками"
+VERSION = "2026-10-12e · «Сохранить MAWB» в карточке «В пути»; редактор брокерских закупок сохраняет"
 
 
 async def _once_recalc_true_rate():
