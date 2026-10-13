@@ -2330,8 +2330,9 @@ def assign_awb_by_farms(awb: str, farms: list[str]) -> list[str]:
                     and i.farm not in done and i.farm not in on_awb):
                 i.awb = awb; s.add(i); done.append(i.farm)
         s.commit()
-    from .backup import mark_dirty
-    mark_dirty()
+    if done:
+        from .backup import mark_dirty
+        mark_dirty()
     return done
 
 

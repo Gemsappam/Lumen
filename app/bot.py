@@ -1498,8 +1498,17 @@ async def manual_backup(m: Message):
     if not BACKUP_CHAT_ID:
         await m.answer("BACKUP_CHAT_ID не задан в .env")
         return
-    await backup_now(bot, "вручную")
+    await backup_now(bot, "вручную", force=True)
     await m.answer("💾 Бэкап отправлен в канал и закреплён")
+
+
+@dp.message(pv, sysf, Command("backup_cleanup"))
+async def backup_cleanup(m: Message):
+    """Delete the pile of old backups in the channel, keep the newest 10."""
+    from .backup import cleanup_channel
+    note = await m.answer("🧹 Удаляю старые бэкапы из канала (оставлю 10 последних)…")
+    n = await cleanup_channel(bot)
+    await note.edit_text(f"🧹 Готово: удалено ~{n} старых сообщений, оставлены 10 последних бэкапов (закреплённый — последний).")
 
 
 @dp.message(pv, ~ops)

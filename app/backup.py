@@ -22,7 +22,9 @@ from .config import DATA_DIR, MASTER_XLSX
 
 BACKUP_CHAT_ID = os.getenv("BACKUP_CHAT_ID", "").strip()
 DB_PATH = DATA_DIR / "lumen.db"
-DEBOUNCE_SEC = 10
+DEBOUNCE_SEC = 60
+MIN_GAP_SEC = 300          # at most one automatic backup per 5 minutes
+HASH_FILE = DATA_DIR / ".last_backup_hash"
 
 _dirty = asyncio.Event()
 
@@ -61,15 +63,39 @@ def _unzip(data: bytes):
             target.write_bytes(z.read(name))
 
 
-async def backup_now(bot, reason: str = "auto"):
+def _content_hash() -> str:
+    """What the backup would contain — the DB as SQL text (not its pages), settings, drafts, master file."""
+    import hashlib
+    h = hashlib.sha256()
+    if DB_PATH.exists():
+        con = sqlite3.connect(DB_PATH)
+        try:
+            for line in con.iterdump():
+                h.update(line.encode())
+        finally:
+            con.close()
+    for p in [MASTER_XLSX, DATA_DIR / "settings.json"] + sorted((DATA_DIR / "drafts").glob("*.json")):
+        if p.exists():
+            h.update(p.name.encode()); h.update(p.read_bytes())
+    return h.hexdigest()
+
+
+async def backup_now(bot, reason: str = "auto", force: bool = False):
+    """Posts a backup ONLY if something really changed since the last one (manual /backup: always)."""
     if not (bot and BACKUP_CHAT_ID):
-        return
+        return False
+    digest = _content_hash()
+    last = HASH_FILE.read_text().strip() if HASH_FILE.exists() else ""
+    if not force and digest == last:
+        return False
     data = _make_zip()
     name = f"lumen_{datetime.now():%Y-%m-%d_%H-%M}.zip"
     msg = await bot.send_document(BACKUP_CHAT_ID, BufferedInputFile(data, name),
                                   caption=f"💾 бэкап ({reason})", disable_notification=True)
     await bot.pin_chat_message(BACKUP_CHAT_ID, msg.message_id, disable_notification=True)
     print(f"[lumen] backup → channel ({len(data) // 1024} KB, {reason})", flush=True)
+    HASH_FILE.write_text(digest)
+    return True
 
 
 async def restore_if_empty(bot) -> str:
@@ -100,8 +126,31 @@ async def backup_loop(bot):
         await asyncio.sleep(DEBOUNCE_SEC)      # collect a burst of edits into one backup
         _dirty.clear()
         try:
-            await backup_now(bot)
+            if await backup_now(bot):
+                await asyncio.sleep(MIN_GAP_SEC)   # later edits wait and go out together in the next one
         except Exception as e:
             print(f"[lumen] backup failed: {e}", flush=True)
             _dirty.set()
             await asyncio.sleep(300)
+
+
+async def cleanup_channel(bot, keep: int = 10) -> int:
+    """Delete old backup posts from the channel, keep the newest `keep` (the pinned one is the newest)."""
+    if not (bot and BACKUP_CHAT_ID):
+        return 0
+    probe = await bot.send_message(BACKUP_CHAT_ID, "🧹 чищу старые бэкапы…", disable_notification=True)
+    top = probe.message_id
+    ids = list(range(1, max(1, top - keep)))
+    deleted = 0
+    for i in range(0, len(ids), 100):
+        try:
+            if await bot.delete_messages(BACKUP_CHAT_ID, ids[i:i + 100]):
+                deleted += len(ids[i:i + 100])
+        except Exception as e:
+            print(f"[lumen] cleanup batch: {e}", flush=True)
+        await asyncio.sleep(0.05)
+    try:
+        await bot.delete_message(BACKUP_CHAT_ID, top)
+    except Exception:
+        pass
+    return deleted

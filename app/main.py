@@ -442,7 +442,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-12e · «Сохранить MAWB» в карточке «В пути»; редактор брокерских закупок сохраняет"
+VERSION = "2026-10-13a · бэкап только при реальных изменениях, не чаще раза в 5 мин; /backup_cleanup"
 
 
 async def _once_recalc_true_rate():
