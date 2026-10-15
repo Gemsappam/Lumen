@@ -345,6 +345,14 @@ def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result
             continue
         inv_stems = [sum(l.stems for l in lines_by_inv[i.id]) for i in invs]
         attr, w = (None, None) if g["basis"] == "stems" else _pick_basis(invs, ["weight_kg"])
+        if attr is None and g["basis"] != "stems" and len(invs) > 1:
+            kgs = [float(i.weight_kg or 0) for i in invs]
+            if any(kgs) and (awb_kg.get(awb) or g["kg_bill"] or g["kg_total"]):
+                # breakdown is there, only some farm (e.g. not in the forwarder's list) has no kg:
+                # everyone with kg pays ₽/kg × kg as usual; the farm without kg gets nothing until its kg is known
+                attr, w = "weight_kg", kgs
+                res.warnings.append(f"MAWB {awb}: нет кг по разбивке у " + ", ".join(
+                    i.farm for i, k in zip(invs, kgs) if not k) + " — их доля логистики не посчитана, впиши кг")
         if attr is None:
             if g["basis"] != "stems" and len(invs) > 1:
                 # several farms, no kg breakdown yet: don't guess — leave freight unallocated until it's loaded

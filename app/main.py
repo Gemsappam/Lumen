@@ -442,7 +442,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-13a · бэкап только при реальных изменениях, не чаще раза в 5 мин; /backup_cleanup"
+VERSION = "2026-10-15a · логистика MAWB распределяется по кг, даже если у одной фермы нет кг"
 
 
 async def _once_recalc_true_rate():
