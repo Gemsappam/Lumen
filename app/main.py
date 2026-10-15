@@ -442,7 +442,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-15a · логистика MAWB распределяется по кг, даже если у одной фермы нет кг"
+VERSION = "2026-10-15b · Floratrack: остаток долга до $20 не делает курс предварительным"
 
 
 async def _once_recalc_true_rate():

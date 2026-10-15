@@ -178,6 +178,13 @@ def _fifo(rows, warnings):
             need -= take
             if p["usd"] <= 1e-6:
                 pays.popleft()
+        paid_usd = c["usd"] - need
+        if 1e-6 < need <= max(20.0, 0.01 * c["usd"]) and paid_usd > 0 and rub > 0:
+            # a few dollars of the balance still open (rounding, -$6): not worth «предварительный» —
+            # the rest is valued at the same payment rate
+            rub += need * rub / paid_usd
+            used.append(f"остаток ${need:.2f} по тому же курсу")
+            need = 0.0
         prov = need > 1e-6          # part (or all) of the truck not paid yet
         out[c["row"]] = (rub, need if prov else 0.0, ", ".join(used))
     return out
