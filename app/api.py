@@ -2211,6 +2211,117 @@ async def export_transit(uid: int = Depends(user_id)):
     return {"ok": True}
 
 
+# ---------- Товарные остатки: груз в пути / на складе ТК / не оплачено — только товар, без ТК ----------
+def _picked() -> dict:
+    return _settings().get("picked") or {}
+
+
+def mark_picked(awb: str, picked: bool = True) -> list[str]:
+    """«Забрал со склада ТК» for a whole MAWB -> its goods leave the stock. Returns farms."""
+    k = norm_awb(awb)
+    st = _settings()
+    pk = dict(st.get("picked") or {})
+    if picked:
+        pk[k] = datetime_now_str()
+    else:
+        pk.pop(k, None)
+    SETTINGS.write_text(json.dumps({**st, "picked": pk}, ensure_ascii=False))
+    from .backup import mark_dirty
+    mark_dirty()
+    with session() as s:
+        return sorted({i.farm for i in s.exec(select(Invoice)).all() if norm_awb(i.awb) == k})
+
+
+def datetime_now_str() -> str:
+    from datetime import datetime
+    return datetime.now().strftime("%d.%m.%Y %H:%M")
+
+
+def awaiting_pickup() -> list[dict]:
+    """MAWBs that ARRIVED (within 30 days) and nobody confirmed «забрал со склада ТК» yet."""
+    from datetime import datetime, timedelta
+    pk = _picked()
+    by = defaultdict(list)
+    with session() as s:
+        for i in s.exec(select(Invoice)).all():
+            if (i.awb or "").strip():
+                by[norm_awb(i.awb)].append(i)
+    out = []
+    for k, invs in by.items():
+        if k in pk or not all(i.arrived_at for i in invs):
+            continue
+        arr = [_dt(re.sub(r"\s*\(.*\)$", "", i.arrived_at or "")) for i in invs]
+        if not all(arr) or datetime.now() - max(arr) > timedelta(days=30):
+            continue
+        out.append({"key": k, "awb": invs[0].awb, "arrived": max(arr).strftime("%d.%m %H:%M"),
+                    "farms": sorted({i.farm for i in invs}), "since_h": (datetime.now() - max(arr)).total_seconds() / 3600})
+    return out
+
+
+def stock_view() -> dict:
+    """Goods only (₽ of the flowers, NO freight):
+       in_transit — not arrived yet; warehouse — arrived, «забрал» not confirmed; unpaid — invoices not paid (money we owe).
+       A MAWB marked «забрал» leaves in_transit/warehouse; unpaid invoices stay in «не оплачено» until paid."""
+    with session() as s:
+        tops, invs, lines, logs = _all(s)
+        res = compute(0, tops, invs, lines, logs, _awb_kg(s))
+        by_inv = defaultdict(list)
+        for l in lines:
+            by_inv[l.invoice_id].append(l)
+        wait = {x["key"] for x in awaiting_pickup()}
+        rows = {"in_transit": [], "warehouse": [], "unpaid": []}
+        for i in invs:
+            ls = by_inv[i.id]
+            if not ls:
+                continue
+            paid = bool(i.topup_id or getattr(i, "via_broker", False))
+            goods = sum(res.lines[l.id].price_rub * l.stems for l in ls if l.id in res.lines)
+            r = {"id": i.id, "farm": i.farm, "awb": i.awb or "", "stems": sum(l.stems for l in ls),
+                 "rub_goods": round(goods), "paid": paid, "approx": not paid,
+                 "usd": i.usd_paid if paid else (i.est_usd or i.invoice_total_usd or 0)}
+            k = norm_awb(i.awb) if (i.awb or "").strip() else None
+            if not i.arrived_at:
+                rows["in_transit"].append(r)
+            elif k and k in wait:
+                rows["warehouse"].append(r)
+            if not paid:
+                rows["unpaid"].append(r)
+        return {**rows, "est_rate": res.est_rate,
+                "est_topup": max(tops, key=lambda t: t.id).date if tops else None}
+
+
+@router.get("/stock")
+def get_stock(uid: int = Depends(user_id)):
+    return stock_view()
+
+
+@router.post("/stock/picked/{awb}")
+def post_picked(awb: str, back: bool = False, uid: int = Depends(writer)):
+    mark_picked(awb, not back)
+    return stock_view()
+
+
+def seed_picked():
+    """Once: everything that arrived more than 2 days ago counts as picked up (no flood of old MAWBs)."""
+    from datetime import datetime, timedelta
+    st = _settings()
+    if st.get("picked_seeded"):
+        return
+    pk = dict(st.get("picked") or {})
+    by = defaultdict(list)
+    with session() as s:
+        for i in s.exec(select(Invoice)).all():
+            if (i.awb or "").strip():
+                by[norm_awb(i.awb)].append(i)
+    for k, invs in by.items():
+        if not all(i.arrived_at for i in invs):
+            continue
+        arr = [_dt(re.sub(r"\s*\(.*\)$", "", i.arrived_at or "")) for i in invs]
+        if not all(arr) or datetime.now() - max(arr) > timedelta(days=2):
+            pk[k] = "до учёта"
+    SETTINGS.write_text(json.dumps({**_settings(), "picked": pk, "picked_seeded": True}, ensure_ascii=False))
+
+
 @router.get("/transit")
 def get_transit(uid: int = Depends(user_id)):
     return transit_view()

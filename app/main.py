@@ -309,6 +309,11 @@ def _fix_broker_swap():
 
 def seed():
     _seed_farms()
+    try:
+        from .api import seed_picked
+        seed_picked()
+    except Exception as e:
+        print(f"[lumen] seed_picked: {e}", flush=True)
     _fix_broker_swap()
     _fix_swapped_dates()
     _fix_double_broker()
@@ -442,7 +447,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-19c · оплаченный MAWB держится в «В пути» неделю от дня последней оплаты"
+VERSION = "2026-10-20a · остатки: только товар; в пути / на складе ТК (Забрал) / не оплачено"
 
 
 async def _once_recalc_true_rate():

@@ -735,20 +735,27 @@ async transitInv({i,v}){
 
 // ======================= ТОВАРНЫЕ ОСТАТКИ (по инвойсам в пути) =======================
 async stock(){
-  const v=await api('/transit');
-  const paid=v.invoices.filter(i=>i.paid_state==='paid'), unpaid=v.invoices.filter(i=>i.paid_state!=='paid');
-  const sum=(l,k)=>l.reduce((a,i)=>a+(i[k]||0),0);
-  const block=(title,list,approx)=>`<h2>${title}</h2>
-    <div class="group"><div class="row"><div class="grow"><div class="big num">${approx?'≈ ':''}${fmt(sum(list,'rub_goods')+sum(list,'rub_logi'))} ₽</div>
-      <div class="s num">товар ${fmt(sum(list,'rub_goods'))} ₽ · ТК Кения ${fmt(list.reduce((a,i)=>a+((i.legs||{}).air?.rub||0),0))} ₽ · ТК МСК ${fmt(list.reduce((a,i)=>a+((i.legs||{}).msk?.rub||0),0))} ₽ · ${list.length} инв.</div></div></div>
-    ${list.map(i=>`<div class="row" data-ti="${i.id}"><div class="grow"><div class="t">${esc(i.farm)}</div><div class="s">MAWB ${esc(i.awb||'?')} · ${fmt(i.stems)} ст</div></div>
-      <div class="v"><div class="num">${i.approx?'≈ ':''}${fmt(i.rub_goods+i.rub_logi)} ₽</div>
-        <div class="s num">товар ${fmt(i.rub_goods)}</div>${legsOf(i).map(l=>`<div class="s num">${l.name} ${fmt(l.rub)}</div>`).join('')}</div></div>`).join('')}</div>`;
+  const v=await api('/stock');
+  const sum=l=>l.reduce((a,i)=>a+(i.rub_goods||0),0);
+  const byAwb=l=>{const m={}; l.forEach(i=>(m[i.awb||'без MAWB']??=[]).push(i)); return Object.entries(m)};
+  const rows=(l,showPaid)=>l.map(i=>`<div class="row" data-ti="${i.id}"><div class="grow"><div class="t">${esc(i.farm)}</div>
+      <div class="s">MAWB ${esc(i.awb||'?')} · ${fmt(i.stems)} ст${showPaid?' · '+(i.paid?'оплачен':'<b>не оплачен</b>'):''}</div></div>
+      <div class="v"><div class="num">${i.approx?'≈ ':''}${fmt(i.rub_goods)} ₽</div></div></div>`).join('');
+  const head=(title,l,hint)=>`<h2>${title}</h2><div class="group"><div class="row"><div class="grow">
+      <div class="big num">${l.some(i=>i.approx)?'≈ ':''}${fmt(sum(l))} ₽</div><div class="s">${hint} · ${l.length} инв.</div></div></div>`;
+  const wh=byAwb(v.warehouse).map(([awb,l])=>`<div class="row"><div class="grow"><div class="t">MAWB ${esc(awb)}</div>
+      <div class="s">${esc([...new Set(l.map(i=>i.farm))].join(', '))} · ${fmt(sum(l))} ₽</div></div>
+      ${ME.can_write?`<div class="v"><button class="primary" data-pk="${esc(awb)}">Забрал</button></div>`:''}</div>${rows(l,true)}`).join('');
   $app.innerHTML=`<h1>Товарные остатки</h1>
-  <p class="sub">Рублёвые суммы груза в пути по инвойсам: товар + логистика. ${ME.can_write?`Неоплаченные — по курсу ${fmt(v.est_rate,2)} (пополнение ${esc(v.est_topup||'—')}).`:''}</p>
-  ${block('Оплаченные в пути',paid,paid.some(i=>i.approx))}
-  ${block('Неоплаченные в пути',unpaid,true)}`;
-  $app.querySelectorAll('[data-ti]').forEach(e=>e.onclick=()=>go('transitInv',{i:v.invoices.find(x=>x.id==e.dataset.ti),v}));
+  <p class="sub">Только товар (цветы), без ТК. ${ME.can_write?`Неоплаченные — ≈ по курсу ${fmt(v.est_rate,2)} (пополнение ${esc(v.est_topup||'—')}).`:''}</p>
+  ${head('🚚 Груз в пути',v.in_transit,'ещё не прибыл')}${rows(v.in_transit,true)}</div>
+  ${v.warehouse.length?`${head('🏬 Прибыл — на складе ТК',v.warehouse,'нажми «Забрал», когда заберёте — уйдёт из остатков')}${wh}</div>`:''}
+  ${head('💳 Не оплачено',v.unpaid,'деньги, которые ещё должны фермам — уходит после оплаты')}${rows(v.unpaid,false)}</div>`;
+  $app.querySelectorAll('[data-pk]').forEach(b=>b.onclick=async e=>{ e.stopPropagation();
+    if(!confirm('Груз MAWB '+b.dataset.pk+' забран со склада ТК?'))return;
+    await api('/stock/picked/'+encodeURIComponent(b.dataset.pk),{method:'POST'}); toast('Убрал из остатков'); render('stock') });
+  $app.querySelectorAll('[data-ti]').forEach(e=>e.onclick=async()=>{ const t=await api('/transit');
+    const i=t.invoices.find(x=>x.id==e.dataset.ti); if(i) go('transitInv',{i,v:t}); else toast('Подробности — в «Откупах»') });
 },
 
 // ======================= ЕЩЁ =======================

@@ -2457,6 +2457,44 @@ async def arrival_check(uid_only: int | None = None):
                 pass
 
 
+async def pickup_check(uid_only: int | None = None, min_hours: float = 20):
+    """Arrived MAWBs nobody confirmed «забрал со склада ТК» -> ask (from the stock screen as well)."""
+    from .api import awaiting_pickup
+    rows = [r for r in awaiting_pickup() if r["since_h"] >= min_hours]
+    if not rows and uid_only:
+        await bot.send_message(uid_only, "На складе ТК ничего не ждёт — всё прибывшее отмечено как забранное.")
+    for r in rows:
+        txt = (f"🏬 MAWB {r['awb']} ({', '.join(r['farms'])}) прибыл {r['arrived']}. Груз со склада ТК забрали?")
+        kb = _kb([[("✅ Забрал", f"pk:{r['key']}"), ("⏳ Ещё на складе", f"pkn:{r['key']}")]])
+        for uid in ([uid_only] if uid_only else _money_people()):
+            try:
+                await bot.send_message(uid, txt, reply_markup=kb)
+            except Exception:
+                pass
+
+
+@dp.callback_query(F.data.startswith("pk:"), wr)
+async def picked_answer(c: CallbackQuery):
+    from .api import mark_picked
+    k = c.data.split(":", 1)[1]
+    farms = mark_picked(k)
+    await c.answer("Отмечено")
+    try:
+        await c.message.edit_text((c.message.text or "") + f"\n\n✅ MAWB {k[:3]}-{k[3:]} забран со склада ТК "
+                                  f"({', '.join(farms)}) — убрал из товарных остатков.")
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.startswith("pkn:"), wr)
+async def picked_not_yet(c: CallbackQuery):
+    await c.answer("Ок, спрошу завтра")
+    try:
+        await c.message.edit_text((c.message.text or "") + "\n⏳ Ок, ещё на складе — спрошу завтра.")
+    except Exception:
+        pass
+
+
 @dp.callback_query(F.data.startswith("arq:"), wr)
 async def arrival_answer(c: CallbackQuery):
     from datetime import datetime as _d, timedelta as _td
@@ -2477,6 +2515,8 @@ async def arrival_answer(c: CallbackQuery):
         mark_dirty()
         await c.message.edit_text(c.message.text.split(" — в пути")[0] + f" — ✅ отмечено прибывшим ({', '.join(farms)}). "
                                   "MAWB уйдёт из «В пути» целиком через неделю после того, как оплачены все его инвойсы.")
+        await bot.send_message(c.from_user.id, f"Груз MAWB {k[:3]}-{k[3:]} со склада ТК уже забрали?",
+                               reply_markup=_kb([[("✅ Забрал", f"pk:{k}"), ("⏳ Ещё на складе", f"pkn:{k}")]]))
     else:
         st = _settings()
         sn = st.get("arr_snooze") or {}
@@ -2506,9 +2546,13 @@ async def scheduler_loop():
             if done:
                 txt = "📦 Прибыло на склад (по сообщению Floratrack +1 ч):\n" + "\n".join(
                     f"• {d['farm']} · MAWB {d['awb']} · {'оплачен' if d['paid'] else 'НЕ оплачен'}" for d in done)
+                from .calc import norm_awb
+                awbs = sorted({d["awb"] for d in done if d.get("awb")})
+                txt += "\n\nКогда заберёте со склада ТК — нажми, и груз уйдёт из товарных остатков."
+                kb = _kb([[(f"✅ Забрал {a}", f"pk:{norm_awb(a)}")] for a in awbs]) if awbs else None
                 for uid in _money_people():
                     try:
-                        await bot.send_message(uid, txt)
+                        await bot.send_message(uid, txt, reply_markup=kb)
                     except Exception:
                         pass
             slot = None
@@ -2521,6 +2565,7 @@ async def scheduler_loop():
                 st = _settings()
                 await missing_reminder()
                 await arrival_check()
+                await pickup_check()
             if now.weekday() == 1 and now.hour == 10 and now.minute < 15 and st.get("last_bf") != now.strftime("%Y-%m-%d"):
                 SETTINGS.write_text(json.dumps({**st, "last_bf": now.strftime("%Y-%m-%d")}))
                 st = _settings()
@@ -2725,6 +2770,12 @@ async def ft_chat_no(c: CallbackQuery):
 @dp.message(pv, wr, Command("arrivals"))
 async def arrivals_cmd(m: Message):
     await arrival_check(m.from_user.id)
+
+
+@dp.message(pv, wr, Command("pickup"))
+async def pickup_cmd(m: Message):
+    """Что прибыло и ждёт «забрал со склада ТК»."""
+    await pickup_check(m.from_user.id, min_hours=0)
 
 
 # catch-all goes LAST so /pay and other commands above get a chance first
