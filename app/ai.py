@@ -98,6 +98,9 @@ DOMAIN = """Ты — бухгалтер-логист оптовой компан
     документом. Вес из счёта (chargeable / оплачиваемый) пиши в total_weight_kg — от него считается ставка за кг.
   • Floratrack (Флоратрак) — leg=msk: для Кении это Амстердам → Москва, для Эквадора, Колумбии и прочих — весь путь.
   Счёт перевозчика — это НЕ цветы, это логистика (doc_type=freight_invoice).
+  CREDIT NOTE / кредит-нота перевозчика (например, Expolanka потеряла коробки) — тоже doc_type=freight_invoice,
+  но freight.total_usd ОТРИЦАТЕЛЬНЫЙ (−242), total_weight_kg пусто (кг уже посчитаны в исходном счёте),
+  awb — MAWB, по которому кредит (из самой кредит-ноты), invoice_no — номер кредит-ноты.
 - MAWB vs HAWB: в поле awb пиши только MAWB (master, обычно 3 цифры-8 цифр, напр. 065-4053 8245).
   HAWB (house, напр. CEVB2311731) пиши ОТДЕЛЬНО в поле hawb — по нему система найдёт верный MAWB консолидации.
 - Консолидационный лист отправки (SHIPPING LIST / prealerta / breakdown агента: одна AWB, таблица SHIPPER/EXPORTER
@@ -282,7 +285,9 @@ def find_mawb(text: str | None) -> str | None:
     return f"{m.group(1)}-{m.group(2)}{m.group(3)}" if m else None
 
 
-async def parse_document(data: bytes, mime: str, farms: list[dict], catalog: list[str], note: str = "") -> dict:
+async def parse_document(data: bytes, mime: str, farms: list[dict], catalog: list[str], note: str = "",
+                         more: list | None = None) -> dict:
+    """more = [(bytes, mime), …]: other files of the SAME document (invoice + packing list in two files)."""
     if not client:
         raise RuntimeError(f"Нет ключа для AI_PROVIDER={AI_PROVIDER} (ANTHROPIC_API_KEY / OPENROUTER_API_KEY)")
     # old wrong names («Hydrangea Mix Assorted Premium») must not pull new invoices back into «mix» lines
@@ -293,7 +298,10 @@ async def parse_document(data: bytes, mime: str, farms: list[dict], catalog: lis
            + "\n".join(catalog[:400]))
     out = await _structured(
         PARSE_MODEL, DOMAIN + "\n\n" + ctx,
-        [*_blocks(data, mime),
+        [*_blocks(data, mime), *[b for d, m in (more or []) for b in _blocks(d, m)],
+         *([{"type": "text", "text": f"Это {1 + len(more)} файла ОДНОГО документа (например, в одном инвойс с ценами, "
+                                    "в другом пакинг по коробкам). Объедини в ОДИН результат: строки и цены — из инвойса, "
+                                    "boxes_detail — из пакинга, ничего не дублируй."}] if more else []),
          {"type": "text", "text": "Распознай документ полностью, все строки. Проверь арифметику строк и итог."
                                   + (f"\n\nПодпись оператора к документу (она важнее документа — если там MAWB, "
                                      f"плантация или дата, бери оттуда): {note}" if note.strip() else "")}],

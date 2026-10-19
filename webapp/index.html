@@ -175,7 +175,7 @@ function back(){ stack.pop(); const [v,a]=stack[stack.length-1]||['home',{}]; re
 tg?.BackButton.onClick(back);
 const ICONS={"home": "<svg viewBox=\"0 0 24 24\" width=\"22\" height=\"22\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M4 7h16v12a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z\"/><path d=\"M8 7V5a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2\"/><path d=\"M4 12h16\"/></svg>", "transit": "<svg viewBox=\"0 0 24 24\" width=\"22\" height=\"22\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M3 6h11v10H3z\"/><path d=\"M14 9h4l3 3v4h-7\"/><circle cx=\"7\" cy=\"17.5\" r=\"1.6\"/><circle cx=\"17\" cy=\"17.5\" r=\"1.6\"/></svg>", "stock": "<svg viewBox=\"0 0 24 24\" width=\"22\" height=\"22\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M12 3 3 7.5 12 12l9-4.5z\"/><path d=\"M3 7.5V16.5L12 21l9-4.5V7.5\"/><path d=\"M12 12v9\"/></svg>", "more": "<svg viewBox=\"0 0 24 24\" width=\"22\" height=\"22\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"5\" cy=\"12\" r=\"1.3\"/><circle cx=\"12\" cy=\"12\" r=\"1.3\"/><circle cx=\"19\" cy=\"12\" r=\"1.3\"/></svg>"};
 const TABS=[['home',ICONS.home,'Откупы'],['transit',ICONS.transit,'В пути'],['stock',ICONS.stock,'Остатки'],['more',ICONS.more,'Ещё']];
-const TAB_OF={archive:'more',ledger:'more',marks:'more',home:'home',topup:'home',topupForm:'home',draft:'home',invoice:null,logistics:null,weights:'home',
+const TAB_OF={archive:'more',autolog:'more',ledger:'more',marks:'more',home:'home',topup:'home',topupForm:'home',draft:'home',invoice:null,logistics:null,weights:'home',
   transit:'transit',transitInv:'transit',stock:'stock',more:'more',farms:'more',farm:'more',users:'more'};
 let CUR_TAB='home';
 function tab(v){ stack.length=0; go(v) }
@@ -748,7 +748,10 @@ async stock(){
       ${ME.can_write?`<div class="v"><button class="primary" data-pk="${esc(awb)}">Забрал</button></div>`:''}</div>${rows(l,true)}`).join('');
   $app.innerHTML=`<h1>Товарные остатки</h1>
   <p class="sub">Только товар (цветы), без ТК. ${ME.can_write?`Неоплаченные — ≈ по курсу ${fmt(v.est_rate,2)} (пополнение ${esc(v.est_topup||'—')}).`:''}</p>
-  ${head('🚚 Груз в пути',v.in_transit,'ещё не прибыл')}${rows(v.in_transit,true)}</div>
+  ${head('🚚 Груз в пути',v.in_transit,'ещё не прибыл — всего')}
+    ${[['🟢 Оплачено',v.in_transit.filter(i=>i.paid)],['🟠 Не оплачено',v.in_transit.filter(i=>!i.paid)]].filter(([,l])=>l.length).map(([t,l])=>
+      `<div class="row" style="background:var(--bg2,rgba(127,127,127,.08))"><div class="grow"><div class="t">${t}</div><div class="s">${l.length} инв.</div></div>
+       <div class="v"><div class="num"><b>${l.some(i=>i.approx)?'≈ ':''}${fmt(sum(l))} ₽</b></div></div></div>${rows(l,false)}`).join('')}</div>
   ${v.warehouse.length?`${head('🏬 Прибыл — на складе ТК',v.warehouse,'нажми «Забрал», когда заберёте — уйдёт из остатков')}${wh}</div>`:''}
   ${head('💳 Не оплачено',v.unpaid,'деньги, которые ещё должны фермам — уходит после оплаты')}${rows(v.unpaid,false)}</div>`;
   $app.querySelectorAll('[data-pk]').forEach(b=>b.onclick=async e=>{ e.stopPropagation();
@@ -761,6 +764,7 @@ async stock(){
 // ======================= ЕЩЁ =======================
 async more(){
   $app.innerHTML=`<h1>Ещё</h1><div class="group">
+    <div class="row" id="m-log"><div class="grow"><div class="t">🤖 Что бот поменял сам</div><div class="s">MAWB, кг, прибытие, слияния — с кнопкой «Отменить»</div></div></div>
     <div class="row" id="m-led"><div class="grow"><div class="t">Расчёты с фермами</div><div class="s">авансы и долги в $</div></div></div>
     <div class="row" id="m-marks"><div class="grow"><div class="t">Маркировки клиентов</div><div class="s">чаты клиентов для статусов грузов</div></div></div>
     <div class="row" id="m-farms"><div class="grow"><div class="t">Плантации</div><div class="s">справочник, правила коробок, нюансы для AI</div></div></div>
@@ -776,8 +780,27 @@ async more(){
   document.getElementById('m-farms').onclick=()=>go('farms');
   document.getElementById('m-marks').onclick=()=>go('marks');
   document.getElementById('m-led').onclick=()=>go('ledger');
+  document.getElementById('m-log').onclick=()=>go('autolog');
   document.getElementById('m-users')?.addEventListener('click',()=>go('users'));
   document.getElementById('m-arch')?.addEventListener('click',()=>go('archive'));
+},
+
+// ======================= ЖУРНАЛ: что бот поменял сам =======================
+async autolog(){
+  let L=await api('/autolog');
+  const draw=()=>{ $app.innerHTML=`<h1>Что бот поменял сам</h1>
+  <p class="sub">Всё, что бот изменил без нажатия кнопки: MAWB, кг, «прибыл», даты, слияния закупок.
+  «Отменить» возвращает как было и ставит 🔒 — бот это поле у этого инвойса больше не трогает. То, что вы меняете сами, тоже сразу под 🔒.</p>
+  ${L.length?`<div class="group">${L.map(r=>`<div class="row"><div class="grow">
+      <div class="t">${esc(r.farm||'—')}${r.awb?` <span class="s">· MAWB ${esc(r.awb)}</span>`:''}</div>
+      <div class="s">${r.field==='merge'?esc(r.new||''):`${esc(r.label)}: <b>${esc(r.old||'пусто')}</b> → <b>${esc(r.new||'пусто')}</b>`}</div>
+      <div class="s">${esc(r.ts)} · ${esc(r.reason)}</div></div>
+      <div class="v">${r.undone?'<span class="pill">отменено 🔒</span>':(r.can_undo&&ME.can_write?`<button data-u="${r.id}">Отменить</button>`:'')}</div></div>`).join('')}</div>`
+    :'<div class="empty">Пока бот ничего сам не менял — записи появятся с этой версии.</div>'}`;
+    $app.querySelectorAll('[data-u]').forEach(b=>b.onclick=async()=>{ if(!confirm('Вернуть как было?'))return;
+      try{ L=await api('/autolog/'+b.dataset.u+'/undo',{method:'POST'}); toast('Вернул, 🔒'); draw() }catch(x){ toast(x.message) } });
+  };
+  draw();
 },
 
 // ======================= АРХИВ ДОКУМЕНТОВ (sys) =======================

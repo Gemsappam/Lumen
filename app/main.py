@@ -119,8 +119,8 @@ def _fix_double_broker():
                 for old in invs[:-1]:
                     if old.ext_id:      # two real statement purchases can share a MAWB — never strip one
                         continue
-                    old.awb = ""
-                    s.add(old)
+                    from .autolog import log as _alog
+                    _alog(s, old, "awb", "", "при запуске: две брокерские закупки на одном MAWB")
         s.commit()
     _repair_broker_packing()
 
@@ -154,8 +154,8 @@ def _repair_broker_packing():
                 else:
                     src.packing_lines_json = None; s.add(src)
             else:
-                src.awb = awb
-                s.add(src)
+                from .autolog import log as _alog
+                _alog(s, src, "awb", awb, "при запуске: MAWB по HAWB из консолидационного листа")
         s.commit()
 
 
@@ -201,6 +201,9 @@ def _merge_broker_dupes():
             for l in ls:
                 s.delete(l)
             s.delete(d)
+            from .autolog import note as _anote
+            _anote(s, b.id, b.farm, b.awb, "merge", f"инвойс фермы №{d.invoice_no} слит с закупкой из выписки {b.invoice_no}",
+                   "при запуске: брокерская ферма, инвойс был внесён как прямой")
         s.commit()
         # a placeholder made from a re-sent farm invoice next to the real statement purchase -> one purchase
         from .calc import norm_awb
@@ -228,11 +231,18 @@ def _merge_broker_dupes():
                     if k in ("awb", "weight_kg", "truck", "eta") and b.arrived_at:
                         continue          # purchase already arrived on its own shipment — don't move it
                     if getattr(d, k, None) and not getattr(b, k, None):
-                        setattr(b, k, getattr(d, k))
+                        if k in ("awb", "weight_kg", "arrived_at"):
+                            from .autolog import log as _alog
+                            _alog(s, b, k, getattr(d, k), "при запуске: перенесено со слитого дубля закупки")
+                        else:
+                            setattr(b, k, getattr(d, k))
                 s.add(b)
                 for l in s.exec(select(Line).where(Line.invoice_id == d.id)).all():
                     s.delete(l)
                 s.delete(d); gone.add(d.id)
+                from .autolog import note as _anote
+                _anote(s, b.id, b.farm, b.awb, "merge", f"дубль закупки №{d.invoice_no or d.id} слит в {b.invoice_no}",
+                       "при запуске: тот же инвойс фермы прислан повторно")
                 print(f"[lumen] merged duplicate broker purchase {d.farm} #{d.id} into #{b.id}", flush=True)
         s.commit()
         from .api import infer_mawb                 # statement purchases still without MAWB: from consolidation lists
@@ -240,8 +250,10 @@ def _merge_broker_dupes():
             if getattr(b, "via_broker", False) and not (b.awb or "").strip() and not b.arrived_at:
                 a, kg, _n = infer_mawb(b.farm)
                 if a:
-                    b.awb, b.weight_kg = a, b.weight_kg or kg
-                    s.add(b)
+                    from .autolog import log as _alog
+                    if _alog(s, b, "awb", a, "при запуске: брокерская закупка без MAWB, ферма есть в листе/разбивке"):
+                        if not b.weight_kg and kg:
+                            _alog(s, b, "weight_kg", kg, "разбивка кг")
         s.commit()
 
 
@@ -264,7 +276,9 @@ def _fix_swapped_dates():
                     continue
                 new = fix_swapped_date(i.invoice_date or "", ref=max(sib))
                 if new != i.invoice_date:
-                    i.invoice_date = new; s.add(i); n += 1
+                    from .autolog import log as _alog
+                    if _alog(s, i, "invoice_date", new, "при запуске: дата прочитана как месяц.день"):
+                        n += 1
         if n:
             s.commit()
             print(f"[lumen] fixed {n} swapped invoice dates", flush=True)
@@ -447,7 +461,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-20a · остатки: только товар; в пути / на складе ТК (Забрал) / не оплачено"
+VERSION = "2026-10-20c · /ai: несколько файлов + пояснение словами, кредит-ноты минусом; остатки в пути по оплате"
 
 
 async def _once_recalc_true_rate():

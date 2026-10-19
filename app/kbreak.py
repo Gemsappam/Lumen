@@ -388,7 +388,10 @@ def _auto_move() -> int:
             if others:                       # other farms on that MAWB too -> it is a real shipment, ask instead
                 continue
             inv = s.get(Invoice, e["id"])
-            inv.awb = x["awb"]
+            from .autolog import log as _alog
+            if not _alog(s, inv, "awb", x["awb"], f"ферма в консолидационном листе {x['awb']}, а MAWB "
+                                                   f"{e['awb']} из инвойса нигде не встречается"):
+                continue
             inv.note = ((inv.note or "") + f" · MAWB по консолидационному листу (в инвойсе был {e['awb']})").strip(" ·")
             s.add(inv); s.commit()
         MOVED.append(f"🔗 {x['farm']}: в инвойсе был MAWB {e['awb']}, но ферма стоит в консолидационном листе "

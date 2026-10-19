@@ -145,6 +145,20 @@ class AwbWeights(SQLModel, table=True):
 engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
 
 
+class AutoLog(SQLModel, table=True):
+    """What the bot changed BY ITSELF (not a person): shown in «🤖 Что бот поменял», can be undone."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    ts: str = ""                          # «20.10.2026 10:31»
+    inv_id: Optional[int] = None
+    farm: str = ""
+    awb: str = ""
+    field: str = ""                       # awb / weight_kg / arrived_at / invoice_date / merge
+    old: Optional[str] = None
+    new: Optional[str] = None
+    reason: str = ""
+    undone: bool = False
+
+
 def init_db():
     SQLModel.metadata.create_all(engine)
     # add columns introduced after the first deploy (SQLite doesn't do it by itself)

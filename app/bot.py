@@ -96,6 +96,173 @@ async def start(m: Message):
                    reply_markup=kb)
 
 
+# ---------- /ai (/intelect): несколько файлов + объяснение словами -------------------------
+AISESSION: dict = {}   # user -> {"files": [(data, mime, name, file_id)], "note": str, "status": Message}
+
+
+def _ai_kb():
+    return _kb([[("✅ Готово", "ai:go"), ("✖️ Отмена", "ai:cancel")]])
+
+
+@dp.message(pv, wr, Command("ai", "intelect", "intellect", "intel"))
+async def ai_start(m: Message):
+    text = (m.text or "").split(maxsplit=1)
+    AISESSION[m.from_user.id] = {"files": [], "note": text[1] if len(text) > 1 else "", "status": None}
+    st = await m.answer(
+        "🧠 Режим «объясню словами». Кидай файлы и пиши, что с ними, например:\n"
+        "• «тут 2 файла: в одном инвойс Tambuzi, в другом пакинг»\n"
+        "• «Expolanka потеряла коробку, это кредит — минусни со старого MAWB»\n"
+        "• «тут инвойс и кредит-нота, кредит вычли из нового инвойса»\n"
+        "Когда всё скинул — «✅ Готово».", reply_markup=_ai_kb())
+    AISESSION[m.from_user.id]["status"] = st
+
+
+async def _ai_status(uid: int):
+    p = AISESSION.get(uid)
+    if not p:
+        return
+    txt = (f"🧠 Файлов: {len(p['files'])}"
+           + ("".join(f"\n📎 {n}" for _d, _m, n, _f in p["files"]))
+           + (f"\n📝 {p['note'][:600]}" if p["note"] else "\n📝 (пояснения пока нет — напиши словами, что с файлами)")
+           + "\n\nЕщё файлы / текст — или «✅ Готово».")
+    try:
+        if p.get("status"):
+            await p["status"].delete()
+    except Exception:
+        pass
+    p["status"] = await bot.send_message(uid, txt, reply_markup=_ai_kb())
+
+
+@dp.message(pv, wr, F.from_user.id.func(lambda i: i in AISESSION), F.document | F.photo)
+async def ai_collect_file(m: Message):
+    p = AISESSION[m.from_user.id]
+    if m.photo:
+        f = await bot.download(m.photo[-1])
+        data, mime, name, fid = f.read(), "image/jpeg", "фото", m.photo[-1].file_id
+    else:
+        f = await bot.download(m.document)
+        data, name, fid = f.read(), m.document.file_name or "файл", m.document.file_id
+        mime = m.document.mime_type or ""
+        low = name.lower()
+        if low.endswith((".xls", ".xlsx")):
+            from .xltext import excel_to_text
+            data, mime = excel_to_text(data, name).encode(), "text/plain"
+        elif low.endswith(".docx"):
+            from .xltext import docx_to_text
+            data, mime = docx_to_text(data).encode(), "text/plain"
+        elif mime not in ("application/pdf", "image/jpeg", "image/png"):
+            await m.answer(f"«{name}» — такой формат не читаю. Нужны PDF, фото, Excel или Word.")
+            return
+    p["files"].append((data, mime, name, fid))
+    if m.caption:
+        p["note"] = (p["note"] + "\n" + m.caption).strip()
+    await _ai_status(m.from_user.id)
+
+
+@dp.message(pv, wr, F.from_user.id.func(lambda i: i in AISESSION), F.text.func(lambda t: not t.startswith("/")))
+async def ai_collect_text(m: Message):
+    p = AISESSION[m.from_user.id]
+    p["note"] = (p["note"] + "\n" + m.text).strip()
+    await _ai_status(m.from_user.id)
+
+
+@dp.callback_query(F.data.startswith("ai:"), wr)
+async def ai_buttons(c: CallbackQuery):
+    import asyncio
+    uid, what = c.from_user.id, c.data.split(":", 1)[1]
+    p = AISESSION.get(uid)
+    await c.answer()
+    if what == "cancel" or not p:
+        AISESSION.pop(uid, None)
+        await c.message.edit_text("Ок, режим «объясню словами» закрыт." if what == "cancel" else "Устарело — начни /ai заново.")
+        return
+    if what == "go":
+        if not p["files"]:
+            await c.message.edit_text("Файлов пока нет — скинь хотя бы один, потом «✅ Готово».", reply_markup=_ai_kb())
+            return
+        if len(p["files"]) == 1:
+            AISESSION.pop(uid, None)
+            await c.message.edit_text("🧠 Читаю с твоим пояснением…")
+            asyncio.create_task(_ai_guard(uid, p["files"], p["note"], c.message))
+            return
+        await c.message.edit_text(
+            f"🧠 Файлов: {len(p['files'])}. Это один документ или разные?",
+            reply_markup=_kb([[("🧩 Один документ — склеить (инвойс + пакинг)", "ai:one")],
+                              [("📑 Разные документы — по очереди", "ai:sep")],
+                              [("✖️ Отмена", "ai:cancel")]]))
+        return
+    AISESSION.pop(uid, None)
+    if what == "one":
+        await c.message.edit_text("🧠 Склеиваю файлы в один документ и читаю…")
+        asyncio.create_task(_ai_guard(uid, p["files"], p["note"], c.message))
+    elif what == "sep":
+        await c.message.edit_text(f"🧠 Разбираю {len(p['files'])} документа по очереди — на каждый задам обычные вопросы.")
+        asyncio.create_task(_ai_queue(uid, p["files"], p["note"]))
+
+
+def _busy(uid: int) -> bool:
+    return uid in FLOW or uid in CORR or uid in NEWFARM or uid in FIXWAIT or uid in FIXPEND
+
+
+async def _ai_queue(uid: int, files: list, note: str):
+    import asyncio, time as _t
+    for n, f in enumerate(files, 1):
+        t0 = _t.time()
+        while _busy(uid) and _t.time() - t0 < 1800:       # wait until the previous document's questions are answered
+            await asyncio.sleep(3)
+        msg = await bot.send_message(uid, f"🧠 Документ {n} из {len(files)}: {f[2]} — читаю…")
+        await _ai_guard(uid, [f], note, msg)
+
+
+async def _ai_guard(uid: int, files: list, note: str, msg):
+    import asyncio, logging, traceback
+    try:
+        await asyncio.wait_for(_ai_run(uid, files, note, msg), timeout=480)
+    except asyncio.TimeoutError:
+        await _send(uid, "⏱ AI не ответил за 8 минут. Попробуй ещё раз: /ai", None, msg)
+    except Exception:
+        logging.exception("ai run failed")
+        tb = traceback.format_exc().strip().splitlines()[-1]
+        await _send(uid, f"❌ Не смог разобрать: {tb[:300]}", None, msg)
+
+
+async def _ai_run(uid: int, files: list, note: str, msg):
+    from .api import merge_lines, record_upload, update_upload
+    with session() as s:
+        fs = [f.model_dump() for f in s.exec(select(Farm)).all()]
+        catalog = sorted({l.name for l in s.exec(select(Line)).all()})
+    ups = []
+    for data, mime, name, fid in files:
+        try:
+            ups.append(record_upload(uid, "", name, mime, tg_file_id=fid, kind="ai"))
+        except Exception:
+            ups.append(0)
+    (d0, m0, _n0, _f0), rest = files[0], files[1:]
+    ai_note = ("ПОЯСНЕНИЕ ОПЕРАТОРА (главнее документа, делай как он говорит): " + note) if note.strip() else ""
+    out = await ai.parse_document(d0, m0, fs, catalog, note=ai_note, more=[(d, m) for d, m, _n, _f in rest])
+    out = merge_lines(out)
+    up_id = ups[0] if ups else 0
+    out["upload_id"], out["source_file"] = up_id, f"up:{up_id}"
+    update_upload(up_id, kind=out.get("doc_type", ""),
+                  summary=f"{out.get('farm') or ''} {out.get('invoice_no') or ''} MAWB {out.get('awb') or '?'} (/ai)")
+    if len(files) == 1:
+        _fix_remember(uid, up_id, d0, m0, note, msg)
+    if out.get("doc_type") not in ("farm_invoice", "freight_invoice"):
+        await _send(uid, f"Прочитал как «{out.get('doc_type')}». В режиме /ai пока разбираю инвойсы ферм и счета ТК "
+                         "(в т.ч. кредит-ноты) — такой документ пришли обычным сообщением.", None, msg)
+        return
+    fr = out.get("freight") or {}
+    pre = ""
+    if out.get("doc_type") == "freight_invoice" and (fr.get("total_usd") or 0) < 0:
+        pre = (f"🧾 Кредит-нота {out.get('invoice_no') or ''}: −${abs(fr['total_usd']):g} по MAWB {out.get('awb') or '?'} — "
+               "запишу минусом на этот MAWB (без кг), скидка разойдётся по его фермам.\n\n")
+    if len(files) > 1:
+        pre = f"🧩 Склеил {len(files)} файла в один документ.\n" + pre
+    warn = ("\n⚠️ " + "\n⚠️ ".join(out["warnings"])) if out.get("warnings") else ""
+    # the explanation doubles as a caption («оплачено 2353.95$ 23.10»); a credit note's $ comes from the document only
+    await _route_invoice(uid, out, "" if pre.startswith("🧾") or "🧾" in pre else note, msg, warn, pre=pre)
+
+
 @dp.message(pv, wr, F.document.file_name.lower().endswith(".xls"))
 async def excel_xls(m: Message):
     """Old-format Excel = a farm invoice / freight bill. A «.xls» that is really .xlsx (BiFlorica sends such) -> xlsx router."""
@@ -2776,6 +2943,21 @@ async def arrivals_cmd(m: Message):
 async def pickup_cmd(m: Message):
     """Что прибыло и ждёт «забрал со склада ТК»."""
     await pickup_check(m.from_user.id, min_hours=0)
+
+
+@dp.message(pv, wr, Command("log"))
+async def autolog_cmd(m: Message):
+    """Последние изменения, которые бот сделал сам."""
+    from .autolog import entries
+    rows = entries(20)
+    if not rows:
+        await m.answer("🤖 Бот пока ничего сам не менял.")
+        return
+    txt = "🤖 Что бот поменял сам (последние 20). Отменить — в приложении: Ещё → «Что бот поменял».\n\n" + "\n".join(
+        f"{'↩️ ' if r['undone'] else ''}{r['ts']} · {r['farm'] or '—'}"
+        + (f" · {r['label']}: {r['old'] or 'пусто'} → {r['new'] or 'пусто'}" if r['field'] != 'merge' else f" · {r['new']}")
+        + f"\n   ↳ {r['reason']}" for r in rows)
+    await m.answer(txt[:4000])
 
 
 # catch-all goes LAST so /pay and other commands above get a chance first

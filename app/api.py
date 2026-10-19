@@ -663,7 +663,7 @@ def book_document(out: dict, topup_id: int, usd, rub, uid: int, paid: bool = Tru
         fr = out.get("freight") or {}
         prov = (fr.get("provider") or out.get("farm") or "")
         body = LogisticsIn(topup_id=topup_id or None, paid=paid, awb=out.get("awb") or "", leg=leg_of(prov, fr.get("leg")),
-                           weight_kg=out.get("total_weight_kg"),
+                           weight_kg=(None if (usd or 0) < 0 else out.get("total_weight_kg")),   # credit note: no kg
                            provider=fr.get("provider") or out.get("farm") or "", invoice_no=out.get("invoice_no") or "",
                            usd=usd, rub=rub, paid_date=today if paid else "", source_file=out.get("source_file"),
                            farm_kg={x["farm"]: x["kg"] for x in fr.get("per_farm_kg") or [] if x.get("kg")})
@@ -852,8 +852,8 @@ def _apply_farm_kg(s, awb, farm_kg):
         if norm_awb(inv.awb) == key:
             v = _kg_for(s, inv.farm, farm_kg)
             if v:
-                inv.weight_kg = v
-                s.add(inv)
+                from .autolog import log as _alog
+                _alog(s, inv, "weight_kg", float(v), f"разбивка кг по MAWB {awb}")
 
 
 def _awb_breakdown(s) -> dict:
@@ -894,8 +894,8 @@ def _store_weights(s, awb, farm_kg, source_file=None, replace=False):
             taken = any(norm_awb(i.awb) == key and _norm_name(i.farm) == _norm_name(inv.farm)
                         for i in s.exec(select(Invoice)).all())
             if not taken:
-                inv.awb = find_mawb(awb) or awb
-                s.add(inv)
+                from .autolog import log as _alog
+                _alog(s, inv, "awb", find_mawb(awb) or awb, "весовая разбивка ТК, в ней есть эта ферма")
     s.flush()
     _apply_farm_kg(s, awb, farm_kg)
 
@@ -1120,6 +1120,12 @@ def save_invoice(body: InvoiceIn, inv_id: int | None = None, uid: int = Depends(
         data = body.model_dump(exclude={"lines", "box_mismatch", "stems_total", "boxes_detail"})
         inv = s.get(Invoice, inv_id) if inv_id else Invoice(**data)
         if inv_id:
+            from .autolog import lock as _lock
+            for f in ("awb", "weight_kg", "arrived_at"):
+                a, b = data.get(f), getattr(inv, f)
+                same = norm_awb(a or "") == norm_awb(b or "") if f == "awb" else str(a or "") == str(b or "")
+                if f in data and not same:
+                    _lock(inv_id, f)               # a person changed it in the editor -> automatics keep off
             for k, v in data.items():
                 setattr(inv, k, v)
             for l in s.exec(select(Line).where(Line.invoice_id == inv_id)).all():
@@ -1164,6 +1170,8 @@ def set_invoice_awb(inv_id: int, body: AwbIn, uid: int = Depends(writer)):
         if not inv:
             raise HTTPException(404, "Инвойс не найден")
         inv.awb = awb
+        from .autolog import lock as _lock
+        _lock(inv.id, "awb")
         if awb:
             old_kg, inv.weight_kg = inv.weight_kg, None
             _fill_weight_from_logistics(s, inv)
@@ -2322,6 +2330,22 @@ def seed_picked():
     SETTINGS.write_text(json.dumps({**_settings(), "picked": pk, "picked_seeded": True}, ensure_ascii=False))
 
 
+@router.get("/autolog")
+def get_autolog(uid: int = Depends(user_id)):
+    from .autolog import entries
+    return entries()
+
+
+@router.post("/autolog/{log_id}/undo")
+def post_autolog_undo(log_id: int, uid: int = Depends(writer)):
+    from .autolog import undo, entries
+    try:
+        undo(log_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return entries()
+
+
 @router.get("/transit")
 def get_transit(uid: int = Depends(user_id)):
     return transit_view()
@@ -2394,6 +2418,8 @@ def api_arrived(inv_id: int, back: bool = False, uid: int = Depends(writer)):
         inv = s.get(Invoice, inv_id)
         inv.arrived_at = None if back else datetime.now().strftime("%d.%m.%Y %H:%M") + " (вручную)"
         s.add(inv); s.commit()
+    from .autolog import lock as _lock
+    _lock(inv_id, "arrived_at")
     from .backup import mark_dirty
     mark_dirty()
     return transit_view()
@@ -2461,7 +2487,9 @@ def assign_awb_by_farms(awb: str, farms: list[str]) -> list[str]:
         for i in sorted(allinv, key=lambda x: -x.id):
             if (not (i.awb or "").strip() and not i.arrived_at and i.farm in farms
                     and i.farm not in done and i.farm not in on_awb):
-                i.awb = awb; s.add(i); done.append(i.farm)
+                from .autolog import log as _alog
+                if _alog(s, i, "awb", awb, "консолидационный лист, в нём есть эта ферма"):
+                    done.append(i.farm)
         s.commit()
     if done:
         from .backup import mark_dirty
@@ -2488,8 +2516,10 @@ def arrive_due(now_iso: str) -> list[dict]:
     with session() as s:
         for i in s.exec(select(Invoice)).all():
             if not i.arrived_at and i.eta and i.eta <= now_iso:
-                i.arrived_at = i.eta.replace("T", " ")[:16] + " (Floratrack)"
-                s.add(i)
+                from .autolog import log as _alog
+                if not _alog(s, i, "arrived_at", i.eta.replace("T", " ")[:16] + " (Floratrack)",
+                             "время прибытия из чата Floratrack"):
+                    continue
                 done.append({"farm": i.farm, "awb": i.awb, "paid": bool(i.topup_id)})
         s.commit()
     if done:
