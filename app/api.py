@@ -1966,7 +1966,7 @@ def _dt(s: str):
 
 
 def stays_in_transit(i) -> bool:
-    """«В пути» shows a shipment until it has ARRIVED and is PAID, and 2 more days have passed after both.
+    """«В пути» shows a shipment until it has ARRIVED and is PAID, and 7 more days have passed after both.
     An unpaid shipment never leaves the list just because it arrived."""
     from datetime import datetime, timedelta
     if not i.arrived_at:
@@ -1978,7 +1978,24 @@ def stays_in_transit(i) -> bool:
     if arr is None:                    # «до учёта в пути» etc. — arrived long ago, date unknown
         return False
     pay = _dt(i.paid_date or "") or arr
-    return datetime.now() - max(arr, pay) < timedelta(days=2)
+    return datetime.now() - max(arr, pay) < timedelta(days=7)
+
+
+def transit_ids(invs) -> set:
+    """A MAWB stays in «В пути» as a WHOLE: while any of its invoices is unpaid, or until 7 days after the last
+    one was paid/arrived. So paid farms don't disappear before the MAWB is closed and its cost handed out."""
+    by = defaultdict(list)
+    keep = set()
+    for i in invs:
+        k = norm_awb(i.awb) if (i.awb or "").strip() else None
+        if k:
+            by[k].append(i)
+        elif stays_in_transit(i):
+            keep.add(i.id)
+    for k, group in by.items():
+        if any(stays_in_transit(i) for i in group):
+            keep |= {i.id for i in group}
+    return keep
 
 
 def transit_view(s=None) -> dict:
@@ -1997,7 +2014,8 @@ def transit_view(s=None) -> dict:
         by_inv = defaultdict(list)
         for l in lines:
             by_inv[l.invoice_id].append(l)
-        moving = [i for i in invs if stays_in_transit(i)]
+        keep = transit_ids(invs)
+        moving = [i for i in invs if i.id in keep]
         ft_rate = None
         out = []
         for i in sorted(moving, key=lambda x: (norm_awb(x.awb), x.id)):

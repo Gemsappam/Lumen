@@ -2476,7 +2476,7 @@ async def arrival_answer(c: CallbackQuery):
         from .backup import mark_dirty
         mark_dirty()
         await c.message.edit_text(c.message.text.split(" — в пути")[0] + f" — ✅ отмечено прибывшим ({', '.join(farms)}). "
-                                  "Оплаченные уйдут из «В пути» через 2 дня, неоплаченные останутся до оплаты.")
+                                  "MAWB уйдёт из «В пути» целиком через неделю после того, как оплачены все его инвойсы.")
     else:
         st = _settings()
         sn = st.get("arr_snooze") or {}
