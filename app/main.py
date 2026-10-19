@@ -442,7 +442,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-19a · «В пути»: MAWB целиком, уходит через 7 дней после оплаты всех инвойсов"
+VERSION = "2026-10-19c · оплаченный MAWB держится в «В пути» неделю от дня последней оплаты"
 
 
 async def _once_recalc_true_rate():

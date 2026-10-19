@@ -33,6 +33,18 @@ def model_id(name: str) -> str:
     return f"anthropic/{name}"
 
 
+NO_MONEY = ("💳 На OpenRouter почти кончились деньги — AI не может прочитать документ. "
+            "Пополни баланс: openrouter.ai/settings/credits, потом пришли документ ещё раз.")
+
+
+async def _call(kw):
+    try:                                   # stream: long multi-page invoices don't hit the read timeout
+        async with client.messages.stream(**kw) as st:
+            return await st.get_final_message()
+    except AttributeError:
+        return await client.messages.create(**kw)
+
+
 async def _structured(model: str, system: str, content, tool: dict, max_tokens: int) -> dict:
     """Get the tool's JSON back WITHOUT forced tool_choice (Opus 5.5 / Fable reject forcing).
     tool_choice=auto + explicit instruction, check, retry once, last resort: JSON from text."""
@@ -42,11 +54,24 @@ async def _structured(model: str, system: str, content, tool: dict, max_tokens: 
                   system=system + f"\n\nОтветь ОДНИМ вызовом инструмента {tool['name']} — без текста вокруг.",
                   tools=[tool], tool_choice={"type": "auto"},
                   messages=[{"role": "user", "content": content}])
-        try:                                   # stream: long multi-page invoices don't hit the read timeout
-            async with client.messages.stream(**kw) as st:
-                msg = await st.get_final_message()
-        except AttributeError:
-            msg = await client.messages.create(**kw)
+        try:
+            msg = await _call(kw)
+        except Exception as e:
+            if getattr(e, "status_code", None) != 402:
+                raise
+            if "in_flight" in str(e) and attempt == 0:
+                # OpenRouter reserves credit for the max possible answer: low balance -> ask for less, once
+                import asyncio
+                await asyncio.sleep(20)
+                kw["max_tokens"] = max_tokens = max(4000, max_tokens // 3)
+                try:
+                    msg = await _call(kw)
+                except Exception as e2:
+                    if getattr(e2, "status_code", None) == 402:
+                        raise RuntimeError(NO_MONEY) from None
+                    raise
+            else:
+                raise RuntimeError(NO_MONEY) from None
         for b in msg.content:                      # response may start with a thinking block
             if getattr(b, "type", "") == "tool_use" and b.name == tool["name"]:
                 return b.input

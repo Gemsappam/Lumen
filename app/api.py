@@ -1975,10 +1975,14 @@ def stays_in_transit(i) -> bool:
     if not paid:
         return True
     arr = _dt(re.sub(r"\s*\(.*\)$", "", i.arrived_at or ""))
-    if arr is None:                    # «до учёта в пути» etc. — arrived long ago, date unknown
+    pay = _dt(i.paid_date or "")
+    last = max(x for x in (arr, pay) if x) if (arr or pay) else None
+    if last is None:                   # «до учёта в пути» and no payment date — closed long ago
         return False
-    pay = _dt(i.paid_date or "") or arr
-    return datetime.now() - max(arr, pay) < timedelta(days=7)
+    # paid date has no time: count from the END of that day, so «paid today» always keeps the full week
+    if pay and last == pay:
+        last = pay + timedelta(days=1)
+    return datetime.now() - last < timedelta(days=7)
 
 
 def transit_ids(invs) -> set:
