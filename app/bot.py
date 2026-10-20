@@ -2577,6 +2577,112 @@ async def discrepancy_typed(m: Message):
 _STARTED = time.time()
 
 
+# ---------- Logiztik API: consolidation lists for Ecuador / Colombia by themselves ----------
+class _LzMsg:
+    """Lets the Logiztik sync reuse the «consolidation list» flow: its answers go to the money people."""
+    def __init__(self, uid):
+        from types import SimpleNamespace
+        self.from_user = SimpleNamespace(id=uid)
+
+    async def answer(self, text, **kw):
+        for uid in _money_people():
+            try:
+                await bot.send_message(uid, "🛰 Logiztik — " + text, **kw)
+            except Exception:
+                pass
+
+
+async def logiztik_sync(report_to: int | None = None) -> str:
+    """New AWBs at Logiztik -> consolidation list (boxes + kg per farm) like a forwarded prealert.
+    An AWB that already has a list (prealert sent by hand / already posted) is NOT overwritten — only differences
+    are reported."""
+    from . import logiztik as lz, kbreak
+    from .ai import find_mawb
+    from .calc import norm_awb
+    from .api import _settings, SETTINGS, resolve_farm
+    if not lz.enabled():
+        return "Logiztik не настроен: в Bothost нужны переменные LOGIZTIK_TOKEN и LOGIZTIK_CUSTOMER."
+    seen = dict(_settings().get("logiztik_seen") or {})
+    lines = []
+    for sh in await lz.recent(6):
+        boxes = await lz.barcodes(sh["awb"])
+        if not boxes:
+            continue
+        awb = find_mawb(sh["awb"]) or sh["awb"]
+        key = norm_awb(awb)
+        if seen.get(key) == len(boxes):
+            continue
+        rows = lz.farm_rows(boxes)
+        st = kbreak._state().get(key)
+        if st and (st.get("src") != "logiztik" or st.get("sent")):
+            have = {}
+            with session() as s:
+                for f in st.get("farms", []):
+                    have[f["farm"]] = f.get("packs") or 0
+                diff = []
+                for r in rows:
+                    ff = resolve_farm(s, r["farm_raw"])
+                    name = ff.name if ff else _farm_label(r["farm_raw"])
+                    if have.get(name) != r["packs"]:
+                        diff.append(f"• {name}: Logiztik {r['packs']} кор., в листе {have.get(name, '—')}")
+            if diff:
+                await _LzMsg(0).answer(f"MAWB {awb}: коробки расходятся с консолидационным листом:\n" + "\n".join(diff))
+            lines.append(f"{awb}: лист уже был — сверил ({'расхождения отправил' if diff else 'всё сходится'})")
+        else:
+            from datetime import datetime as _d
+            try:
+                eta = _d.strptime(sh["date"], "%Y-%m-%d")
+            except ValueError:
+                eta = None
+            await _consolidation(_LzMsg(report_to or (_money_people() or [0])[0]), awb, sh["country"], rows, eta)
+            stt = kbreak._state()
+            if key in stt:
+                stt[key]["src"] = "logiztik"
+                kbreak._save_state(stt)
+            lines.append(f"{awb}: {len(boxes)} кор. — внёс как консолидационный лист")
+        seen[key] = len(boxes)
+    SETTINGS.write_text(json.dumps({**_settings(), "logiztik_seen": seen}, ensure_ascii=False))
+    return "🛰 Logiztik: " + ("\n".join(lines) if lines else "новых поставок нет")
+
+
+@dp.message(pv, sysf, Command("logiztik"))
+async def logiztik_cmd(m: Message):
+    """/logiztik — проверка связи; /logiztik sync — забрать новые поставки сейчас; /logiztik 2026-10-15 — AWB за дату;
+    /logiztik awb 369-12345678 — коробки по AWB."""
+    from datetime import date as _date
+    from . import logiztik as lz
+    arg = (m.text or "").split()[1:]
+    note = await m.answer("🛰 Logiztik: запрашиваю…")
+    try:
+        if not lz.enabled():
+            raise RuntimeError("не настроен: добавь в Bothost переменные LOGIZTIK_TOKEN и LOGIZTIK_CUSTOMER и перезапусти.")
+        if arg and arg[0] == "sync":
+            txt = await logiztik_sync(m.from_user.id)
+        elif arg and arg[0] == "awb" and len(arg) > 1:
+            boxes = await lz.barcodes(arg[1])
+            rows = lz.farm_rows(boxes)
+            txt = (f"🛰 AWB {arg[1]}: {len(boxes)} кор.\n" + "\n".join(
+                f"• {r['farm_raw']}: {r['packs']} кор. · {r['kg']:g} кг"
+                + (f" · {', '.join(f'{k}×{v}' for k, v in r['sizes'].items())}" if r["sizes"] else "")
+                + (f" · HAWB {r['hawb']}" if r["hawb"] else "") + f" · принято {r['received']}/{r['packs']}"
+                for r in rows))
+        else:
+            day = _date.fromisoformat(arg[0]) if arg else None
+            if day:
+                sh = await lz.shipments(day)
+                txt = f"🛰 {day:%d.%m.%Y}: AWB {len(sh)}\n" + "\n".join(
+                    f"• {x.get('awb')} · {x.get('origin')} · мест {x.get('pieces')}" for x in sh)
+            else:
+                rec = await lz.recent(4)
+                from .api import _settings
+                txt = (f"🛰 Logiztik: связь есть ✅ (ключ передаю как «{_settings().get('logiztik_auth')}»).\n"
+                       f"AWB за 4 дня: {len(rec)}\n" + "\n".join(f"• {x['awb']} · {x['date']} · {x['country']}" for x in rec)
+                       + "\n\n/logiztik sync — внести новые поставки сейчас (дальше бот делает это сам 5 раз в день).")
+    except Exception as e:
+        txt = f"🛰 Logiztik: ❌ {e}"
+    await note.edit_text(txt[:4000])
+
+
 def _stale_transit() -> list:
     """MAWBs still «в пути» with no arrival time from Floratrack and older than a normal trip -> ask."""
     from datetime import datetime as _d, timedelta as _td
@@ -2733,6 +2839,16 @@ async def scheduler_loop():
                 await missing_reminder()
                 await arrival_check()
                 await pickup_check()
+            lz_slot = now.strftime("%Y-%m-%d-%H") if now.hour in (9, 12, 15, 18, 21) and now.minute < 15 else None
+            if lz_slot and st.get("last_lz") != lz_slot:
+                SETTINGS.write_text(json.dumps({**st, "last_lz": lz_slot}))
+                st = _settings()
+                from . import logiztik as _lz
+                if _lz.enabled():
+                    try:
+                        await logiztik_sync()
+                    except Exception as e:
+                        print(f"[lumen] logiztik: {e}", flush=True)
             if now.weekday() == 1 and now.hour == 10 and now.minute < 15 and st.get("last_bf") != now.strftime("%Y-%m-%d"):
                 SETTINGS.write_text(json.dumps({**st, "last_bf": now.strftime("%Y-%m-%d")}))
                 st = _settings()
