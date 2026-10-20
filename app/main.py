@@ -461,7 +461,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-20e · Logiztik: сам подбирает, куда класть код клиента, дату и токен"
+VERSION = "2026-10-20f · /logiztik показывает сырой ответ, если пусто"
 
 
 async def _once_recalc_true_rate():

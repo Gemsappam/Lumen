@@ -22,6 +22,7 @@ BASE = os.getenv("LOGIZTIK_BASE", "https://cloud.logiztikalliance.com:5005/logCl
 # The docs show {CUSTOMERCODE}/{DATE} in the path but don't say where the key goes, and the live server answered
 # «ErrorParametrosFaltantesFechaCodigo» to the path form. So: try path / query / headers × key placements once,
 # remember the combination that gets past «missing parameters» and «unauthorized».
+LAST_RAW = ""          # last answer as text — shown by /logiztik when it isn't a list
 AUTH_MODES = ["AuthenticationToken", "query", "Api-Key", "ApiKey", "Authorization", "Bearer"]
 PARAM_MODES = ["path", "header", "query", "path+header", "path+query"]
 
@@ -120,6 +121,8 @@ async def _call(endpoint: str, params: list, date_param: int | None = None):
                     _save_modes(a, p, fmt)
                 if k == "other":
                     raise RuntimeError(f"Logiztik: {data.get('error') or data.get('mensaje')}")
+                global LAST_RAW
+                LAST_RAW = (json.dumps(data, ensure_ascii=False) if not isinstance(data, str) else data)[:800]
                 return data if isinstance(data, list) else []
     msg = seen.get("missing") or seen.get("auth") or seen.get("datefmt") or "нет ответа"
     raise RuntimeError(f"Logiztik не принял запрос ни в одном варианте ({msg}). Проверено: {len(tried)} вариантов. "

@@ -2661,6 +2661,8 @@ async def logiztik_cmd(m: Message):
         elif arg and arg[0] == "awb" and len(arg) > 1:
             boxes = await lz.barcodes(arg[1])
             rows = lz.farm_rows(boxes)
+            if not boxes:
+                raise RuntimeError(f"по AWB {arg[1]} коробок нет. Ответ сервера: {lz.LAST_RAW or '(пусто)'}")
             txt = (f"🛰 AWB {arg[1]}: {len(boxes)} кор.\n" + "\n".join(
                 f"• {r['farm_raw']}: {r['packs']} кор. · {r['kg']:g} кг"
                 + (f" · {', '.join(f'{k}×{v}' for k, v in r['sizes'].items())}" if r["sizes"] else "")
@@ -2672,6 +2674,8 @@ async def logiztik_cmd(m: Message):
                 sh = await lz.shipments(day)
                 txt = f"🛰 {day:%d.%m.%Y}: AWB {len(sh)}\n" + "\n".join(
                     f"• {x.get('awb')} · {x.get('origin')} · мест {x.get('pieces')}" for x in sh)
+                if not sh:
+                    txt += f"\nОтвет сервера: {lz.LAST_RAW or '(пусто)'}"
             else:
                 rec = await lz.recent(4)
                 from .api import _settings
