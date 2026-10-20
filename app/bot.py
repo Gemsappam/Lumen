@@ -2675,7 +2675,8 @@ async def logiztik_cmd(m: Message):
             else:
                 rec = await lz.recent(4)
                 from .api import _settings
-                txt = (f"🛰 Logiztik: связь есть ✅ (ключ передаю как «{_settings().get('logiztik_auth')}»).\n"
+                txt = (f"🛰 Logiztik: связь есть ✅ (параметры: {_settings().get('logiztik_params')}, "
+                       f"ключ: {_settings().get('logiztik_auth2')}).\n"
                        f"AWB за 4 дня: {len(rec)}\n" + "\n".join(f"• {x['awb']} · {x['date']} · {x['country']}" for x in rec)
                        + "\n\n/logiztik sync — внести новые поставки сейчас (дальше бот делает это сам 5 раз в день).")
     except Exception as e:

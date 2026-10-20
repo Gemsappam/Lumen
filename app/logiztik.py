@@ -19,74 +19,122 @@ TOKEN = os.getenv("LOGIZTIK_TOKEN", "").strip()
 CUSTOMER = os.getenv("LOGIZTIK_CUSTOMER", "").strip()
 BASE = os.getenv("LOGIZTIK_BASE", "https://cloud.logiztikalliance.com:5005/logCloudWS/api").rstrip("/")
 
-# the docs don't say where the key goes — try the usual places once, remember what worked
-AUTH_MODES = ["AuthenticationToken", "Api-Key", "ApiKey", "Authorization", "Bearer", "query"]
+# The docs show {CUSTOMERCODE}/{DATE} in the path but don't say where the key goes, and the live server answered
+# «ErrorParametrosFaltantesFechaCodigo» to the path form. So: try path / query / headers × key placements once,
+# remember the combination that gets past «missing parameters» and «unauthorized».
+AUTH_MODES = ["AuthenticationToken", "query", "Api-Key", "ApiKey", "Authorization", "Bearer"]
+PARAM_MODES = ["path", "header", "query", "path+header", "path+query"]
 
 
 def enabled() -> bool:
     return bool(TOKEN and CUSTOMER)
 
 
-def _mode() -> str | None:
+def _modes():
     from .api import _settings
-    return _settings().get("logiztik_auth")
+    st = _settings()
+    return st.get("logiztik_auth2"), st.get("logiztik_params"), st.get("logiztik_datefmt") or "%Y-%m-%d"
 
 
-def _save_mode(m: str):
+def _save_modes(a: str, p: str, dfmt: str):
     from .api import _settings, SETTINGS
-    SETTINGS.write_text(json.dumps({**_settings(), "logiztik_auth": m}, ensure_ascii=False))
+    SETTINGS.write_text(json.dumps({**_settings(), "logiztik_auth2": a, "logiztik_params": p,
+                                    "logiztik_datefmt": dfmt}, ensure_ascii=False))
 
 
-def _req(mode: str, url: str):
+def _build(endpoint: str, params: list, auth: str, pmode: str):
+    """params = [(name, value), …] in path order."""
+    from urllib.parse import quote, urlencode
+    url = f"{BASE}/{endpoint}"
     h = {"Accept": "application/json", "Content-Type": "application/json"}
-    if mode == "Bearer":
+    q = {}
+    if "path" in pmode:
+        url += "".join("/" + quote(str(v), safe="") for _n, v in params)
+    if "header" in pmode:
+        for n, v in params:
+            h[n] = str(v)
+    if "query" in pmode:
+        q.update({n: str(v) for n, v in params})
+    if auth == "Bearer":
         h["Authorization"] = f"Bearer {TOKEN}"
-    elif mode == "query":
-        url += ("&" if "?" in url else "?") + f"authenticationToken={TOKEN}"
+    elif auth == "query":
+        q["authenticationToken"] = TOKEN
     else:
-        h[mode] = TOKEN
+        h[auth] = TOKEN
+    if q:
+        url += "?" + urlencode(q)
     return url, h
 
 
-async def _get(path: str):
-    """-> parsed JSON. Raises RuntimeError with Logiztik's own message."""
-    url0 = f"{BASE}/{path}"
-    modes = [_mode()] if _mode() else AUTH_MODES
-    last = ""
+def _kind(data, status) -> str:
+    """ok / auth / missing / datefmt / other"""
+    if isinstance(data, list):
+        return "ok"
+    txt = json.dumps(data, ensure_ascii=False) if not isinstance(data, str) else data
+    low = txt.lower()
+    if status == 401 or "unauthorized" in low or "autoriz" in low:
+        return "auth"
+    if "faltante" in low or "missing" in low:
+        return "missing"
+    if "format" in low and ("date" in low or "fecha" in low):
+        return "datefmt"
+    if isinstance(data, dict) and (data.get("error") or data.get("mensaje")):
+        return "other"
+    return "ok"
+
+
+async def _fetch(http, url, h):
+    try:
+        async with http.get(url, headers=h, ssl=(ssl.create_default_context() if url.startswith('https') else None)) as r:
+            txt, status = await r.text(), r.status
+    except Exception as e:
+        raise RuntimeError(f"нет связи с Logiztik ({type(e).__name__}: {str(e)[:150]}) — "
+                           "возможно, хостинг не пускает на порт 5005 или нужен IP в белом списке")
+    try:
+        return json.loads(txt), status
+    except ValueError:
+        return txt.strip().strip('"'), status
+
+
+async def _call(endpoint: str, params: list, date_param: int | None = None):
+    """-> list. date_param = index of the date in params (its format may need to change)."""
+    a0, p0, dfmt = _modes()
+    combos = ([(a0, p0)] if a0 and p0 else []) + [(a, p) for p in PARAM_MODES for a in AUTH_MODES if (a, p) != (a0, p0)]
+    tried, seen = [], {}
     timeout = aiohttp.ClientTimeout(total=40)
     async with aiohttp.ClientSession(timeout=timeout) as http:
-        for mode in modes:
-            url, h = _req(mode, url0)
-            try:
-                async with http.get(url, headers=h, ssl=ssl.create_default_context()) as r:
-                    txt = await r.text()
-            except Exception as e:
-                raise RuntimeError(f"нет связи с Logiztik ({type(e).__name__}: {str(e)[:150]}) — "
-                                   "возможно, хостинг не пускает на порт 5005 или нужен IP в белом списке")
-            try:
-                data = json.loads(txt)
-            except ValueError:
-                data = txt.strip().strip('"')
-            if data == "Unauthorized" or r.status == 401:
-                last = "Unauthorized — токен не подошёл"
-                continue
-            if not _mode():
-                _save_mode(mode)
-            if isinstance(data, dict) and (data.get("error") or data.get("mensaje")):
-                raise RuntimeError(f"Logiztik: {data.get('error') or data.get('mensaje')}")
-            return data
-    raise RuntimeError(last or "Logiztik не ответил")
+        for fmt in ([dfmt] + ([f for f in ("%Y/%m/%d", "%Y-%m-%d") if f != dfmt] if date_param is not None else [])):
+            ps = [(n, (v.strftime(fmt) if (k == date_param and hasattr(v, "strftime")) else v))
+                  for k, (n, v) in enumerate(params)]
+            for a, p in combos:
+                url, h = _build(endpoint, ps, a, p)
+                data, status = await _fetch(http, url, h)
+                k = _kind(data, status)
+                seen[k] = data
+                tried.append(f"{p}/{a}:{k}")
+                if k in ("auth", "missing"):
+                    continue
+                if k == "datefmt":
+                    break
+                if (a, p, fmt) != (a0, p0, dfmt):
+                    _save_modes(a, p, fmt)
+                if k == "other":
+                    raise RuntimeError(f"Logiztik: {data.get('error') or data.get('mensaje')}")
+                return data if isinstance(data, list) else []
+    msg = seen.get("missing") or seen.get("auth") or seen.get("datefmt") or "нет ответа"
+    raise RuntimeError(f"Logiztik не принял запрос ни в одном варианте ({msg}). Проверено: {len(tried)} вариантов. "
+                       "Спроси у них пример запроса (curl) — куда класть токен, код клиента и дату.")
 
 
 async def shipments(day: date) -> list[dict]:
-    d = await _get(f"ClientesExternosA/ListarTotalesGuiasPorClienteV2/{CUSTOMER}/{day:%Y-%m-%d}")
-    return d if isinstance(d, list) else []
+    return await _call("ClientesExternosA/ListarTotalesGuiasPorClienteV2",
+                       [("CustomerCode", CUSTOMER), ("Date", day)], date_param=1)
 
 
 async def barcodes(awb: str) -> list[dict]:
     nr = "".join(ch for ch in awb if ch.isdigit()) or awb
-    d = await _get(f"v2/ClientesExternosA/ListarCodigosDeBarraPorClienteNew/{CUSTOMER}/{nr}")
-    return d if isinstance(d, list) else []
+    return await _call("v2/ClientesExternosA/ListarCodigosDeBarraPorClienteNew",
+                       [("CustomerCode", CUSTOMER), ("ShipmentNr", nr)])
 
 
 def _num(v) -> float:
