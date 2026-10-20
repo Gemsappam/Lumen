@@ -1749,7 +1749,7 @@ async def viewer_upload(m: Message):
     await m.answer("У тебя роль «1С оператор» — только просмотр. Отчёт: /excel или «Учёт» → «Excel в чат».")
 
 
-@dp.message(pv, wr, F.from_user.id.func(lambda i: bool(FLOW.get(i, {}).get("bal_wait"))), F.text)
+@dp.message(pv, wr, F.from_user.id.func(lambda i: bool(FLOW.get(i, {}).get("bal_wait"))), F.text.func(lambda t: not t.startswith("/")))
 async def balance_answer(m: Message):
     """Farm balance BEFORE this shipment, typed: «+48», «-100», «0», or «Agriflora +48» per line."""
     from .api import adjust_farm_balance
@@ -1774,7 +1774,7 @@ async def balance_answer(m: Message):
     await _step(m.from_user.id, head="✓ Баланс до поставки: " + "; ".join(done))
 
 
-@dp.message(pv, wr, F.text.func(lambda t: bool(re.search(r"(?:9\d|1[0-4]\d)\s*[.,x×*]\s*\d{2}\s*[.,x×*]\s*\d{2}(?!\d)", t or ""))))
+@dp.message(pv, wr, F.text.func(lambda t: not (t or "").startswith("/") and bool(re.search(r"(?:9\d|1[0-4]\d)\s*[.,x×*]\s*\d{2}\s*[.,x×*]\s*\d{2}(?!\d)", t or ""))))
 async def weights_message(m: Message):
     """Expolanka weights from WhatsApp ('Zeeflora - 11 - 100.48.25 …') -> volumetric kg per farm."""
     from .api import learn_dims, volumetric_breakdown
@@ -1804,7 +1804,7 @@ async def weights_message(m: Message):
     await m.answer(txt + "\n\nНапиши MAWB этой отправки — сохраню как разбивку.")
 
 
-@dp.message(pv, wr, F.text.func(lambda t: any(money_from_text(t)) and not ai.find_mawb(t)))
+@dp.message(pv, wr, F.text.func(lambda t: not (t or "").startswith("/") and any(money_from_text(t)) and not ai.find_mawb(t)))
 async def money_followup(m: Message):
     flow = FLOW.get(m.from_user.id)
     if flow and time.time() - flow["ts"] < 60 * 60:
@@ -1898,7 +1898,7 @@ async def set_topup(c: CallbackQuery):
     await c.answer()
 
 
-@dp.message(pv, wr, F.text.func(lambda t: bool(ai.find_mawb(t))))
+@dp.message(pv, wr, F.text.func(lambda t: not (t or "").startswith("/") and bool(ai.find_mawb(t))))
 async def mawb_followup(m: Message):
     """MAWB sent as a separate message right after a document -> goes into that draft.
     MAWB + 'Farm kg' pairs in one message -> a kg breakdown for that MAWB."""
