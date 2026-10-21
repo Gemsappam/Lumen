@@ -2284,7 +2284,8 @@ async def export_transit(uid: int = Depends(user_id)):
                        "Статус оплаты": "оплачен" if want == "paid" else "НЕ оплачен",
                        "Пополнение": i.get("topup") or "", "Оплачено $": i.get("usd_paid") if want == "paid" else i.get("est_usd"),
                        "Машина": i.get("truck") or "", "Прибытие": eta,
-                       "Точность": "≈ ±10%" if i.get("approx") else "точно"}
+                       "Точность": (("≈ ±10%" if i.get("approx_big") else "≈ ±1–3%")
+                                    + (f" ({i['approx_why']})" if i.get("approx_why") else "")) if i.get("approx") else "точно"}
                 for c, h in enumerate(head, 1):
                     x = ws.cell(r, c, row[h]); x.font = Font(name=F_); x.border = box
                     if h.endswith("₽/ст"):
