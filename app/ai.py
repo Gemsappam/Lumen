@@ -285,6 +285,33 @@ def find_mawb(text: str | None) -> str | None:
     return f"{m.group(1)}-{m.group(2)}{m.group(3)}" if m else None
 
 
+STATUS_TOOL = {
+    "name": "truck_status",
+    "description": "Статус груза от ТК МСК (Floratrack): что произошло с какими AWB.",
+    "input_schema": {"type": "object", "properties": {
+        "kind": {"type": "string", "enum": ["loaded", "eta", "arrived", "border", "other"],
+                 "description": "loaded — товар забран/загружен в машину; eta — машина едет на склад, время прибытия; "
+                                "arrived — уже прибыл на склад; border — прошла границу; other — не про статус груза"},
+        "truck": {"type": ["string", "null"], "description": "номер машины, например NUA544/KI411"},
+        "awbs": {"type": "array", "items": {"type": "string"}, "description": "все AWB/MAWB, 11 цифр, как 369-11529125"},
+        "time": {"type": ["string", "null"], "description": "время прибытия/события HH:MM (для диапазона — позднее)"},
+        "date": {"type": ["string", "null"], "description": "дата события ДД.ММ, если указана"},
+        "boxes": {"type": ["integer", "null"], "description": "кол-во мест, если одно на всех"},
+        "text": {"type": "string", "description": "текст с картинки дословно (или суть ответа)"}},
+        "required": ["kind", "awbs", "text"]}}
+
+
+async def read_truck_status(data: bytes | None = None, mime: str = "image/jpeg", text: str = "") -> dict:
+    """A Floratrack status sent as a PICTURE (or an admin's own words about it) -> structured status."""
+    if not client:
+        raise RuntimeError("нет ключа AI")
+    content = ([*_blocks(data, mime)] if data else []) + [{"type": "text", "text": (
+        "Это статус груза от ТК МСК (Floratrack) — картинка или слова оператора. Определи, что произошло, с какими AWB, "
+        "машина, время. Если это не статус груза (реклама, другой документ) — kind=other."
+        + (f"\n\nСлова оператора: {text}" if text else ""))}]
+    return await _structured(PARSE_MODEL, "Ты читаешь статусы перевозчика для учёта цветов.", content, STATUS_TOOL, 2000)
+
+
 async def parse_document(data: bytes, mime: str, farms: list[dict], catalog: list[str], note: str = "",
                          more: list | None = None) -> dict:
     """more = [(bytes, mime), …]: other files of the SAME document (invoice + packing list in two files)."""

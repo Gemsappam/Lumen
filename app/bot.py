@@ -133,6 +133,12 @@ async def _ai_status(uid: int):
     p["status"] = await bot.send_message(uid, txt, reply_markup=_ai_kb())
 
 
+@dp.message(pv, wr, F.reply_to_message.func(lambda r: r is not None), F.text,
+            F.func(lambda m: (m.from_user.id, m.reply_to_message.message_id) in STATUSASK))
+async def status_answer(m: Message):
+    await _status_answer(m)
+
+
 @dp.message(pv, wr, F.from_user.id.func(lambda i: i in AISESSION), F.document | F.photo)
 async def ai_collect_file(m: Message):
     p = AISESSION[m.from_user.id]
@@ -1641,7 +1647,14 @@ async def doc(m: Message):
 @dp.message(pv, wr, F.photo)
 async def photo(m: Message):
     f = await bot.download(m.photo[-1])
-    await _parse_and_reply(m, f.read(), "image/jpeg")
+    data = f.read()
+    if m.forward_origin and not m.caption:            # forwarded picture: maybe a TK MSK status, not an invoice
+        try:
+            if await truck_photo(data, "image/jpeg", "", notify_uid=m.from_user.id):
+                return
+        except Exception as e:
+            print(f"[lumen] fwd photo status: {e}", flush=True)
+    await _parse_and_reply(m, data, "image/jpeg")
 
 
 @dp.channel_post(F.text.startswith("/id"))
@@ -2907,6 +2920,82 @@ async def _truck_event(uid_list, text: str, sent_msk, notify_uid=None):
     return True
 
 
+def _synth_truck_text(st: dict):
+    """Structured status (from a picture / an admin's words) -> text in Floratrack's own wording -> the usual parser.
+    Returns (text, sent_msk) or (None, None)."""
+    from .ai import find_mawb
+    awbs = [a for a in (find_mawb(x) for x in st.get("awbs") or []) if a]
+    kind, truck = st.get("kind"), (st.get("truck") or "").strip()
+    now = _msk_now()
+    when = now
+    if st.get("time") and re.match(r"^\d{1,2}[:.]\d{2}$", st["time"].strip()):
+        hh, mm = re.split(r"[:.]", st["time"].strip())
+        when = now.replace(hour=int(hh) % 24, minute=int(mm), second=0, microsecond=0)
+        if st.get("date") and re.match(r"^\d{1,2}\.\d{1,2}", st["date"]):
+            d, mo = st["date"].split(".")[:2]
+            try:
+                when = when.replace(day=int(d), month=int(mo))
+            except ValueError:
+                pass
+    tr = f"Машина {truck} " if truck else "Груз "
+    if kind == "loaded" and awbs:
+        return ("Ваш импортный товар забран: " + " ".join(f"Номер AWB: {a}" for a in awbs)
+                + (f" кол-во. мест: {st['boxes']}." if st.get("boxes") else "")
+                + (f" загружен в машину {truck}" if truck else "")), now
+    if kind in ("eta", "arrived") and awbs:
+        t = when.strftime("%H:%M")
+        sent = when if kind == "arrived" else now   # «already arrived at 14:00» must not jump to tomorrow
+        if kind == "arrived":
+            sent = when - timedelta(minutes=1)
+        return (tr + f"едет на склад Химки, предварительное время прибытия на склад к {t} "
+                + " ".join(f"AWB {a}" for a in awbs)), sent
+    if kind == "border":
+        return (tr + "прошла границу"), now
+    return None, None
+
+
+STATUSASK: dict = {}     # (uid, bot message id) -> True: «what is this Floratrack picture?» waiting for words
+
+
+async def truck_photo(data: bytes, mime: str, chat_title: str, notify_uid=None) -> bool:
+    """A status picture from the TK MSK chat (or forwarded to the bot): read it; can't -> ask the admins."""
+    from . import ai as _ai
+    try:
+        st = await _ai.read_truck_status(data, mime)
+    except Exception as e:
+        print(f"[lumen] truck photo: {e}", flush=True)
+        st = {"kind": "other"}
+    txt, sent = _synth_truck_text(st)
+    if txt and await _truck_event(_money_people(), txt, sent, notify_uid=notify_uid):
+        return True
+    if notify_uid is not None and st.get("kind") == "other":
+        return False                                   # forwarded picture that isn't a status -> normal document flow
+    from aiogram.types import BufferedInputFile
+    for uid in ([notify_uid] if notify_uid else _money_people()):
+        try:
+            msg = await bot.send_photo(uid, BufferedInputFile(data, "status.jpg"),
+                                       caption=f"🚚 ТК МСК прислал картинку{(' в «' + chat_title + '»') if chat_title else ''} — "
+                                               "не понял, что на ней. Ответь на это сообщение словами: что это и что "
+                                               "прибыло, например «369-11529125 прибыл сегодня 14:00» или «машина NUA544 "
+                                               "загрузила 065-45086624». Если это не статус — «пропустить».")
+            STATUSASK[(uid, msg.message_id)] = True
+        except Exception:
+            pass
+    return True
+
+
+async def _status_answer(m: Message):
+    STATUSASK.pop((m.from_user.id, m.reply_to_message.message_id), None)
+    if re.search(r"пропуст|не статус|skip", m.text or "", re.I):
+        await m.answer("Ок, пропускаю эту картинку.")
+        return
+    from . import ai as _ai
+    st = await _ai.read_truck_status(text=m.text or "")
+    txt, sent = _synth_truck_text(st)
+    if not txt or not await _truck_event(_money_people(), txt, sent, notify_uid=m.from_user.id):
+        await m.answer("Не понял статус. Напиши, например: «369-11529125 прибыл сегодня 14:00».")
+
+
 async def _flush_truck(uid: int):
     await asyncio.sleep(4)                       # forwarded messages arrive one by one — wait for the batch
     items = sorted(_TRUCK_BUF.pop(uid, []), key=lambda x: x[0])
@@ -3029,6 +3118,23 @@ async def reader_join_marking(c: CallbackQuery):
     await c.message.edit_text(f"✅ «{title}» — чат клиента {mk}. Статусы его грузов будут приходить туда.")
 
 
+@grp.message(F.photo)
+async def group_photo(m: Message):
+    await process_group_photo(bot, m)
+
+
+async def process_group_photo(any_bot, m: Message):
+    """Picture in an approved TK MSK chat -> read the status from it."""
+    from .api import _settings
+    if m.chat.id not in (_settings().get("ft_chats") or []):
+        return
+    cap = m.caption or ""
+    if cap and re.search(r"товар\s+забран|едет на склад|время прибытия|прошла границу", cap, re.I):
+        return                                        # the caption already has the status text
+    f = await any_bot.download(m.photo[-1])
+    await truck_photo(f.read(), "image/jpeg", m.chat.title or "")
+
+
 @grp.message(F.text)
 async def group_text(m: Message):
     from datetime import timedelta
@@ -3076,7 +3182,7 @@ async def autolog_cmd(m: Message):
         return
     txt = "🤖 Что бот поменял сам (последние 20). Отменить — в приложении: Ещё → «Что бот поменял».\n\n" + "\n".join(
         f"{'↩️ ' if r['undone'] else ''}{r['ts']} · {r['farm'] or '—'}"
-        + (f" · {r['label']}: {r['old'] or 'пусто'} → {r['new'] or 'пусто'}" if r['field'] != 'merge' else f" · {r['new']}")
+        + (f" · {r['label']}: {r['old'] or 'пусто'} → {r['new'] or 'пусто'}" if r['field'] not in ('merge', 'line_kg') else f" · {r['new']}")
         + f"\n   ↳ {r['reason']}" for r in rows)
     await m.answer(txt[:4000])
 

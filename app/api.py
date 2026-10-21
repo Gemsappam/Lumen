@@ -1110,6 +1110,7 @@ def save_invoice(body: InvoiceIn, inv_id: int | None = None, uid: int = Depends(
         if fm:
             body.farm = fm.name
     body.awb = find_mawb(body.awb) or body.awb.strip()   # one spelling everywhere: 065-40538245
+    hand_kg = {l.name for l in body.lines if l.weight_kg} if inv_id else set()
     _apply_box_rules(body)
     prices = {round(l.price_usd, 4) for l in body.lines if l.stems}
     if not inv_id and len(prices) == 1 and len(body.lines) > 1:
@@ -1133,6 +1134,10 @@ def save_invoice(body: InvoiceIn, inv_id: int | None = None, uid: int = Depends(
         s.add(inv); s.commit(); s.refresh(inv)
         for l in body.lines:
             s.add(Line(invoice_id=inv.id, **l.model_dump()))
+        if hand_kg:
+            from .autolog import lock as _lock
+            for n in hand_kg:
+                _lock(inv.id, f"linekg:{n}")
         _fill_weight_from_logistics(s, inv)
         s.commit()
         if not inv.topup_id and not getattr(inv, "via_broker", False):
@@ -1728,15 +1733,85 @@ def farms(uid: int = Depends(user_id)):
         return s.exec(select(Farm).order_by(Farm.country, Farm.name)).all()
 
 
+# ---------- вес коробки по строкам ----------------------------------------------------------
+def reapply_box_rules(farm: str) -> int:
+    """Farm rule changed -> recompute fixed box kg on this farm's invoices still in transit.
+    Lines a person set by hand (🔒) are left alone. Returns how many lines changed."""
+    from types import SimpleNamespace
+    from .autolog import locked, note
+    n = 0
+    with session() as s:
+        fkeys = _farm_keys(s, farm)
+        invs = [i for i in s.exec(select(Invoice)).all() if _norm_name(i.farm) in fkeys and not i.arrived_at]
+        for inv in invs:
+            ls = s.exec(select(Line).where(Line.invoice_id == inv.id)).all()
+            free = [l for l in ls if not locked(inv.id, f"linekg:{l.name}")]
+            fake = SimpleNamespace(farm=inv.farm, lines=[SimpleNamespace(name=l.name, boxes=l.boxes, stems=l.stems,
+                                                                         weight_kg=None) for l in free])
+            _apply_box_rules(fake)
+            for l, fl in zip(free, fake.lines):
+                if (l.weight_kg or None) != (fl.weight_kg or None):
+                    note(s, inv.id, inv.farm, inv.awb, "line_kg",
+                         f"{l.name}: кг {l.weight_kg or 'по стеблям'} → {fl.weight_kg or 'по стеблям'}",
+                         "изменили правило веса коробки у фермы")
+                    l.weight_kg = fl.weight_kg
+                    s.add(l); n += 1
+        s.commit()
+    if n:
+        from .backup import mark_dirty
+        mark_dirty()
+    return n
+
+
+class BoxKgIn(BaseModel):
+    kg_per_box: float | None = None    # None / 0 = back to «по стеблям»
+    remember: bool = False
+
+
+@router.post("/lines/{line_id}/boxkg")
+def set_line_box_kg(line_id: int, body: BoxKgIn, uid: int = Depends(writer)):
+    from .autolog import lock
+    with session() as s:
+        l = s.get(Line, line_id)
+        if not l:
+            raise HTTPException(404, "Строка не найдена")
+        inv = s.get(Invoice, l.invoice_id)
+        kg = body.kg_per_box if body.kg_per_box and body.kg_per_box > 0 else None
+        l.weight_kg = round(kg * max(1.0, float(l.boxes or 0)), 3) if kg else None
+        s.add(l); s.commit()
+        name, farm, inv_id = l.name, inv.farm, inv.id
+        if body.remember:
+            ff = resolve_farm(s, farm)
+            if ff:
+                rules = json.loads(ff.box_kg_json or "{}")
+                if kg:
+                    rules[name] = kg
+                else:
+                    rules.pop(name, None)
+                ff.box_kg_json = json.dumps(rules, ensure_ascii=False)
+                s.add(ff); s.commit()
+    lock(inv_id, f"linekg:{name}")
+    if body.remember:
+        reapply_box_rules(farm)
+    from .backup import mark_dirty
+    mark_dirty()
+    return transit_view()
+
+
 @router.post("/farms")
 def save_farm(body: FarmIn, farm_id: int | None = None, uid: int = Depends(writer)):
     with session() as s:
         f = s.get(Farm, farm_id) if farm_id else Farm(**body.model_dump())
+        old_rules = f.box_kg_json if farm_id else "{}"
         if farm_id:
             for k, v in body.model_dump().items():
                 setattr(f, k, v)
         s.add(f); s.commit(); s.refresh(f)
-        return f
+        name, changed = f.name, (old_rules or "{}") != (f.box_kg_json or "{}")
+        out = f.model_dump()
+    if changed:
+        reapply_box_rules(name)
+    return out
 
 
 @router.post("/parse")
@@ -2010,7 +2085,7 @@ def transit_ids(invs) -> set:
     return keep
 
 
-def transit_view(s=None) -> dict:
+def transit_view(s=None, q: str | None = None) -> dict:
     """Everything not arrived yet: paid (in a top-up) and unpaid, with ≈ cost per stem.
     Missing freight is estimated per leg:
       Kenya  — copy of the previous shipment of this farm & this item (Expolanka and/or Floratrack)
@@ -2027,7 +2102,13 @@ def transit_view(s=None) -> dict:
         for l in lines:
             by_inv[l.invoice_id].append(l)
         keep = transit_ids(invs)
-        moving = [i for i in invs if i.id in keep]
+        if q and q.strip():                  # search: ANY invoice by MAWB digits or farm name, closed ones too
+            qd, ql = re.sub(r"\D", "", q), q.strip().lower()
+            moving = [i for i in invs if (len(qd) >= 3 and qd in norm_awb(i.awb or ""))
+                      or (not qd and ql in (i.farm or "").lower())]
+            moving = sorted(moving, key=lambda i: -i.id)[:80]
+        else:
+            moving = [i for i in invs if i.id in keep]
         ft_rate = None
         out = []
         for i in sorted(moving, key=lambda x: (norm_awb(x.awb), x.id)):
@@ -2093,6 +2174,11 @@ def transit_view(s=None) -> dict:
             legs_est = any((norm_awb(i.awb), leg) in res.estimated_legs for leg in ("air", "msk"))
             if (has_air or has_msk) and not notes:
                 notes.append("по счетам" + (" (часть приблизительно)" if legs_est else ""))
+            fixed_kg = sum(l.weight_kg or 0 for l in ls)
+            rest_st = sum(l.stems for l in ls if not l.weight_kg) or 1
+            rest_kg = (i.weight_kg - fixed_kg) if i.weight_kg and i.weight_kg > fixed_kg else None
+            kg_eff = {l.id: (round(l.weight_kg, 2) if l.weight_kg else
+                             (round(rest_kg * l.stems / rest_st, 2) if rest_kg is not None else None)) for l in ls}
             rows = []
             flower_rub = logi_rub = air_rub = msk_rub = 0.0
             for l in ls:
@@ -2100,7 +2186,9 @@ def transit_view(s=None) -> dict:
                 lg = sum(est[l.id])
                 air_rub += est[l.id][0] * l.stems
                 msk_rub += est[l.id][1] * l.stems
-                rows.append({**l.model_dump(), "price_rub": round(c.price_rub, 2), "logi_rub": round(lg, 2),
+                rows.append({**l.model_dump(), "kg_eff": kg_eff.get(l.id), "kg_fixed": bool(l.weight_kg),
+                             "kg_box": (round(l.weight_kg / max(1.0, float(l.boxes or 0)), 2) if l.weight_kg else None),
+                             "price_rub": round(c.price_rub, 2), "logi_rub": round(lg, 2),
                              "air_rub": round(est[l.id][0], 2), "msk_rub": round(est[l.id][1], 2),
                              "total_rub": round(c.price_rub + lg, 2)})
                 flower_rub += c.price_rub * l.stems
@@ -2122,6 +2210,7 @@ def transit_view(s=None) -> dict:
                         "topup": tdate.get(i.topup_id) or ("брокер" if getattr(i, "via_broker", False) else None),
                         "rub_goods": round(res.invoice_rub.get(i.id) or flower_rub), "rub_logi": round(logi_rub),
                         "avg_rub": round((flower_rub + logi_rub) / st, 2), "approx": approx, "approx_why": approx_why,
+                        "kg_fixed": round(fixed_kg, 2), "kg_rest": (round(rest_kg, 2) if rest_kg is not None else None),
                         "approx_big": (not paid_now) or approx_legs,
                         "logi_source": ("; ".join(notes) or "нет данных").replace("Expolanka", "ТК Кения").replace("Floratrack", "ТК МСК"),
                         "legs": {"air": {"name": "ТК Кения", "rub": round(air_rub), "per": round(air_rub / st, 4), "src": src["air"]},
@@ -2347,8 +2436,8 @@ def post_autolog_undo(log_id: int, uid: int = Depends(writer)):
 
 
 @router.get("/transit")
-def get_transit(uid: int = Depends(user_id)):
-    return transit_view()
+def get_transit(q: str | None = None, uid: int = Depends(user_id)):
+    return transit_view(q=q)
 
 
 class PayIn(BaseModel):

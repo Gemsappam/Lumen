@@ -84,8 +84,13 @@ def build():
         await m.reply("Статусы сюда больше не отправляю." + (f" ({', '.join(gone)})" if gone else ""))
 
     async def _take(m: Message):
-        from .bot import process_group_text
+        from .bot import process_group_text, process_group_photo
         text = m.text or m.caption or ""
+        if m.photo:
+            try:
+                await process_group_photo(rbot, m)
+            except Exception as e:
+                print(f"[lumen] reader photo: {e}", flush=True)
         SEEN.append({"chat": m.chat.title or str(m.chat.id), "chat_id": m.chat.id,
                      "from": (m.from_user.full_name if m.from_user else (m.sender_chat.title if m.sender_chat else "?")),
                      "bot": bool(m.from_user and m.from_user.is_bot),

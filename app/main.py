@@ -461,7 +461,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-20g · команды с номером MAWB больше не перехватываются (/logiztik awb, /awb)"
+VERSION = "2026-10-21a · поиск по MAWB в «В пути»; вес коробки по строкам; статусы ТК МСК с картинок"
 
 
 async def _once_recalc_true_rate():
