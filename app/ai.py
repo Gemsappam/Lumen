@@ -301,6 +301,36 @@ STATUS_TOOL = {
         "required": ["kind", "awbs", "text"]}}
 
 
+ANALYZE_TOOL = {
+    "name": "document_analysis",
+    "description": "What an unfamiliar document is and what it means for our books.",
+    "input_schema": {"type": "object", "properties": {
+        "what": {"type": "string", "description": "что это за документ, одной строкой (по-русски)"},
+        "summary": {"type": "string", "description": "суть для бухгалтера: суммы, даты, кто кому должен — 2-6 строк"},
+        "differences": {"type": "array", "items": {"type": "string"},
+                        "description": "что НЕ сходится с нашим учётом (конкретно: инвойс, сумма, MAWB)"},
+        "actions": {"type": "array", "description": "что предлагаешь сделать в учёте (только если уверен)", "items": {
+            "type": "object", "properties": {
+                "type": {"type": "string", "enum": ["mark_paid", "freight_credit", "none"]},
+                "farm": {"type": ["string", "null"]}, "invoice_no": {"type": ["string", "null"]},
+                "awb": {"type": ["string", "null"]}, "provider": {"type": ["string", "null"]},
+                "amount_usd": {"type": ["number", "null"]}, "reason": {"type": "string"}},
+            "required": ["type", "reason"]}}},
+        "required": ["what", "summary"]}}
+
+
+async def analyze_document(data: bytes, mime: str, books: str, note: str = "") -> dict:
+    """Strong model for a document the normal reader didn't recognise: explain it and propose actions (never applies)."""
+    if not client:
+        raise RuntimeError("нет ключа AI")
+    content = [*_blocks(data, mime), {"type": "text", "text": (
+        "Обычный разбор не узнал этот документ. Разберись сам: что это, что из него следует для нашего учёта, "
+        "что не сходится с нашими данными ниже. Предлагай действия только если уверен: mark_paid — ферма считает "
+        "инвойс оплаченным, а у нас он не оплачен; freight_credit — перевозчик даёт кредит/скидку по MAWB.\n\n"
+        + (f"Пояснение оператора: {note}\n\n" if note.strip() else "") + "НАШ УЧЁТ (последние 75 дней):\n" + books)}]
+    return await _structured(AUDIT_MODEL, DOMAIN, content, ANALYZE_TOOL, 6000)
+
+
 async def read_truck_status(data: bytes | None = None, mime: str = "image/jpeg", text: str = "") -> dict:
     """A Floratrack status sent as a PICTURE (or an admin's own words about it) -> structured status."""
     if not client:

@@ -253,6 +253,10 @@ async def _ai_run(uid: int, files: list, note: str, msg):
                   summary=f"{out.get('farm') or ''} {out.get('invoice_no') or ''} MAWB {out.get('awb') or '?'} (/ai)")
     if len(files) == 1:
         _fix_remember(uid, up_id, d0, m0, note, msg)
+    if out.get("doc_type") in ("other", "awb"):
+        if not await _smart(uid, d0, m0, note, msg):
+            await _send(uid, "Не узнал документ.", None, msg)
+        return
     if out.get("doc_type") not in ("farm_invoice", "freight_invoice"):
         await _send(uid, f"Прочитал как «{out.get('doc_type')}». В режиме /ai пока разбираю инвойсы ферм и счета ТК "
                          "(в т.ч. кредит-ноты) — такой документ пришли обычным сообщением.", None, msg)
@@ -610,7 +614,59 @@ def _record(m: Message, kind: str = "") -> int:
         return 0
 
 
+async def _smart(uid: int, data: bytes, mime: str, note_text: str, note_msg) -> bool:
+    """Document the normal reader didn't recognise -> strong AI explains + proposes buttons. False = didn't run."""
+    from . import smart
+    if not smart.allowed():
+        await _send(uid, "Не узнал документ, а лимит разборов сильным ИИ на сегодня исчерпан (15). "
+                         "Пришли с подписью, что это, или завтра.", None, note_msg)
+        return True
+    try:
+        await _send(uid, "🧠 Обычный разбор не узнал документ — отдаю сильному ИИ, до пары минут…", None, note_msg)
+        txt, buttons = await smart.analyze(data, mime, note_text)
+    except Exception as e:
+        print(f"[lumen] smart: {e}", flush=True)
+        return False
+    await _send(uid, txt[:4000], _kb([[b] for b in buttons[:8]]) if buttons else None, note_msg)
+    return True
+
+
+@dp.callback_query(F.data.startswith("sc:"), wr)
+async def smart_credit(c: CallbackQuery):
+    from . import smart
+    await c.answer()
+    try:
+        txt = smart.apply_credit(c.data.split(":", 1)[1])
+    except Exception as e:
+        txt = f"❌ {e}"
+    await bot.send_message(c.from_user.id, txt)
+
+
+STMTWAIT: dict = {}   # user -> farm: the next document is that farm's statement of account
+
+
+def _looks_like_statement(data: bytes, mime: str) -> bool:
+    if not mime.startswith("text/"):
+        return False
+    head = data[:3000].decode("utf-8", errors="ignore")
+    return bool(re.search(r"statement\s+of\s+account|estado\s+de\s+cuenta|account\s+statement", head, re.I))
+
+
+async def _statement(m: Message, data: bytes, mime: str, holder: dict):
+    from . import statement
+    farm = STMTWAIT.pop(m.from_user.id, "")
+    note = await m.answer("📄 Читаю стейтмент фермы…")
+    holder["note"] = note
+    _record(m, kind="farm_statement")
+    parsed = await statement.parse(data, mime)
+    txt, buttons = statement.reconcile(parsed, farm)
+    await _send(m.from_user.id, txt[:4000], _kb([[b] for b in buttons[:10]]) if buttons else None, note)
+
+
 async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dict):
+    if m.from_user.id in STMTWAIT or _looks_like_statement(data, mime):
+        await _statement(m, data, mime, holder)
+        return
     if m.from_user.id in BOXWAIT:
         iid = BOXWAIT.pop(m.from_user.id)
         note = await m.answer("Читаю детализацию по коробкам…")
@@ -638,7 +694,12 @@ async def _parse_and_reply_inner(m: Message, data: bytes, mime: str, holder: dic
         from .api import merge_lines
         out = merge_lines(out)
     except Exception as e:
-        await note.edit_text(f"Не смог прочитать: {e}")
+        if "OpenRouter" in str(e) or not await _smart(m.from_user.id, data, mime, m.caption or "", note):
+            await note.edit_text(f"Не смог прочитать: {e}")
+        return
+    if out.get("doc_type") in ("other", "awb"):
+        if not await _smart(m.from_user.id, data, mime, m.caption or "", note):
+            await note.edit_text("Не узнал документ. Пришли с подписью, что это, или через /ai.")
         return
     warn = ("\n⚠️ " + "\n⚠️ ".join(out["warnings"])) if out.get("warnings") else ""
     if warn and out.get("doc_type") == "farm_invoice":
@@ -1301,7 +1362,8 @@ async def _step(uid: int, head: str = ""):
     head = (head + "\n\n") if head else ""
     freight = flow["kind"] == "freight_invoice"
     if flow["paid"] is None:
-        await _send(uid, head + "Оплачен?", _kb([[("✅ Оплачен", "fl:paid"), ("🚚 Не оплачен — в пути", "fl:unpaid")]] + ([[("↩️ Назад", "fl:back")]] if flow.get("hist") else []) + _fix_rows(flow.get("up")) + [[("✖️ Отменить (останется в черновиках)", "fl:cancel")]]), note)
+        await _send(uid, head + "Оплачен?", _kb([[("✅ Оплачен", "fl:paid"), ("🚚 Не оплачен — в пути", "fl:unpaid")],
+                                                [("🤷 Не знаю", "fl:dunno")]] + ([[("↩️ Назад", "fl:back")]] if flow.get("hist") else []) + _fix_rows(flow.get("up")) + [[("✖️ Отменить (останется в черновиках)", "fl:cancel")]]), note)
         return
     if flow["paid"] and not flow["topup"]:
         with session() as s:
@@ -1310,6 +1372,7 @@ async def _step(uid: int, head: str = ""):
             await _send(uid, head + "Нет ни одного пополнения — создай его (скрин покупки USDT или «Учёт»).", None, note)
             return
         rows = [[(f"{x.date} · курс {x.rub / x.usd:.2f}", f"fl:tp:{x.id}")] for x in tops]
+        rows.append([("🤷 Не знаю, из какого", "fl:tpx")])
         await _send(uid, head + "Из какого пополнения оплачен?", _kbb(rows), note)
         return
     if not flow.get("awb_done"):
@@ -1370,6 +1433,51 @@ async def _step(uid: int, head: str = ""):
                     _kbb([[("✅ Верно", "fl:bal:ok"), ("✏️ Другой баланс", "fl:bal:edit")]]), note)
         return
     await _book_flow(uid, head, note)
+
+
+async def _book_unknown(uid: int, note, why: str):
+    """«Не знаю» on «Оплачен?» (why=pay) or on «Из какого пополнения?» (why=topup):
+    book it as «в пути, не оплачен» at the invoice sum and stop asking. Finance sorts out the payment later."""
+    from .api import find_invoice_id
+    from .models import Invoice
+    flow = FLOW.get(uid)
+    if not flow:
+        return
+    docs = _flow_docs(flow)
+    def _tot(d):
+        if d.get("doc_type") == "freight_invoice":
+            return (d.get("freight") or {}).get("total_usd") or d.get("invoice_total_usd") or 0
+        return round(d.get("invoice_total_usd") or sum((l.get("stems") or 0) * (l.get("price_usd") or 0)
+                                                       for l in d.get("lines", [])), 2)
+    flow.update({"paid": False, "topup": None, "pays": [(_tot(d), None) for _p, d in docs], "approx": True,
+                 "awb_done": True, "bal_done": True})
+    tag = ("оплата не известна — ждём стейтмент фермы" if why == "pay"
+           else "оплачен, пополнение не указано — разберутся финансы")
+    farms = ", ".join(sorted({d.get("farm") or "?" for _p, d in docs}))
+    await _book_flow(uid, "", note)
+    with session() as s:
+        for _p, d in docs:
+            iid = find_invoice_id(d) if d.get("doc_type") == "farm_invoice" else None
+            inv = s.get(Invoice, iid) if iid else None
+            if inv:
+                inv.note = ((inv.note or "") + " · " + tag).strip(" ·")
+                s.add(inv)
+        s.commit()
+    if why == "pay":
+        STMTWAIT[uid] = (docs[0][1].get("farm") or "") if docs else ""
+        await bot.send_message(uid, f"🤷 Оплату {farms} пока не знаем — внёс как «в пути, не оплачен» по сумме инвойса.\n"
+                                    "📄 Загрузи стейтмент фермы (Excel/PDF/фото) следующим сообщением — сверю, какие инвойсы ферма считает оплаченными.")
+    else:
+        await bot.send_message(uid, f"🤷 Ок, отдел финансов разберётся, из какого пополнения оплачен {farms}.\n"
+                                    "Пока внёс как «в пути» по сумме инвойса.")
+        for m in _money_people():
+            if m == uid:
+                continue
+            try:
+                await bot.send_message(m, f"💳 Инвойс {farms} оплачен, но пополнение не указано. Внесён как «в пути». "
+                                          "Укажи пополнение: «В пути» → ферма → «Оплачен».")
+            except Exception:
+                pass
 
 
 async def _book_flow(uid: int, head: str, note):
@@ -1447,6 +1555,14 @@ async def flow_button(c: CallbackQuery):
         flow["paid"] = True; _mark(flow, "paid")
     elif part[1] == "unpaid":
         flow["paid"] = False; _mark(flow, "paid")
+    elif part[1] == "dunno":
+        await c.answer()
+        await _book_unknown(c.from_user.id, c.message, "pay")
+        return
+    elif part[1] == "tpx":
+        await c.answer()
+        await _book_unknown(c.from_user.id, c.message, "topup")
+        return
     elif part[1] == "tp":
         flow["topup"] = int(part[2]); _mark(flow, "topup")
     elif part[1] == "bal" and part[2] == "ok":
@@ -2617,8 +2733,37 @@ async def logiztik_sync(report_to: int | None = None) -> str:
         return "Logiztik не настроен: в Bothost нужны переменные LOGIZTIK_TOKEN и LOGIZTIK_CUSTOMER."
     seen = dict(_settings().get("logiztik_seen") or {})
     lines = []
-    for sh in await lz.recent(6):
-        boxes = await lz.barcodes(sh["awb"])
+    try:
+        found = await lz.recent(6)
+    except Exception as e:
+        print(f"[lumen] logiztik shipments: {e}", flush=True)
+        found = []
+    # the «shipments by date» list may come back empty — also ask Logiztik about every Ecuador/Colombia MAWB we know
+    # from invoices / consolidation lists that is still in transit
+    known = {norm_awb(x["awb"]) for x in found}
+    from datetime import datetime as _dt2, timedelta as _td2
+    from .models import Invoice
+    with session() as s:
+        for i in s.exec(select(Invoice)).all():
+            k = norm_awb(i.awb or "")
+            if len(k) == 11 and not i.arrived_at and k not in known and (i.country or "") in ("Эквадор", "Колумбия"):
+                known.add(k)
+                found.append({"awb": i.awb, "date": "", "country": i.country, "origin": ""})
+    for k, st in kbreak._state().items():
+        try:
+            fresh = _dt2.now() - _dt2.strptime(st.get("ts") or "", "%Y-%m-%d") <= _td2(days=21)
+        except ValueError:
+            fresh = False
+        if fresh and k not in known and st.get("country") in ("Эквадор", "Колумбия"):
+            known.add(k)
+            found.append({"awb": st.get("awb") or k, "date": st.get("ts") or "", "country": st.get("country"), "origin": ""})
+    for sh in found:
+        try:
+            boxes = await lz.barcodes(sh["awb"])
+        except Exception as e:
+            if "does not contain" in str(e) or "no contiene" in str(e).lower():
+                continue                       # not a Logiztik shipment (other forwarder)
+            raise
         if not boxes:
             continue
         awb = find_mawb(sh["awb"]) or sh["awb"]
@@ -2626,6 +2771,15 @@ async def logiztik_sync(report_to: int | None = None) -> str:
         if seen.get(key) == len(boxes):
             continue
         rows = lz.farm_rows(boxes)
+        with session() as s:              # Logiztik's exporter code (EXP013535) is stable — learn it as a farm alias
+            for r in rows:
+                ff = (resolve_farm(s, r["code"]) if r.get("code") else None) or resolve_farm(s, r["farm_raw"])
+                if ff:
+                    if r.get("code") and r["code"].upper() not in (ff.aliases or "").upper():
+                        ff.aliases = ",".join(x for x in [ff.aliases, r["code"].upper()] if x)
+                        s.add(ff)
+                    r["farm_raw"] = ff.name
+            s.commit()
         st = kbreak._state().get(key)
         if st and (st.get("src") != "logiztik" or st.get("sent")):
             have = {}
@@ -3185,6 +3339,14 @@ async def autolog_cmd(m: Message):
         + (f" · {r['label']}: {r['old'] or 'пусто'} → {r['new'] or 'пусто'}" if r['field'] not in ('merge', 'line_kg') else f" · {r['new']}")
         + f"\n   ↳ {r['reason']}" for r in rows)
     await m.answer(txt[:4000])
+
+
+@dp.message(pv, wr, Command("statement"))
+async def statement_cmd(m: Message):
+    """Следующий документ — стейтмент фермы (statement of account)."""
+    STMTWAIT[m.from_user.id] = ""
+    await m.answer("📄 Жду стейтмент фермы следующим сообщением (Excel, PDF или фото). Сверю, какие инвойсы ферма "
+                   "считает оплаченными, и покажу, что у нас не сходится.")
 
 
 # catch-all goes LAST so /pay and other commands above get a chance first

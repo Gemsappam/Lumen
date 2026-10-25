@@ -23,7 +23,7 @@ BASE = os.getenv("LOGIZTIK_BASE", "https://cloud.logiztikalliance.com:5005/logCl
 # «ErrorParametrosFaltantesFechaCodigo» to the path form. So: try path / query / headers × key placements once,
 # remember the combination that gets past «missing parameters» and «unauthorized».
 LAST_RAW = ""          # last answer as text — shown by /logiztik when it isn't a list
-AUTH_MODES = ["AuthenticationToken", "query", "Api-Key", "ApiKey", "Authorization", "Bearer"]
+AUTH_MODES = ["apiKey", "AuthenticationToken", "query", "Api-Key", "Authorization", "Bearer"]   # their Postman: header apiKey
 PARAM_MODES = ["path", "header", "query", "path+header", "path+query"]
 
 
@@ -157,8 +157,8 @@ def farm_rows(boxes: list[dict]) -> list[dict]:
     rows = OrderedDict()
     for b in boxes:
         name = (b.get("exporterName") or b.get("exporterCode") or "?").strip()
-        r = rows.setdefault(name, {"farm_raw": name, "packs": 0, "kg": 0.0, "hawb": None, "sizes": {},
-                                   "received": 0, "price": 0.0})
+        r = rows.setdefault(name, {"farm_raw": name, "code": (b.get("exporterCode") or "").strip(), "packs": 0,
+                                   "kg": 0.0, "hawb": None, "sizes": {}, "received": 0, "price": 0.0})
         r["packs"] += 1
         r["kg"] += box_kg(b)
         r["hawb"] = r["hawb"] or (b.get("hawb") or "").strip() or None
