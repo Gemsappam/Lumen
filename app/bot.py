@@ -1283,6 +1283,8 @@ async def box_detail_answer(c: CallbackQuery):
 
 
 async def _start_flow(uid: int, subs: list, out: dict, caption: str, note, head: str):
+    from .api import strip_file_refs
+    caption = strip_file_refs(caption)          # a forwarded archive copy carries «📎 name 21.10.2026.pdf · …»
     t = topup_from_text(caption)
     if out.get("doc_type") == "farm_invoice":
         for d in subs:

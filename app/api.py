@@ -212,9 +212,20 @@ def _num(x: str) -> float:
     return float(x.replace(" ", "").replace("\u00a0", "").replace(",", "."))
 
 
+FILE_EXT = r"(?:pdf|xlsx|xls|xlsm|csv|jpe?g|png|heic|webp|docx?|zip)"
+
+
+def strip_file_refs(text: str) -> str:
+    """Drop what isn't the user's words: the archive caption «📎 file.pdf · who · 25.10.2026 14:43» (it lands in the
+    caption when an archived document is forwarded back) and file names like «DILUNA_21.10.2026.pdf» — their dates
+    must not pick a top-up and mark the invoice as paid."""
+    text = "\n".join(l for l in (text or "").splitlines() if not l.lstrip().startswith("📎"))
+    return re.sub(r"\S+\." + FILE_EXT + r"\b", " ", text, flags=re.I)
+
+
 def money_from_text(text: str):
     """'1198$ 105 472₽' -> (1198.0, 105472.0). Either may be None."""
-    text = text or ""
+    text = strip_file_refs(text)
     u, r = USD_RE.search(text), RUB_RE.search(text)
     usd = _num(u.group(1) or u.group(2)) if u else None
     rub = _num(r.group(1)) if r else None
@@ -223,7 +234,7 @@ def money_from_text(text: str):
 
 def topup_from_text(text: str):
     """A date like 23.09 in the caption picks that top-up."""
-    text = RUB_RE.sub(" ", USD_RE.sub(" ", text or ""))
+    text = RUB_RE.sub(" ", USD_RE.sub(" ", strip_file_refs(text)))
     with session() as s:
         tops = s.exec(select(TopUp).order_by(TopUp.id.desc())).all()
         for m in re.finditer(r"(?<![\d.])(\d{1,2})\.(\d{2})(?:\.(\d{2,4}))?(?![\d])", text):
