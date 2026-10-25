@@ -832,7 +832,7 @@ async autolog(){
   «Отменить» возвращает как было и ставит 🔒 — бот это поле у этого инвойса больше не трогает. То, что вы меняете сами, тоже сразу под 🔒.</p>
   ${L.length?`<div class="group">${L.map(r=>`<div class="row"><div class="grow">
       <div class="t">${esc(r.farm||'—')}${r.awb?` <span class="s">· MAWB ${esc(r.awb)}</span>`:''}</div>
-      <div class="s">${(r.field==='merge'||r.field==='line_kg')?esc(r.new||''):`${esc(r.label)}: <b>${esc(r.old||'пусто')}</b> → <b>${esc(r.new||'пусто')}</b>`}</div>
+      <div class="s">${(r.field==='merge'||r.field==='line_kg'||r.field==='opening')?esc(r.new||''):`${esc(r.label)}: <b>${esc(r.old||'пусто')}</b> → <b>${esc(r.new||'пусто')}</b>`}</div>
       <div class="s">${esc(r.ts)} · ${esc(r.reason)}</div></div>
       <div class="v">${r.undone?'<span class="pill">отменено 🔒</span>':(r.can_undo&&ME.can_write?`<button data-u="${r.id}">Отменить</button>`:'')}</div></div>`).join('')}</div>`
     :'<div class="empty">Пока бот ничего сам не менял — записи появятся с этой версии.</div>'}`;
@@ -862,7 +862,7 @@ async ledger(){
   $app.innerHTML=`<h1>Расчёты с фермами</h1>
   <p class="sub">В $, по тому, что дошло до фермы. Аванс — деньги лежат у фермы и зачтутся в следующий инвойс по курсу той оплаты. Долг — мы должны; пока не оплачен, считается ≈ по курсу последнего пополнения.</p>
   <div class="group">${r.farms.length?r.farms.map(f=>`<div class="row"><div class="grow"><div class="t">${esc(f.farm)}</div>
-      <div class="s num">${f.advances.map(a=>`аванс $${fmt(a.usd,2)} по ${fmt(a.rate,2)} ₽/$ (оплата ${esc(a.from)})`).join('<br>')}${f.debts.length?(f.advances.length?'<br>':'')+`долг $${fmt(f.debt_usd,2)}`:''}</div></div>
+      <div class="s num">${f.advances.map(a=>`аванс $${fmt(a.usd,2)} по ${fmt(a.rate,2)} ₽/$ (оплата ${esc(a.from)})`).join('<br>')}${f.debts.length?(f.advances.length?'<br>':'')+`долг $${fmt(f.debt_usd,2)}`:''}${f.opening_usd?`<br><span style="color:var(--warn,#c80)">в т.ч. «баланс до бота» ${f.opening_usd>0?'+':''}$${fmt(f.opening_usd,2)} — если его не было, поставь 0 ниже</span>`:''}</div></div>
       <div class="v"><div class="num" style="color:${f.balance_usd<0?'var(--err)':'var(--ok)'}"><b>${f.balance_usd<0?'долг ':'аванс '}$${fmt(Math.abs(f.balance_usd),2)}</b></div>
         ${f.balance_usd<0?`<button class="ghost" onclick="payDebt('${esc(f.farm.replace(/ \(.*\)$/,''))}',${Math.abs(f.balance_usd).toFixed(2)})">Оплатить</button>`:''}</div></div>`).join('')
     :'<div class="empty">Со всеми фермами расчёты закрыты: ни авансов, ни долгов.</div>'}</div>

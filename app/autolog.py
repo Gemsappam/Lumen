@@ -13,7 +13,7 @@ from sqlmodel import select
 from .models import AutoLog, Invoice, session
 
 FIELDS = {"awb": "MAWB", "weight_kg": "кг", "arrived_at": "прибыл", "invoice_date": "дата инвойса",
-          "truck": "машина", "merge": "слияние закупок", "line_kg": "вес строки"}
+          "truck": "машина", "merge": "слияние закупок", "line_kg": "вес строки", "opening": "баланс до бота"}
 
 
 def _locks() -> dict:
@@ -66,14 +66,14 @@ def entries(limit: int = 300) -> list[dict]:
         rows = s.exec(select(AutoLog).order_by(AutoLog.id.desc()).limit(limit)).all()
         alive = {i.id for i in s.exec(select(Invoice)).all()}
         return [{**r.model_dump(), "label": FIELDS.get(r.field, r.field),
-                 "can_undo": (not r.undone and r.field in FIELDS and r.field not in ("merge", "line_kg") and r.inv_id in alive)}
+                 "can_undo": (not r.undone and r.field in FIELDS and r.field not in ("merge", "line_kg", "opening") and r.inv_id in alive)}
                 for r in rows]
 
 
 def undo(log_id: int) -> dict:
     with session() as s:
         r = s.get(AutoLog, log_id)
-        if not r or r.undone or r.field in ("merge", "line_kg"):
+        if not r or r.undone or r.field in ("merge", "line_kg", "opening"):
             raise ValueError("Эту запись нельзя отменить")
         inv = s.get(Invoice, r.inv_id) if r.inv_id else None
         if not inv:

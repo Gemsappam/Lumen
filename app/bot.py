@@ -32,10 +32,52 @@ KB = InlineKeyboardMarkup(inline_keyboard=[[
     InlineKeyboardButton(text="📒 Открыть учёт", web_app=WebAppInfo(url=WEBAPP_URL))]])
 
 
+COMMANDS = [
+    ("start", "открыть учёт"),
+    ("blockers", "что мешает пакингам уйти в чаты"),
+    ("missing", "где инвойсы — фермы из листов без инвойса"),
+    ("ai", "несколько файлов + объяснить словами"),
+    ("fix", "исправить последний инвойс текстом"),
+    ("statement", "сверить стейтмент фермы"),
+    ("pay", "неоплаченные инвойсы и логистика"),
+    ("pickup", "что прибыло и ждёт «забрал со склада»"),
+    ("arrivals", "поставки без отметки о прибытии"),
+    ("awb", "инвойсы по MAWB"),
+    ("packing", "пакинг-листы"),
+    ("push_packing", "отправить пакинги в чаты"),
+    ("log", "что бот поменял сам"),
+    ("mark", "маркировка по умолчанию"),
+    ("excel", "выгрузка учёта в Excel"),
+]
+ADMIN_COMMANDS = [
+    ("status", "состояние бота"),
+    ("logiztik", "Logiztik: связь / sync / AWB"),
+    ("backup", "бэкап в канал сейчас"),
+    ("backup_cleanup", "почистить старые бэкапы"),
+    ("users", "пользователи и роли"),
+    ("archive", "архив документов"),
+    ("notify_reset", "сбросить уведомления"),
+]
+
+
 async def setup_menu_button():
-    """Blue button next to the message field opens the Mini App."""
+    """Blue button next to the message field opens the Mini App; «/» shows the commands."""
     if bot and WEBAPP_URL:
         await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="Учёт", web_app=WebAppInfo(url=WEBAPP_URL)))
+    if not bot:
+        return
+    from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat
+    try:
+        await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in COMMANDS],
+                                  scope=BotCommandScopeAllPrivateChats())
+        full = [BotCommand(command=c, description=d) for c, d in COMMANDS + ADMIN_COMMANDS]
+        for uid in roles.sys_ids():
+            try:
+                await bot.set_my_commands(full, scope=BotCommandScopeChat(chat_id=uid))
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[lumen] set_my_commands: {e}", flush=True)
 
 
 @dp.errors()
@@ -3336,7 +3378,7 @@ async def autolog_cmd(m: Message):
         return
     txt = "🤖 Что бот поменял сам (последние 20). Отменить — в приложении: Ещё → «Что бот поменял».\n\n" + "\n".join(
         f"{'↩️ ' if r['undone'] else ''}{r['ts']} · {r['farm'] or '—'}"
-        + (f" · {r['label']}: {r['old'] or 'пусто'} → {r['new'] or 'пусто'}" if r['field'] not in ('merge', 'line_kg') else f" · {r['new']}")
+        + (f" · {r['label']}: {r['old'] or 'пусто'} → {r['new'] or 'пусто'}" if r['field'] not in ('merge', 'line_kg', 'opening') else f" · {r['new']}")
         + f"\n   ↳ {r['reason']}" for r in rows)
     await m.answer(txt[:4000])
 

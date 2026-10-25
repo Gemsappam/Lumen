@@ -1306,7 +1306,11 @@ def ledger_view() -> dict:
     with session() as s:
         tops, invs, lines, logs = _all(s)
         res = compute(0, tops, invs, lines, logs, _awb_kg(s))
+    from . import calc
+    op = {v[2]: v[0] for v in calc.OPENINGS.values() if len(v) > 2}
     farms = sorted(res.ledger.values(), key=lambda f: (-abs(f["balance_usd"]), f["farm"]))
+    for f in farms:
+        f["opening_usd"] = op.get(f["farm"]) or 0
     return {"farms": [f for f in farms if abs(f["balance_usd"]) > 0.01 or f["advances"] or f["debts"]]}
 
 
@@ -1362,8 +1366,13 @@ def adjust_farm_balance(farm: str, target_usd: float):
         return
     with session() as s:
         fr = resolve_farm(s, farm, create_country="Кения")
-        fr.opening_usd = (fr.opening_usd or 0) + delta
-        s.add(fr); s.commit()
+        was = fr.opening_usd or 0
+        fr.opening_usd = was + delta
+        s.add(fr)
+        from .autolog import note
+        note(s, None, fr.name, "", "opening", f"баланс до бота: {was:+g} → {fr.opening_usd:+g} $",
+             f"ответ «✏️ У фермы был другой баланс»: было {cur:+.2f}, сказали {target_usd:+.2f}")
+        s.commit()
     from .backup import mark_dirty
     mark_dirty()
 
