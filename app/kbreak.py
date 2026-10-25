@@ -436,8 +436,34 @@ def elsewhere(farm: str, awb_key: str):
 def skip_farm(awb_key: str, farm: str):
     st = _state()
     if awb_key in st:
-        st[awb_key].setdefault("skip", []).append(farm)
+        names = [f.get("farm") for f in st[awb_key].get("farms") or [] if f.get("farm")]
+        farm = farm if farm in names else next((n for n in names if farm and n.startswith(farm)), farm)   # cut button data
+        if farm not in st[awb_key].setdefault("skip", []):
+            st[awb_key]["skip"].append(farm)
         _save_state(st)
+    return farm
+
+
+def unskip_farm(awb_key: str, farm: str):
+    """Undo «инвойса не будет»: the shipment waits for this farm's invoice again."""
+    st = _state()
+    sk = (st.get(awb_key) or {}).get("skip") or []
+    hit = farm if farm in sk else next((f for f in sk if farm and f.startswith(farm)), None)   # button data may be cut
+    if not hit:
+        return False
+    st[awb_key]["skip"] = [f for f in sk if f != hit]
+    _save_state(st)
+    return hit                       # the full farm name
+
+
+def skipped() -> list[dict]:
+    """Every «инвойса не будет» mark: [{key, awb, farm, sent}] (sent = the packing already went to the chats)."""
+    out = []
+    for k, st in _state().items():
+        for f in st.get("skip") or []:
+            out.append({"key": k, "awb": st.get("awb") or k, "farm": f, "sent": bool(st.get("msgs")),
+                        "country": st.get("country") or ""})
+    return out
 
 
 def breakdown_bytes(awb_key: str) -> bytes:

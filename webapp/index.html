@@ -961,17 +961,29 @@ async more(){
 
 // ======================= ЧТО МЕШАЕТ ПАКИНГАМ =======================
 async blockers(){
-  const L=await api('/packing/blockers');
+  const [L,SK]=await Promise.all([api('/packing/blockers'),api('/packing/skipped').catch(()=>[])]);
+  const can=ME?.can_write;
   const flag=c=>({'Кения':'KE','Эквадор':'EC','Колумбия':'CO'}[c]?`<span class="pill">${({'Кения':'KE','Эквадор':'EC','Колумбия':'CO'})[c]}</span>`:'');
   $app.innerHTML=`<h1>Что мешает пакингам</h1>
   <p class="sub">Пакинг поставки уходит в чаты только когда есть консолидационный лист и инвойсы всех ферм из него.</p>
   ${L.length?L.map(v=>`<h2>${v.key==='broker'?'Закупки брокера без MAWB':v.key==='noawb'?'Инвойсы без MAWB':flag(v.country)+' MAWB '+esc(v.awb)}
       ${v.ready?' · <span class="pill ok">всё на месте</span>':' · <span class="pill warn">не уйдёт</span>'}</h2>
     <div class="group">${v.blockers.map(b=>`<div class="row"><div class="grow"><div class="t">${esc(b.farm)}</div>
-        <div class="s"><b style="color:var(--err)">${esc(b.what)}</b></div><div class="s">→ ${esc(b.fix)}</div></div></div>`).join('')}
+        <div class="s"><b style="color:var(--err)">${esc(b.what)}</b></div><div class="s">→ ${esc(b.fix)}</div></div>
+        ${can&&b.kind==='no_invoice'&&!['broker','noawb'].includes(v.key)?`<div class="v"><button class="sm" data-skip="${esc(v.key)}" data-farm="${esc(b.farm)}">Инвойса не будет</button></div>`:''}</div>`).join('')}
       ${v.farms_ok.length?`<div class="row"><div class="grow"><div class="s"><i class="dot dk"></i>готовы: ${esc(v.farms_ok.join(', '))}</div></div></div>`:''}</div>`).join('')
     :'<div class="empty">Все пакинги ушли — ждать нечего.</div>'}
-  <p class="hint" style="margin:10px 16px">В боте то же самое — команда /blockers (с кнопками «инвойса не будет»).</p>`;
+  <h2>Инвойса не будет · ${SK.length}</h2>
+  <div class="group">${SK.length?SK.map(x=>`<div class="row" style="cursor:default"><div class="grow"><div class="t">${esc(x.farm)}</div>
+      <div class="s">MAWB ${esc(x.awb)} · поставка этот инвойс не ждёт${x.sent?' · пакинг уже ушёл в чаты':''}</div></div>
+      ${can?`<div class="v"><button class="sm" data-unskip="${esc(x.key)}" data-farm="${esc(x.farm)}">Вернуть</button></div>`:''}</div>`).join('')
+    :'<div class="empty" style="padding:16px">Отметок нет.</div>'}</div>
+  <p class="hint" style="margin:10px 16px">«Вернуть» — поставка снова ждёт инвойс этой фермы. В боте: /blockers и /skipped.</p>`;
+  $app.querySelectorAll('[data-skip]').forEach(b=>b.onclick=async()=>{
+    if(!confirm(`${b.dataset.farm}: инвойса не будет? Пакинг уйдёт без этой фермы. Вернуть можно ниже.`)) return;
+    try{ await api('/packing/skip',{method:'POST',body:{key:b.dataset.skip,farm:b.dataset.farm}}); toast('Отмечено: инвойса не будет'); render('blockers',{}) }catch(e){ toast(e.message) } });
+  $app.querySelectorAll('[data-unskip]').forEach(b=>b.onclick=async()=>{
+    try{ await api('/packing/unskip',{method:'POST',body:{key:b.dataset.unskip,farm:b.dataset.farm}}); toast('Вернул — ждём инвойс'); render('blockers',{}) }catch(e){ toast(e.message) } });
 },
 
 // ======================= ЖУРНАЛ: что бот поменял сам =======================
@@ -982,7 +994,7 @@ async autolog(){
   «Отменить» возвращает как было и закрепляет — бот это поле у этого инвойса больше не трогает. То, что вы меняете сами, тоже сразу закрепляется.</p>
   ${L.length?`<div class="group">${L.map(r=>`<div class="row"><div class="grow">
       <div class="t">${esc(r.farm||'—')}${r.awb?` <span class="s">· MAWB ${esc(r.awb)}</span>`:''}</div>
-      <div class="s">${(r.field==='merge'||r.field==='line_kg'||r.field==='opening')?esc(r.new||''):`${esc(r.label)}: <b>${esc(r.old||'пусто')}</b> → <b>${esc(r.new||'пусто')}</b>`}</div>
+      <div class="s">${(['merge','line_kg','opening','boxes','skip'].includes(r.field))?esc(r.new||''):`${esc(r.label)}: <b>${esc(r.old||'пусто')}</b> → <b>${esc(r.new||'пусто')}</b>`}</div>
       <div class="s">${esc(r.ts)} · ${esc(r.reason)}</div></div>
       <div class="v">${r.undone?'<span class="pill">отменено · закреплено</span>':(r.can_undo&&ME.can_write?`<button data-u="${r.id}">Отменить</button>`:'')}</div></div>`).join('')}</div>`
     :'<div class="empty">Пока бот ничего сам не менял — записи появятся с этой версии.</div>'}`;

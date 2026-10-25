@@ -13,7 +13,7 @@ from sqlmodel import select
 from .models import AutoLog, Invoice, session
 
 FIELDS = {"awb": "MAWB", "weight_kg": "кг", "arrived_at": "прибыл", "invoice_date": "дата инвойса",
-          "truck": "машина", "merge": "слияние закупок", "line_kg": "вес строки", "opening": "баланс до бота", "boxes": "пакинг-лист"}
+          "truck": "машина", "merge": "слияние закупок", "line_kg": "вес строки", "opening": "баланс до бота", "boxes": "пакинг-лист", "skip": "инвойса не будет"}
 
 
 def _locks() -> dict:
@@ -66,7 +66,7 @@ def entries(limit: int = 300) -> list[dict]:
         rows = s.exec(select(AutoLog).order_by(AutoLog.id.desc()).limit(limit)).all()
         alive = {i.id for i in s.exec(select(Invoice)).all()}
         return [{**r.model_dump(), "label": FIELDS.get(r.field, r.field),
-                 "can_undo": (not r.undone and r.field in FIELDS and r.field not in ("merge", "line_kg", "opening", "boxes") and r.inv_id in alive)}
+                 "can_undo": (not r.undone and r.field in FIELDS and r.field not in ("merge", "line_kg", "opening", "boxes", "skip") and r.inv_id in alive)}
                 for r in rows]
 
 

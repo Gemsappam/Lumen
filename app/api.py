@@ -2570,6 +2570,42 @@ def get_packing_blockers(uid: int = Depends(user_id)):
     return blockers()
 
 
+@router.get("/packing/skipped")
+def get_packing_skipped(uid: int = Depends(user_id)):
+    from .kbreak import skipped
+    return skipped()
+
+
+class SkipIn(BaseModel):
+    key: str
+    farm: str
+
+
+def _skiplog(key: str, farm: str, text: str):
+    from .autolog import note
+    with session() as s:
+        note(s, None, farm, key, "skip", text, "вручную")
+        s.commit()
+
+
+@router.post("/packing/skip")
+def post_packing_skip(body: SkipIn, uid: int = Depends(writer)):
+    from .kbreak import skip_farm, skipped
+    skip_farm(body.key, body.farm)
+    _skiplog(body.key, body.farm, "«инвойса не будет» — поставка его больше не ждёт")
+    return skipped()
+
+
+@router.post("/packing/unskip")
+async def post_packing_unskip(body: SkipIn, uid: int = Depends(writer)):
+    from .kbreak import unskip_farm, skipped
+    farm = unskip_farm(body.key, body.farm)
+    if not farm:
+        raise HTTPException(404, "Такой отметки уже нет")
+    _skiplog(body.key, farm, "вернули: поставка снова ждёт инвойс этой фермы")
+    return skipped()
+
+
 @router.get("/autolog")
 def get_autolog(uid: int = Depends(user_id)):
     from .autolog import entries

@@ -45,6 +45,7 @@ COMMANDS = [
     ("awb", "инвойсы по MAWB"),
     ("packing", "пакинг-листы"),
     ("boxes", "добавить пакинг-лист (коробки) к инвойсу"),
+    ("skipped", "«инвойса не будет» — вернуть ферму"),
     ("push_packing", "отправить пакинги в чаты"),
     ("log", "что бот поменял сам"),
     ("mark", "маркировка по умолчанию"),
@@ -2548,7 +2549,7 @@ async def missing_reminder(uid_list=None):
             if el:
                 lines.append(f"   ↳ инвойс {x['farm']} есть, но на MAWB {el['awb']} (ферма написала свой)")
                 rows.append([(f"↪️ {x['farm']}: перенести на {awb}", f"mv:{el['id']}:{k}")])
-            rows.append([(f"🚫 {x['farm']} ({awb[-4:]}) — инвойса не будет", f"miss:{k}:{x['farm'][:40]}")])
+            rows.append([(f"🚫 {x['farm']} ({awb[-4:]}) — инвойса не будет", _cbf("miss", k, x['farm']))])
     lines.append("\nКинь инвойсы сюда — сами привяжутся к MAWB. Пока их нет, пакинг этих ферм не уйдёт, а я буду спрашивать каждый день 🙂")
     for uid in uid_list or _money_people():
         try:
@@ -2580,9 +2581,50 @@ async def move_to_awb(c: CallbackQuery):
 async def missing_skip(c: CallbackQuery):
     from . import kbreak
     _, k, farm = c.data.split(":", 2)
-    kbreak.skip_farm(k, farm)
+    farm = kbreak.skip_farm(k, farm) or farm
+    from .api import _skiplog
+    _skiplog(k, farm, "«инвойса не будет» — кнопка в боте")
     await c.answer("Ок, больше не спрашиваю")
-    await c.message.answer(f"Ок, по {farm} инвойса не будет — больше не спрашиваю.")
+    await c.message.answer(f"Ок, по {farm} инвойса не будет — больше не спрашиваю.\n"
+                           "Нажал случайно — верни кнопкой ниже (или потом: /skipped, в «Учёте» — «Что мешает пакингам»).",
+                           reply_markup=_kb([[("↩️ Вернуть — ждать инвойс", _cbf("unmiss", k, farm))]]))
+
+
+def _cbf(prefix: str, key: str, farm: str) -> str:
+    """callback_data is capped at 64 bytes: cut the farm name to fit (unskip matches by prefix)."""
+    head = f"{prefix}:{key}:"
+    room = 64 - len(head.encode())
+    while len(farm.encode()) > room:
+        farm = farm[:-1]
+    return head + farm
+
+
+@dp.callback_query(F.data.startswith("unmiss:"), wr)
+async def missing_unskip(c: CallbackQuery):
+    from . import kbreak
+    _, k, farm = c.data.split(":", 2)
+    ok = kbreak.unskip_farm(k, farm)
+    if ok:
+        farm = ok
+        from .api import _skiplog
+        _skiplog(k, farm, "вернули: поставка снова ждёт инвойс этой фермы")
+    await c.answer("Вернул" if ok else "Отметки уже нет")
+    awb = (kbreak._state().get(k) or {}).get("awb") or k
+    await c.message.edit_text(f"↩️ {farm} (MAWB {awb}): снова ждём инвойс — пакинг уйдёт, когда он придёт."
+                              if ok else f"По {farm} отметки «инвойса не будет» уже нет.")
+
+
+@dp.message(pv, wr, Command("skipped", "net_invoice"))
+async def skipped_cmd(m: Message):
+    """All «инвойса не будет» marks with a «Вернуть» button."""
+    from . import kbreak
+    L = kbreak.skipped()
+    if not L:
+        await m.answer("Отметок «инвойса не будет» нет.")
+        return
+    await m.answer("Фермы, по которым отмечено «инвойса не будет». Нажми, чтобы вернуть — поставка снова будет ждать инвойс:",
+                   reply_markup=_kb([[(f"↩️ {x['farm']} · MAWB {x['awb']}", _cbf("unmiss", x['key'], x['farm']))]
+                                     for x in L[:30]]))
 
 
 @dp.message(pv, wr, Command("missing"))
@@ -3411,7 +3453,7 @@ def blockers_text() -> tuple[str, list]:
         for b in v["blockers"]:
             lines.append(f"• {b['farm']}: {b['what']} → {b['fix']}")
             if b["kind"] == "no_invoice" and v["key"] not in ("broker", "noawb"):
-                rows.append([(f"🚫 {b['farm']} ({v['awb'][-4:]}) — инвойса не будет", f"miss:{v['key']}:{b['farm'][:40]}")])
+                rows.append([(f"🚫 {b['farm']} ({v['awb'][-4:]}) — инвойса не будет", _cbf("miss", v['key'], b['farm']))])
         if v["farms_ok"]:
             lines.append(f"  ✅ готовы: {', '.join(v['farms_ok'])}")
     return "📦 Что мешает пакингам уйти в чаты:\n" + "\n".join(lines), rows
