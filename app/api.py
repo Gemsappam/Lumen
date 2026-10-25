@@ -1365,7 +1365,9 @@ def adjust_farm_balance(farm: str, target_usd: float):
     if abs(delta) < 0.005:
         return
     with session() as s:
-        fr = resolve_farm(s, farm, create_country="Кения")
+        fr = resolve_farm(s, farm)
+        if not fr:
+            return                                   # never invent a farm from a ledger label
         was = fr.opening_usd or 0
         fr.opening_usd = was + delta
         s.add(fr)
@@ -1573,6 +1575,43 @@ class OpeningIn(BaseModel):
     farm: str
     usd: float                 # + advance at the farm / − our debt
     rate: float | None = None
+
+
+class BalanceIn(BaseModel):
+    farm: str                  # ledger row name («Кондор (Гортензия)», «Брокер (Plazoleta)»)
+    usd: float | None = None   # wanted CURRENT balance: + advance at the farm / − our debt
+    reset_opening: bool = False
+
+
+@router.post("/ledger/balance")
+def set_farm_balance(body: BalanceIn, uid: int = Depends(writer)):
+    """Manual fix from «Расчёты с фермами»: make the farm's CURRENT balance what the person says
+    (done through the «balance before the bot»), or just zero that opening balance. Logged in the journal."""
+    from .autolog import note
+    rows = {f["farm"]: f for f in ledger_view()["farms"]}
+    cur = (rows.get(body.farm) or {}).get("balance_usd", 0.0)
+    with session() as s:
+        fr = s.exec(select(Farm).where(Farm.name == body.farm)).first()        # exact row name first
+        if not fr and body.farm.lower().startswith("брокер"):
+            cands = [f for f in s.exec(select(Farm)).all() if (f.account or "").strip().lower() == "брокер"]
+            fr = next((f for f in cands if f.opening_usd), None) or (cands[0] if cands else None)
+        if not fr:
+            fr = resolve_farm(s, body.farm)
+        if not fr:
+            raise HTTPException(404, "Ферма не найдена")
+        was = fr.opening_usd or 0
+        if body.reset_opening:
+            fr.opening_usd, why = 0, "обнулили «баланс до бота» вручную"
+        else:
+            if body.usd is None:
+                raise HTTPException(400, "Впиши баланс: + аванс у фермы, − наш долг")
+            fr.opening_usd, why = round(was + (body.usd - cur), 2), f"вручную: баланс сейчас {cur:+.2f} → {body.usd:+.2f}"
+        s.add(fr)
+        note(s, None, fr.name, "", "opening", f"баланс до бота: {was:+g} → {fr.opening_usd:+g} $", why)
+        s.commit()
+    from .backup import mark_dirty
+    mark_dirty()
+    return ledger_view()
 
 
 @router.post("/ledger/opening")
