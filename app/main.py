@@ -324,6 +324,13 @@ def _fix_broker_swap():
 def seed():
     _seed_farms()
     try:
+        from . import kbreak
+        n = kbreak.restore_missing_sheets()
+        if n:
+            print(f"[lumen] rebuilt {n} lost consolidation sheets", flush=True)
+    except Exception as e:
+        print(f"[lumen] restore sheets: {e}", flush=True)
+    try:
         from .api import seed_picked
         seed_picked()
     except Exception as e:
@@ -461,7 +468,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-25c · нераспознанный документ → сильный ИИ: объясняет и предлагает кнопки (лимит 15/день)"
+VERSION = "2026-10-25d · /blockers и «Что мешает пакингам»; листы детализации в бэкапе и восстановление"
 
 
 async def _once_recalc_true_rate():

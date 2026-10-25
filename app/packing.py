@@ -313,3 +313,80 @@ def mark_sent(inv_id: int):
             i.packing_sent = True
             s.add(i)
             s.commit()
+
+
+def blockers() -> list[dict]:
+    """Every shipment whose packing hasn't gone to the chats yet and WHY: [{key, awb, country, farms_ok, blockers}].
+    blockers: [{"farm", "what", "fix", "kind", "inv_id"?}]  kind: no_list / no_invoice / broker / mix / no_lines / no_awb"""
+    from datetime import datetime, timedelta
+    from .calc import norm_awb
+    from . import kbreak
+    st = kbreak._state()
+    miss = kbreak.missing_invoices()
+    out: dict = {}
+
+    def ship(k, awb, country=""):
+        return out.setdefault(k, {"key": k, "awb": awb, "country": country or (st.get(k) or {}).get("country") or "",
+                                  "farms_ok": [], "blockers": []})
+
+    for k, v in st.items():                              # consolidation lists not sent yet
+        if v.get("sent"):
+            continue
+        try:
+            if datetime.now() - datetime.strptime(v.get("ts") or "", "%Y-%m-%d") > timedelta(days=21):
+                continue
+        except ValueError:
+            pass
+        ship(k, v.get("awb") or k, v.get("country"))
+    for x in miss:
+        if x["awb_key"] == "broker":
+            ship("broker", "без MAWB", x.get("country"))["blockers"].append(
+                {"farm": x["farm"], "kind": "broker", "what": "закупка из выписки брокера — нет инвойса фермы (пакинга)",
+                 "fix": "пришли инвойс фермы"})
+            continue
+        if kbreak.is_sent(x["awb_key"]):
+            continue
+        ship(x["awb_key"], x["awb"], x.get("country"))["blockers"].append(
+            {"farm": x["farm"], "kind": "no_invoice",
+             "what": (x.get("note") or "нет инвойса") + (f" ({x['packs']} кор. в листе)" if x.get("packs") else ""),
+             "fix": "пришли инвойс фермы или «🚫 инвойса не будет»"})
+    with session() as s:
+        for i in s.exec(select(Invoice)).all():
+            if i.arrived_at or i.packing_sent:
+                continue
+            if not (i.awb or "").strip():
+                if i.via_broker:
+                    continue                             # already listed via missing_invoices / waits for statement
+                ship("noawb", "MAWB не известен")["blockers"].append(
+                    {"farm": i.farm, "kind": "no_awb", "inv_id": i.id, "what": f"инвойс № {i.invoice_no or '?'} без MAWB",
+                     "fix": "пришли консолидационный лист / разбивку или впиши MAWB в «В пути»"})
+                continue
+            k = norm_awb(i.awb)
+            if kbreak.is_sent(k):
+                continue                                 # late invoice of a sent shipment goes by itself
+            sh = ship(k, i.awb, i.country)
+            if not kbreak.has(k):
+                if not any(b["kind"] == "no_list" for b in sh["blockers"]):
+                    lost = k in st
+                    sh["blockers"].append({"farm": "—", "kind": "no_list",
+                                           "what": ("лист по этому MAWB был, но файл детализации потерялся (перезапуск сервера)"
+                                                    if lost else "нет консолидационного листа / разбивки по коробкам"),
+                                           "fix": "перешли прэалерт / разбивку ТК ещё раз"})
+            if i.via_broker and not i.packing_lines_json:
+                if not any(b["farm"] == i.farm and b["kind"] in ("broker", "no_invoice") for b in sh["blockers"]):
+                    sh["blockers"].append({"farm": i.farm, "kind": "broker", "inv_id": i.id,
+                                           "what": "закупка брокера — нет инвойса фермы (пакинга)", "fix": "пришли инвойс фермы"})
+            elif unpacked_mix(s, i):
+                sh["blockers"].append({"farm": i.farm, "kind": "mix", "inv_id": i.id,
+                                       "what": "в инвойсе строка «Mix / Assorted» не разложена по сортам",
+                                       "fix": "перешли инвойс ещё раз или «✏️ Бот ошибся — исправить текстом»"})
+            elif not s.exec(select(Line).where(Line.invoice_id == i.id)).first() and not i.packing_lines_json:
+                sh["blockers"].append({"farm": i.farm, "kind": "no_lines", "inv_id": i.id,
+                                       "what": "в инвойсе нет строк", "fix": "перешли инвойс"})
+            else:
+                sh["farms_ok"].append(i.farm)
+    res = [v for v in out.values() if v["blockers"] or v["farms_ok"]]
+    for v in res:
+        v["farms_ok"] = sorted(set(v["farms_ok"]))
+        v["ready"] = not v["blockers"]
+    return sorted(res, key=lambda v: (v["ready"], v["key"] in ("broker", "noawb"), v["awb"]))

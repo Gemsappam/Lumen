@@ -50,6 +50,10 @@ def _make_zip() -> bytes:
             z.write(DATA_DIR / "settings.json", "settings.json")
         for p in (DATA_DIR / "drafts").glob("*.json"):
             z.write(p, f"drafts/{p.name}")
+        for sub in ("breakdowns", "fixsrc"):          # consolidation sheets (packing needs them) + originals for /fix
+            for p in (DATA_DIR / sub).glob("*"):
+                if p.is_file() and p.stat().st_size < 5_000_000:
+                    z.write(p, f"{sub}/{p.name}")
     return buf.getvalue()
 
 
@@ -74,7 +78,8 @@ def _content_hash() -> str:
                 h.update(line.encode())
         finally:
             con.close()
-    for p in [MASTER_XLSX, DATA_DIR / "settings.json"] + sorted((DATA_DIR / "drafts").glob("*.json")):
+    for p in [MASTER_XLSX, DATA_DIR / "settings.json"] + sorted((DATA_DIR / "drafts").glob("*.json")) \
+            + sorted((DATA_DIR / "breakdowns").glob("*.xlsx")):
         if p.exists():
             h.update(p.name.encode()); h.update(p.read_bytes())
     return h.hexdigest()

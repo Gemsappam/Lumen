@@ -118,6 +118,25 @@ def store(data: bytes, info: dict, awb_key: str, farms: list[dict]):
     store_rows(awb_key, info["awb"] or awb_key, "Кения", farms, info.get("eta"))
 
 
+def restore_missing_sheets() -> int:
+    """After a server wipe the state survives (settings.json) but the sheet files didn't (older backups had no
+    them): rebuild our «Детализация» sheet from the stored farms, so the packing gate isn't stuck forever."""
+    from openpyxl import Workbook
+    n = 0
+    for k, v in _state().items():
+        if (DIR / f"{k}.xlsx").exists() or not v.get("farms"):
+            continue
+        wb = Workbook(); ws = wb.active; ws.title = "Детализация"
+        ws.append(["AWB", "Ферма", "Коробки"])
+        for f in v["farms"]:
+            ws.append([v.get("awb") or k, f.get("farm"), f.get("packs")])
+        ws.append([None, "Общее", sum(f.get("packs") or 0 for f in v["farms"])])
+        buf = io.BytesIO(); wb.save(buf)
+        (DIR / f"{k}.xlsx").write_bytes(buf.getvalue())
+        n += 1
+    return n
+
+
 def store_rows(awb_key: str, awb_display: str, country: str, farms: list[dict], eta=None):
     """Any consolidation list (Kenya / Ecuador / Colombia) -> our sheet AWB | Ферма | Коробки (+ Общее)."""
     from datetime import timedelta

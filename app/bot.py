@@ -3349,6 +3349,36 @@ async def statement_cmd(m: Message):
                    "считает оплаченными, и покажу, что у нас не сходится.")
 
 
+def blockers_text() -> tuple[str, list]:
+    from .packing import blockers
+    from .kbreak import flag
+    rows, lines = [], []
+    data = blockers()
+    if not data:
+        return "📦 Все пакинги ушли — ждать нечего.", []
+    for v in data:
+        title = (f"✈️ {flag(v['country'])} MAWB {v['awb']}" if v["key"] not in ("broker", "noawb") else
+                 ("🛒 Закупки брокера без MAWB" if v["key"] == "broker" else "❓ Инвойсы без MAWB"))
+        if v["ready"]:
+            lines.append(f"{title} — ✅ всё на месте ({', '.join(v['farms_ok'])}), уйдёт сам в течение минуты")
+            continue
+        lines.append(f"\n{title} — ⛔ пакинг НЕ уйдёт, пока:")
+        for b in v["blockers"]:
+            lines.append(f"• {b['farm']}: {b['what']} → {b['fix']}")
+            if b["kind"] == "no_invoice" and v["key"] not in ("broker", "noawb"):
+                rows.append([(f"🚫 {b['farm']} ({v['awb'][-4:]}) — инвойса не будет", f"miss:{v['key']}:{b['farm'][:40]}")])
+        if v["farms_ok"]:
+            lines.append(f"  ✅ готовы: {', '.join(v['farms_ok'])}")
+    return "📦 Что мешает пакингам уйти в чаты:\n" + "\n".join(lines), rows
+
+
+@dp.message(pv, wr, Command("blockers", "packing_status", "chego"))
+async def blockers_cmd(m: Message):
+    """Что не хватает, чтобы ушли пакинги."""
+    txt, rows = blockers_text()
+    await m.answer(txt[:4000], reply_markup=_kb(rows[:20]) if rows else None)
+
+
 # catch-all goes LAST so /pay and other commands above get a chance first
 @dp.message(pv, ops)
 async def other(m: Message):

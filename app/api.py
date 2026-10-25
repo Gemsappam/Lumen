@@ -2420,6 +2420,12 @@ def seed_picked():
     SETTINGS.write_text(json.dumps({**_settings(), "picked": pk, "picked_seeded": True}, ensure_ascii=False))
 
 
+@router.get("/packing/blockers")
+def get_packing_blockers(uid: int = Depends(user_id)):
+    from .packing import blockers
+    return blockers()
+
+
 @router.get("/autolog")
 def get_autolog(uid: int = Depends(user_id)):
     from .autolog import entries

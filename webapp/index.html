@@ -175,7 +175,7 @@ function back(){ stack.pop(); const [v,a]=stack[stack.length-1]||['home',{}]; re
 tg?.BackButton.onClick(back);
 const ICONS={"home": "<svg viewBox=\"0 0 24 24\" width=\"22\" height=\"22\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M4 7h16v12a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z\"/><path d=\"M8 7V5a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2\"/><path d=\"M4 12h16\"/></svg>", "transit": "<svg viewBox=\"0 0 24 24\" width=\"22\" height=\"22\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M3 6h11v10H3z\"/><path d=\"M14 9h4l3 3v4h-7\"/><circle cx=\"7\" cy=\"17.5\" r=\"1.6\"/><circle cx=\"17\" cy=\"17.5\" r=\"1.6\"/></svg>", "stock": "<svg viewBox=\"0 0 24 24\" width=\"22\" height=\"22\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M12 3 3 7.5 12 12l9-4.5z\"/><path d=\"M3 7.5V16.5L12 21l9-4.5V7.5\"/><path d=\"M12 12v9\"/></svg>", "more": "<svg viewBox=\"0 0 24 24\" width=\"22\" height=\"22\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"5\" cy=\"12\" r=\"1.3\"/><circle cx=\"12\" cy=\"12\" r=\"1.3\"/><circle cx=\"19\" cy=\"12\" r=\"1.3\"/></svg>"};
 const TABS=[['home',ICONS.home,'Откупы'],['transit',ICONS.transit,'В пути'],['stock',ICONS.stock,'Остатки'],['more',ICONS.more,'Ещё']];
-const TAB_OF={archive:'more',autolog:'more',ledger:'more',marks:'more',home:'home',topup:'home',topupForm:'home',draft:'home',invoice:null,logistics:null,weights:'home',
+const TAB_OF={archive:'more',blockers:'transit',autolog:'more',ledger:'more',marks:'more',home:'home',topup:'home',topupForm:'home',draft:'home',invoice:null,logistics:null,weights:'home',
   transit:'transit',transitInv:'transit',stock:'stock',more:'more',farms:'more',farm:'more',users:'more'};
 let CUR_TAB='home';
 function tab(v){ stack.length=0; go(v) }
@@ -663,6 +663,7 @@ async transit({seg,q}={}){
       <div class="v"><div class="num">$${fmt(l.usd||0,2)}</div><div class="s">≈ ${fmt(l.rub_est)} ₽</div></div>
       <button class="primary" data-pl="${l.id}" style="margin-left:6px;padding:8px 10px">Оплачен</button></div>`).join('')}</div>`:''}
   <div class="actions"><button id="addT">+ Инвойс в пути</button><button id="pushP">📦 Пакинги в чаты</button></div>
+  <div class="actions"><button id="blkP">🧩 Что мешает пакингам</button></div>
   <div class="actions"><button id="xlsT">📊 Excel по грузам в пути</button></div>`;
   $app.querySelectorAll('[data-seg]').forEach(b=>b.onclick=()=>render('transit',{seg:b.dataset.seg}));
   document.getElementById('tq').onsubmit=e=>{e.preventDefault(); render('transit',{q:e.target.q.value})};
@@ -708,6 +709,7 @@ async transit({seg,q}={}){
     await api('/awb/'+encodeURIComponent(e.dataset.mk)+'/markings',{method:'POST',body:{markings:nv.split(',')}}); toast('Маркировки сохранены'); render('transit',{})});
   $app.querySelectorAll('[data-pl]').forEach(b=>b.onclick=ev=>{ev.stopPropagation();payForm({kind:'logistics',id:+b.dataset.pl,usd:v.unpaid_logistics.find(x=>x.id==b.dataset.pl).usd})});
   document.getElementById('addT').onclick=()=>go('invoice',{t:{id:0,date:'в пути'}});
+  document.getElementById('blkP').onclick=()=>go('blockers');
   if(!ME.can_write){ document.getElementById('addT').style.display='none'; document.getElementById('pushP').style.display='none' }
 },
 
@@ -805,6 +807,21 @@ async more(){
   document.getElementById('m-log').onclick=()=>go('autolog');
   document.getElementById('m-users')?.addEventListener('click',()=>go('users'));
   document.getElementById('m-arch')?.addEventListener('click',()=>go('archive'));
+},
+
+// ======================= ЧТО МЕШАЕТ ПАКИНГАМ =======================
+async blockers(){
+  const L=await api('/packing/blockers');
+  const flag=c=>({'Кения':'🇰🇪','Эквадор':'🇪🇨','Колумбия':'🇨🇴'}[c]||'✈️');
+  $app.innerHTML=`<h1>Что мешает пакингам</h1>
+  <p class="sub">Пакинг поставки уходит в чаты только когда есть консолидационный лист и инвойсы всех ферм из него.</p>
+  ${L.length?L.map(v=>`<h2>${v.key==='broker'?'🛒 Закупки брокера без MAWB':v.key==='noawb'?'❓ Инвойсы без MAWB':flag(v.country)+' MAWB '+esc(v.awb)}
+      ${v.ready?' · <span class="pill ok">всё на месте</span>':' · <span class="pill warn">не уйдёт</span>'}</h2>
+    <div class="group">${v.blockers.map(b=>`<div class="row"><div class="grow"><div class="t">${esc(b.farm)}</div>
+        <div class="s">⛔ ${esc(b.what)}</div><div class="s">→ ${esc(b.fix)}</div></div></div>`).join('')}
+      ${v.farms_ok.length?`<div class="row"><div class="grow"><div class="s">✅ готовы: ${esc(v.farms_ok.join(', '))}</div></div></div>`:''}</div>`).join('')
+    :'<div class="empty">Все пакинги ушли — ждать нечего.</div>'}
+  <p class="hint" style="margin:10px 16px">В боте то же самое — команда /blockers (с кнопками «инвойса не будет»).</p>`;
 },
 
 // ======================= ЖУРНАЛ: что бот поменял сам =======================
