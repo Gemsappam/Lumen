@@ -136,6 +136,8 @@ h2 .s{flex-basis:100%;font-family:var(--text)}
 button.sm{padding:8px 12px;font-size:13.5px;border-radius:10px;flex:none}
 .row .s.num{font-family:var(--text);font-weight:500}
 
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;vertical-align:1px;background:var(--muted)}
+.dot.dk{background:var(--ok)} .dot.dw{background:var(--warn)}
 /* pills: tag-like, condensed caps */
 .pill{display:inline-block;font-family:var(--cond);font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;
   padding:2px 8px 1px;border-radius:6px;border:1.5px solid var(--line2);color:var(--fg);background:transparent;white-space:nowrap;vertical-align:1px}
@@ -249,7 +251,8 @@ document.getElementById('themeBtn').onclick=()=>{ setTheme(document.documentElem
 paintTelegram();
 const $app = document.getElementById('app');
 const fmt = (n, d=0) => n==null||n==='' ? '—' : Number(n).toLocaleString('ru-RU',{minimumFractionDigits:d,maximumFractionDigits:d});
-const esc = s => String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const noEmo = s => String(s??'').replace(/(?:\p{Extended_Pictographic}|\p{Regional_Indicator}|\uFE0F|\u200D)+\s?/gu,'');   // texts from the bot come with emoji; the app stays clean
+const esc = s => noEmo(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const numOrNull = v => v===''||v==null ? null : Number(String(v).replace(',','.').replace(/\s/g,''));
 const dm = v => { const x=String(v||''); const m=x.match(/^(\d{4})-(\d{2})-(\d{2})/); return m?m[3]+'.'+m[2]:x.slice(0,5) };
 const today = () => new Date().toLocaleDateString('ru-RU');
@@ -274,14 +277,40 @@ async function payDebt(farm, debt){
     try{const r=await api('/farm_payment',{method:'POST',body:b}); w.remove(); toast(r.text); if((document.querySelector('h1')?.textContent||'').includes('Расчёты')) render('ledger',{})}catch(e){toast(e.message)}};
 }
 
+// ---------- packing list (box by box) of a booked invoice: view / upload / remove ----------
+async function boxesBlock(iid, el){
+  if(!el||!iid) return;
+  let b; try{ b=await api(`/invoices/${iid}/boxes`) }catch(e){ el.innerHTML=''; return }
+  const can=ME?.can_write;
+  const row=x=>`<div class="row" style="cursor:default"><div class="grow"><div class="t">${x.qty>1?x.qty+' кор.':'1 кор.'}${x.pack?' · '+esc(x.pack):''}</div>
+      <div class="s">${(x.content||[]).map(c=>`${esc(c.name)} — ${c.stems_per_box!=null?fmt(c.stems_per_box)+' ст'+(x.qty>1?' в каждой':''):fmt(c.stems_total??c.stems??0)+' ст'}`).join('<br>')}</div></div></div>`;
+  el.innerHTML=`<h2>Пакинг-лист · ${fmt(b.total)} кор.</h2>
+    <div class="group">
+      <div class="row" style="cursor:default"><div class="grow"><div class="t">${b.own?'<i class="dot dk"></i>Из пакинг-листа фермы':'По строкам инвойса'}</div>
+        <div class="s">${b.own?'Коробки в пакинге — ровно как в загруженном файле.':'Пакинг-листа нет — коробки собраны из строк инвойса. Если ферма прислала раскладку по коробкам, загрузи её.'}</div></div></div>
+      ${b.boxes.slice(0,40).map(row).join('')}${b.boxes.length>40?`<div class="empty" style="padding:10px">…и ещё ${b.boxes.length-40}</div>`:''}
+    </div>
+    ${can?`<input type="file" id="bxFile" accept="application/pdf,image/*,.xlsx,.xls,.xlsm" hidden>
+    <div class="actions"><button class="primary" id="bxUp">${b.own?'Заменить пакинг-лист':'Загрузить пакинг-лист'}</button>${b.own?'<button id="bxDel">Убрать</button>':''}</div>`:''}`;
+  const inp=el.querySelector('#bxFile');
+  el.querySelector('#bxUp')?.addEventListener('click',()=>inp.click());
+  inp?.addEventListener('change',async()=>{ const f=inp.files[0]; if(!f) return;
+    const btn=el.querySelector('#bxUp'); btn.disabled=true; btn.textContent='Читаю пакинг-лист…';
+    const fd=new FormData(); fd.append('file',f);
+    try{ const r=await api(`/invoices/${iid}/boxes`,{method:'POST',body:fd}); toast(r.text||'Пакинг-лист сохранён'); boxesBlock(iid,el) }
+    catch(e){ toast(e.message); btn.disabled=false; btn.textContent='Загрузить пакинг-лист' } });
+  el.querySelector('#bxDel')?.addEventListener('click',async()=>{
+    if(!confirm('Убрать пакинг-лист? Коробки снова будут по строкам инвойса.')) return;
+    try{ await api(`/invoices/${iid}/boxes`,{method:'DELETE'}); toast('Пакинг-лист убран'); boxesBlock(iid,el) }catch(e){ toast(e.message) } });
+}
 
-function toast(t){const e=document.getElementById('toast');e.textContent=t;e.classList.add('on');setTimeout(()=>e.classList.remove('on'),2600)}
+function toast(t){const e=document.getElementById('toast');e.textContent=noEmo(t);e.classList.add('on');setTimeout(()=>e.classList.remove('on'),2600)}
 
 async function api(path, opt={}){
   const headers = {'X-Init-Data': tg?.initData||''};
   if (opt.body && !(opt.body instanceof FormData)){headers['Content-Type']='application/json';opt.body=JSON.stringify(opt.body)}
   const r = await fetch('/api'+path,{...opt,headers});
-  if(!r.ok){const t=await r.text();throw new Error(t.slice(0,200))}
+  if(!r.ok){let t=await r.text(); try{const j=JSON.parse(t); if(j.detail) t=typeof j.detail==="string"?j.detail:JSON.stringify(j.detail)}catch(e){} throw new Error(t.slice(0,300))}
   return r.json();
 }
 
@@ -473,7 +502,7 @@ async invoice({t, inv, draft}){
     <div class="two"><div class="field"><label>MAWB</label><input name="awb" value="${esc(inv.awb)}"></div>
     <div class="field"><label>Вес плантации в MAWB, кг</label><input name="weight_kg" inputmode="decimal" value="${inv.weight_kg??''}"></div></div>
     <div class="two"><div class="field"><label>Маркировка (несколько — через запятую)</label><input name="client_code" value="${esc(inv.client_code)}" placeholder="${esc(MARK||'LUMEN')}"></div>
-    <div class="field"><label>Пополнение</label><select name="topup"><option value="0" ${!(inv.topup_id??t.id)?'selected':''}>🚚 не оплачен — в пути</option>${TOPS.map(x=>`<option value="${x.id}" ${x.id===(inv.topup_id??t.id)?'selected':''}>${esc(x.date)} · $${fmt(x.usd,0)}</option>`).join('')}</select></div></div>
+    <div class="field"><label>Пополнение</label><select name="topup"><option value="0" ${!(inv.topup_id??t.id)?'selected':''}>не оплачен — в пути</option>${TOPS.map(x=>`<option value="${x.id}" ${x.id===(inv.topup_id??t.id)?'selected':''}>${esc(x.date)} · $${fmt(x.usd,0)}</option>`).join('')}</select></div></div>
   </form>
   <h2>Номенклатура</h2>
   <div class="group scroll"><table class="lines"><thead><tr><th style="min-width:170px">Название</th><th>Кор.</th><th>Стебли</th><th>Кг</th><th>$ / ст</th><th>₽ / ст</th><th></th></tr></thead>
@@ -494,10 +523,12 @@ async invoice({t, inv, draft}){
     <div class="field"><label>Дата оплаты</label><input name="paid_date" value="${esc(inv.paid_date)}"></div></div>
     <div class="field"><label>Комментарий</label><input name="note" value="${esc(inv.note)}"></div>
   </form>
+  ${inv.id?'<div id="boxesSlot"></div>':''}
   ${inv.id?`<h2>Статус груза</h2><div class="group"><div class="row"><div class="grow">
-      <div class="t">${inv.arrived_at?'📦 Прибыл':'🚚 В пути'}</div><div class="s">${inv.arrived_at?esc(inv.arrived_at):(inv.eta?'прибытие '+esc(inv.eta.replace('T',' ')):'ждёт сообщения ТК МСК о машине')}</div></div>
+      <div class="t">${inv.arrived_at?'Прибыл':'В пути'}</div><div class="s">${inv.arrived_at?esc(inv.arrived_at):(inv.eta?'прибытие '+esc(inv.eta.replace('T',' ')):'ждёт сообщения ТК МСК о машине')}</div></div>
       <button id="arrToggle">${inv.arrived_at?'Вернуть в «В пути»':'Отметить прибывшим'}</button></div></div>`:''}
   <div class="actions">${inv.id?'<button id="del" class="x">Удалить</button>':''}<button class="primary" id="save">Сохранить</button></div>`;
+  if(inv.id) boxesBlock(inv.id, document.getElementById('boxesSlot'));
   document.getElementById('arrToggle')?.addEventListener('click',async()=>{
     await api(`/invoices/${inv.id}/arrived${inv.arrived_at?'?back=true':''}`,{method:'POST'});
     inv.arrived_at = inv.arrived_at ? null : 'только что (вручную)';
@@ -540,7 +571,7 @@ async invoice({t, inv, draft}){
           ? `<span style="color:var(--err)">Долг ферме: $${fmt(L.debt_usd,2)}</span> <span class="s">(закрыто: ${parts||'—'})</span>`
             + ` <button type="button" class="ghost" onclick="payDebt('${esc(f.farm.value)}',${L.debt_usd.toFixed(2)})">Оплатить долг</button>`
           : `<span style="color:var(--ok)">✓ Инвойс $${fmt(T,2)} закрыт полностью</span> <span class="s">= ${parts}</span>`;
-        if(rub && F){ const k=rub/F, r=rateNow(); if(k<r*0.98) fb.innerHTML+=`<div style="color:var(--warn);margin-top:4px">⚠️ ${fmt(k,2)} ₽ за 1 $ фермы — меньше курса пополнения ${fmt(r,2)}: проверь суммы.</div>` }
+        if(rub && F){ const k=rub/F, r=rateNow(); if(k<r*0.98) fb.innerHTML+=`<div style="color:var(--warn);margin-top:4px">${fmt(k,2)} ₽ за 1 $ фермы — меньше курса пополнения ${fmt(r,2)}: проверь суммы.</div>` }
       } else {
       const d = F + A - T;
       const why = BB && A>0.005 ? ' ← ' + (BB.from.length ? BB.from.join('; ') : BB.advances.map(x=>`$${fmt(x.usd,2)} от ${x.from}`).join('; ')) : '';
@@ -551,7 +582,7 @@ async invoice({t, inv, draft}){
         : `<span style="color:var(--ok)">Аванс у фермы: $${fmt(d,2)}</span> <span class="s">(${how}; зачтётся в следующий инвойс)</span>`;
       if(rub && F){
         const k = rub / F, r = rateNow();
-        if(k < r*0.98) fb.innerHTML += `<div style="color:var(--warn);margin-top:4px">⚠️ ${fmt(k,2)} ₽ за 1 $ фермы — это меньше курса пополнения ${fmt(r,2)}. Так не бывает: проверь «Оплачено, ₽» и «Дошло до фермы».</div>`;
+        if(k < r*0.98) fb.innerHTML += `<div style="color:var(--warn);margin-top:4px">${fmt(k,2)} ₽ за 1 $ фермы — это меньше курса пополнения ${fmt(r,2)}. Так не бывает: проверь «Оплачено, ₽» и «Дошло до фермы».</div>`;
       }
       }
     }
@@ -759,19 +790,19 @@ async transit({seg,q}={}){
   $app.innerHTML=`<h1>Груз в пути</h1>
   <form id="tq" style="display:flex;gap:6px;margin:4px 16px 8px"><input name="q" value="${esc(Q)}" placeholder="Поиск: MAWB (хоть 4 цифры) или ферма" style="flex:1">
     <button class="primary">Найти</button>${Q?'<button type="button" id="tqx">✕</button>':''}</form>
-  ${Q?`<p class="sub">Найдено ${v.invoices.length} инв. по «${esc(Q)}» — и в пути, и закрытые: 🟢 оплачено ${nPd} · 🟠 не оплачено ${nUn}</p>`:''}
+  ${Q?`<p class="sub">Найдено ${v.invoices.length} инв. по «${esc(Q)}» — и в пути, и закрытые: <i class="dot dk"></i>оплачено ${nPd} · <i class="dot dw"></i>не оплачено ${nUn}</p>`:''}
   <div class="seg" style="display:${Q?'none':'flex'};gap:6px;margin:4px 16px 10px">
-    <button data-seg="unpaid" class="${SEG==='unpaid'?'primary':''}" style="flex:1">🟠 Не оплачены (${nUn})</button>
-    <button data-seg="paid" class="${SEG==='paid'?'primary':''}" style="flex:1">🟢 Оплачены (${nPd})</button></div>
+    <button data-seg="unpaid" class="${SEG==='unpaid'?'primary':''}" style="flex:1"><i class="dot dw"></i>Не оплачены (${nUn})</button>
+    <button data-seg="paid" class="${SEG==='paid'?'primary':''}" style="flex:1"><i class="dot dk"></i>Оплачены (${nPd})</button></div>
   <p class="sub">${SEG==='paid'?'Оплаченные грузы, которые ещё едут.':'Неоплаченные грузы в пути — себестоимость приблизительная (±10%).'}
     ${ME.can_write&&SEG!=='paid'?` ≈ по курсу ${fmt(v.est_rate,2)} (пополнение ${esc(v.est_topup||'—')}).`:''}</p>
   ${Object.keys(by).length?Object.entries(by).map(([awb,list])=>`<h2>${awb==='без MAWB'?'MAWB ещё не известен':'MAWB '+esc(awb)}${list.find(x=>x.eta)?' · '+eta(list.find(x=>x.eta)):''}
-      ${Q?`<div class="s" style="text-transform:none;letter-spacing:0">🟢 оплачено ${fmt(sumR(list.filter(i=>i.paid_state==='paid')))} ₽ · 🟠 не оплачено ≈ ${fmt(sumR(list.filter(i=>i.paid_state!=='paid')))} ₽ · всего ${fmt(sumR(list))} ₽</div>`:''}
-      ${awb!=='без MAWB'&&ME.can_write?`<span class="pill" data-px="${esc(awb)}" style="cursor:pointer;margin-left:6px">💳 Excel MAWB</span><span class="pill" data-mk="${esc(awb)}" style="cursor:pointer;margin-left:6px">🏷 ${esc([...new Set(list.flatMap(i=>(i.client_code||'').split(',').map(x=>x.trim()).filter(Boolean)))].join(', ')||'маркировки')}</span>`:''}</h2>
+      ${Q?`<div class="s" style="text-transform:none;letter-spacing:0"><i class="dot dk"></i>оплачено ${fmt(sumR(list.filter(i=>i.paid_state==='paid')))} ₽ · <i class="dot dw"></i>не оплачено ≈ ${fmt(sumR(list.filter(i=>i.paid_state!=='paid')))} ₽ · всего ${fmt(sumR(list))} ₽</div>`:''}
+      ${awb!=='без MAWB'&&ME.can_write?`<span class="pill" data-px="${esc(awb)}" style="cursor:pointer;margin-left:6px">Excel MAWB</span><span class="pill" data-mk="${esc(awb)}" style="cursor:pointer;margin-left:6px">Маркировка: ${esc([...new Set(list.flatMap(i=>(i.client_code||'').split(',').map(x=>x.trim()).filter(Boolean)))].join(', ')||'маркировки')}</span>`:''}</h2>
     <div class="group">${list.map(i=>`<div class="row" data-ti="${i.id}"><div class="grow">
       <div class="t">${esc(i.farm)}</div>
       <div style="margin:3px 0"><span class="pill ${i.paid_state==='paid'?'ok':'warn'}">${i.paid_state==='paid'?'оплачен · '+esc(i.topup):'не оплачен'}</span>${i.arrived_at?` <span class="pill">прибыл ${esc(dm(i.arrived_at))}</span>`:''}</div>
-      <div class="s num">${fmt(i.stems)} ст${i.paid_state==='paid'?'':' · ≈$'+fmt(i.est_usd||0,0)}${i.truck?' · 🚚 '+esc(i.truck):''}</div>
+      <div class="s num">${fmt(i.stems)} ст${i.paid_state==='paid'?'':' · ≈$'+fmt(i.est_usd||0,0)}${i.truck?' · машина '+esc(i.truck):''}</div>
       <div class="s num">${legsOf(i).map(l=>`${l.name} ${fmt(l.per,2)}`).join(' + ')} ₽/ст</div></div>
       <div class="v"><div class="num">${i.approx?'≈ ':''}${fmt(i.avg_rub,2)} ₽</div><div class="s">${i.approx?(i.approx_big?'±10% · ':'≈ курс ТК · '):''}за стебель</div></div></div>`).join('')}</div>`).join('')
     :`<div class="empty">${SEG==='paid'?'Оплаченных грузов в пути нет.':'Неоплаченных грузов в пути нет.'}</div>`}
@@ -779,15 +810,15 @@ async transit({seg,q}={}){
       <div class="t">${esc(l.provider||'Фрахт')}</div><div style="margin:3px 0"><span class="pill warn">не оплачен</span></div><div class="s">MAWB ${esc(l.awb)}</div></div>
       <div class="v"><div class="num">$${fmt(l.usd||0,2)}</div><div class="s">≈ ${fmt(l.rub_est)} ₽</div></div>
       <button class="primary" data-pl="${l.id}" style="margin-left:6px;padding:8px 10px">Оплачен</button></div>`).join('')}</div>`:''}
-  <div class="actions"><button id="addT">+ Инвойс в пути</button><button id="pushP">📦 Пакинги в чаты</button></div>
-  <div class="actions"><button id="blkP">🧩 Что мешает пакингам</button></div>
-  <div class="actions"><button id="xlsT">📊 Excel по грузам в пути</button></div>`;
+  <div class="actions"><button id="addT">+ Инвойс в пути</button><button id="pushP">Пакинги в чаты</button></div>
+  <div class="actions"><button id="blkP">Что мешает пакингам</button></div>
+  <div class="actions"><button id="xlsT">Excel по грузам в пути</button></div>`;
   $app.querySelectorAll('[data-seg]').forEach(b=>b.onclick=()=>render('transit',{seg:b.dataset.seg}));
   document.getElementById('tq').onsubmit=e=>{e.preventDefault(); render('transit',{q:e.target.q.value})};
   document.getElementById('tqx')?.addEventListener('click',()=>render('transit',{q:''}));
   document.getElementById('xlsT').onclick=async e=>{e.target.disabled=true;e.target.textContent='Собираю…';
     try{await api('/transit/export',{method:'POST'});toast('Excel по грузам в пути отправлен в чат')}catch(x){toast(x.message)}
-    e.target.disabled=false;e.target.textContent='📊 Excel по грузам в пути'};
+    e.target.disabled=false;e.target.textContent='Excel по грузам в пути'};
   document.getElementById('pushP').onclick=async()=>{
     const [aw, tgs]=await Promise.all([api('/packing/awbs'), api('/packing/targets')]);
     if(!aw.length) return toast('Грузов в пути с MAWB нет');
@@ -797,9 +828,9 @@ async transit({seg,q}={}){
     wrap.innerHTML=`<div style="background:var(--bg2);width:100%;border-radius:18px 18px 0 0;padding:14px 0 calc(16px + env(safe-area-inset-bottom,0));max-height:80vh;overflow:auto">
       <h2 style="margin-top:4px">Какую поставку отправить в чаты?</h2>
       <div class="group">${aw.map(a=>`<div class="row" data-k="${a.key}" style="cursor:pointer"><div class="grow">
-        <div class="t">${a.has_bd?'✅':'⏳'} MAWB ${esc(a.awb)} · ${esc(a.country)}</div>
+        <div class="t">${a.has_bd?'<i class="dot dk"></i>':'<i class="dot dw"></i>'}MAWB ${esc(a.awb)} · ${esc(a.country)}</div>
         <div class="s">${esc(a.farms.join(', '))}${a.has_bd?'':' — нет консолидационного листа, не уйдёт'}</div></div></div>`).join('')}
-        <div class="row" data-k="all" style="cursor:pointer"><div class="grow"><div class="t">📦 Все грузы в пути</div></div></div></div>
+        <div class="row" data-k="all" style="cursor:pointer"><div class="grow"><div class="t">Все грузы в пути</div></div></div></div>
       <h2>В какие чаты</h2>
       <div class="group">${tgs.map(t=>`<label class="row"><input type="checkbox" class="tgc" value="${esc(t.key)}" checked>
         <div class="grow"><div class="t">${esc(t.title)}${t.topic?' · тема':''}</div></div></label>`).join('')}</div>
@@ -842,12 +873,13 @@ async transitInv({i,v}){
   <h2>По позициям, ₽ на стебель</h2>
   <div class="group scroll"><table class="lines"><thead><tr><th>Номенклатура</th><th>Ст.</th><th>кг</th><th>$</th><th>Цветок</th>${legsOf(i).map(l=>`<th>${l.name.replace('ТК ','')}</th>`).join('')}<th>Итого</th></tr></thead>
   <tbody>${i.lines.map(l=>`<tr data-ln="${l.id}" style="cursor:pointer"><td style="padding:8px 4px">${esc(l.name)}</td><td class="calc">${fmt(l.stems)}</td>
-    <td class="calc">${l.kg_fixed?`<b>📦${fmt(l.kg_box,1)}/кор</b><br><span class="s">${fmt(l.kg_eff,1)}</span>`:(l.kg_eff!=null?`${fmt(l.kg_eff,1)}<br><span class="s">по ст.</span>`:'—')}</td>
+    <td class="calc">${l.kg_fixed?`<b>${fmt(l.kg_box,1)}/кор</b><br><span class="s">${fmt(l.kg_eff,1)}</span>`:(l.kg_eff!=null?`${fmt(l.kg_eff,1)}<br><span class="s">по ст.</span>`:'—')}</td>
     <td class="calc">${l.price_usd}</td>
     <td class="calc">${fmt(l.price_rub,2)}</td>${legsOf(i).map(g=>`<td class="calc">${fmt(g.k==='air'?l.air_rub:l.msk_rub,2)}</td>`).join('')}
     <td class="calc"><b>${i.approx?'≈':''}${fmt(l.total_rub,2)}</b></td></tr>`).join('')}</tbody></table></div>
   <p class="hint" style="margin:6px 16px">Вес: ${i.weight_kg?`фикс. ${fmt(i.kg_fixed||0,1)} кг + по стеблям ${i.kg_rest!=null?fmt(i.kg_rest,1):'—'} кг = ${fmt(i.weight_kg,1)} кг фермы`:'кг фермы ещё нет (нет разбивки)'}.
     Нажми на строку, чтобы задать вес коробки.</p>
+  <div id="boxesSlot"></div>
   <h2>MAWB</h2>
   <div class="group" id="awbBox" style="padding:12px"><div class="field" style="margin:0"><label>Номер MAWB (можно с пробелами/без дефиса)</label>
     <input id="awbIn" inputmode="numeric" value="${esc(i.awb||'')}" placeholder="369-99583094"></div>
@@ -855,6 +887,7 @@ async transitInv({i,v}){
   <div class="actions">${i.paid_state==='unpaid'?'<button class="primary" id="pay">Оплачен</button>':''}<button id="arr">Прибыл</button></div>
   <div class="actions"><button id="edit">Редактировать инвойс</button></div>`;
   document.getElementById('pay')?.addEventListener('click',()=>payForm({kind:'invoices',id:i.id,usd:i.est_usd}));
+  boxesBlock(i.id, document.getElementById('boxesSlot'));
   if(ME.can_write) $app.querySelectorAll('[data-ln]').forEach(r=>r.onclick=async()=>{
     const l=i.lines.find(x=>x.id==r.dataset.ln);
     const v=prompt(`${l.name}\nКоробок: ${l.boxes||1}\nВес ОДНОЙ коробки, кг (пусто — считать по стеблям):`, l.kg_box??'');
@@ -862,7 +895,7 @@ async transitInv({i,v}){
     const kg=numOrNull(v);
     const remember=confirm(`Запомнить для фермы ${i.farm}?\nОК — правило «${l.name} = ${kg||'по стеблям'}» для всех её инвойсов (те, что в пути, пересчитаю).\nОтмена — только этот инвойс.`);
     try{ const t=await api('/lines/'+l.id+'/boxkg',{method:'POST',body:{kg_per_box:kg,remember}});
-      toast(kg?'Вес коробки сохранён 🔒':'Строка снова по стеблям 🔒');
+      toast(kg?'Вес коробки сохранён и закреплён':'Строка снова по стеблям');
       const ni=t.invoices.find(x=>x.id===i.id); if(ni){ stack.pop(); go('transitInv',{i:ni,v:t}) } }catch(x){ toast(x.message) } });
   document.getElementById('awbSave').onclick=async()=>{
     const b=document.getElementById('awbSave'); b.disabled=true;
@@ -889,12 +922,12 @@ async stock(){
       ${ME.can_write?`<div class="v"><button class="primary" data-pk="${esc(awb)}">Забрал</button></div>`:''}</div>${rows(l,true)}`).join('');
   $app.innerHTML=`<h1>Товарные остатки</h1>
   <p class="sub">Только товар (цветы), без ТК. ${ME.can_write?`Неоплаченные — ≈ по курсу ${fmt(v.est_rate,2)} (пополнение ${esc(v.est_topup||'—')}).`:''}</p>
-  ${head('🚚 Груз в пути',v.in_transit,'ещё не прибыл — всего')}
-    ${[['🟢 Оплачено',v.in_transit.filter(i=>i.paid)],['🟠 Не оплачено',v.in_transit.filter(i=>!i.paid)]].filter(([,l])=>l.length).map(([t,l])=>
+  ${head('Груз в пути',v.in_transit,'ещё не прибыл — всего')}
+    ${[['<i class="dot dk"></i>Оплачено',v.in_transit.filter(i=>i.paid)],['<i class="dot dw"></i>Не оплачено',v.in_transit.filter(i=>!i.paid)]].filter(([,l])=>l.length).map(([t,l])=>
       `<div class="row" style="background:var(--bg2,rgba(127,127,127,.08))"><div class="grow"><div class="t">${t}</div><div class="s">${l.length} инв.</div></div>
        <div class="v"><div class="num"><b>${l.some(i=>i.approx)?'≈ ':''}${fmt(sum(l))} ₽</b></div></div></div>${rows(l,false)}`).join('')}</div>
-  ${v.warehouse.length?`${head('🏬 Прибыл — на складе ТК',v.warehouse,'нажми «Забрал», когда заберёте — уйдёт из остатков')}${wh}</div>`:''}
-  ${head('💳 Не оплачено',v.unpaid,'деньги, которые ещё должны фермам — уходит после оплаты')}${rows(v.unpaid,false)}</div>`;
+  ${v.warehouse.length?`${head('Прибыл — на складе ТК',v.warehouse,'нажми «Забрал», когда заберёте — уйдёт из остатков')}${wh}</div>`:''}
+  ${head('Не оплачено',v.unpaid,'деньги, которые ещё должны фермам — уходит после оплаты')}${rows(v.unpaid,false)}</div>`;
   $app.querySelectorAll('[data-pk]').forEach(b=>b.onclick=async e=>{ e.stopPropagation();
     if(!confirm('Груз MAWB '+b.dataset.pk+' забран со склада ТК?'))return;
     await api('/stock/picked/'+encodeURIComponent(b.dataset.pk),{method:'POST'}); toast('Убрал из остатков'); render('stock') });
@@ -905,7 +938,7 @@ async stock(){
 // ======================= ЕЩЁ =======================
 async more(){
   $app.innerHTML=`<h1>Ещё</h1><div class="group">
-    <div class="row" id="m-log"><div class="grow"><div class="t">🤖 Что бот поменял сам</div><div class="s">MAWB, кг, прибытие, слияния — с кнопкой «Отменить»</div></div></div>
+    <div class="row" id="m-log"><div class="grow"><div class="t">Что бот поменял сам</div><div class="s">MAWB, кг, прибытие, слияния — с кнопкой «Отменить»</div></div></div>
     <div class="row" id="m-led"><div class="grow"><div class="t">Расчёты с фермами</div><div class="s">авансы и долги в $</div></div></div>
     <div class="row" id="m-marks"><div class="grow"><div class="t">Маркировки клиентов</div><div class="s">чаты клиентов для статусов грузов</div></div></div>
     <div class="row" id="m-farms"><div class="grow"><div class="t">Плантации</div><div class="s">справочник, правила коробок, нюансы для AI</div></div></div>
@@ -929,14 +962,14 @@ async more(){
 // ======================= ЧТО МЕШАЕТ ПАКИНГАМ =======================
 async blockers(){
   const L=await api('/packing/blockers');
-  const flag=c=>({'Кения':'🇰🇪','Эквадор':'🇪🇨','Колумбия':'🇨🇴'}[c]||'✈️');
+  const flag=c=>({'Кения':'KE','Эквадор':'EC','Колумбия':'CO'}[c]?`<span class="pill">${({'Кения':'KE','Эквадор':'EC','Колумбия':'CO'})[c]}</span>`:'');
   $app.innerHTML=`<h1>Что мешает пакингам</h1>
   <p class="sub">Пакинг поставки уходит в чаты только когда есть консолидационный лист и инвойсы всех ферм из него.</p>
-  ${L.length?L.map(v=>`<h2>${v.key==='broker'?'🛒 Закупки брокера без MAWB':v.key==='noawb'?'❓ Инвойсы без MAWB':flag(v.country)+' MAWB '+esc(v.awb)}
+  ${L.length?L.map(v=>`<h2>${v.key==='broker'?'Закупки брокера без MAWB':v.key==='noawb'?'Инвойсы без MAWB':flag(v.country)+' MAWB '+esc(v.awb)}
       ${v.ready?' · <span class="pill ok">всё на месте</span>':' · <span class="pill warn">не уйдёт</span>'}</h2>
     <div class="group">${v.blockers.map(b=>`<div class="row"><div class="grow"><div class="t">${esc(b.farm)}</div>
-        <div class="s">⛔ ${esc(b.what)}</div><div class="s">→ ${esc(b.fix)}</div></div></div>`).join('')}
-      ${v.farms_ok.length?`<div class="row"><div class="grow"><div class="s">✅ готовы: ${esc(v.farms_ok.join(', '))}</div></div></div>`:''}</div>`).join('')
+        <div class="s"><b style="color:var(--err)">${esc(b.what)}</b></div><div class="s">→ ${esc(b.fix)}</div></div></div>`).join('')}
+      ${v.farms_ok.length?`<div class="row"><div class="grow"><div class="s"><i class="dot dk"></i>готовы: ${esc(v.farms_ok.join(', '))}</div></div></div>`:''}</div>`).join('')
     :'<div class="empty">Все пакинги ушли — ждать нечего.</div>'}
   <p class="hint" style="margin:10px 16px">В боте то же самое — команда /blockers (с кнопками «инвойса не будет»).</p>`;
 },
@@ -946,15 +979,15 @@ async autolog(){
   let L=await api('/autolog');
   const draw=()=>{ $app.innerHTML=`<h1>Что бот поменял сам</h1>
   <p class="sub">Всё, что бот изменил без нажатия кнопки: MAWB, кг, «прибыл», даты, слияния закупок.
-  «Отменить» возвращает как было и ставит 🔒 — бот это поле у этого инвойса больше не трогает. То, что вы меняете сами, тоже сразу под 🔒.</p>
+  «Отменить» возвращает как было и закрепляет — бот это поле у этого инвойса больше не трогает. То, что вы меняете сами, тоже сразу закрепляется.</p>
   ${L.length?`<div class="group">${L.map(r=>`<div class="row"><div class="grow">
       <div class="t">${esc(r.farm||'—')}${r.awb?` <span class="s">· MAWB ${esc(r.awb)}</span>`:''}</div>
       <div class="s">${(r.field==='merge'||r.field==='line_kg'||r.field==='opening')?esc(r.new||''):`${esc(r.label)}: <b>${esc(r.old||'пусто')}</b> → <b>${esc(r.new||'пусто')}</b>`}</div>
       <div class="s">${esc(r.ts)} · ${esc(r.reason)}</div></div>
-      <div class="v">${r.undone?'<span class="pill">отменено 🔒</span>':(r.can_undo&&ME.can_write?`<button data-u="${r.id}">Отменить</button>`:'')}</div></div>`).join('')}</div>`
+      <div class="v">${r.undone?'<span class="pill">отменено · закреплено</span>':(r.can_undo&&ME.can_write?`<button data-u="${r.id}">Отменить</button>`:'')}</div></div>`).join('')}</div>`
     :'<div class="empty">Пока бот ничего сам не менял — записи появятся с этой версии.</div>'}`;
     $app.querySelectorAll('[data-u]').forEach(b=>b.onclick=async()=>{ if(!confirm('Вернуть как было?'))return;
-      try{ L=await api('/autolog/'+b.dataset.u+'/undo',{method:'POST'}); toast('Вернул, 🔒'); draw() }catch(x){ toast(x.message) } });
+      try{ L=await api('/autolog/'+b.dataset.u+'/undo',{method:'POST'}); toast('Вернул и закрепил'); draw() }catch(x){ toast(x.message) } });
   };
   draw();
 },
@@ -965,7 +998,7 @@ async archive(){
   $app.innerHTML=`<h1>Архив</h1>
   <p class="sub">Каждый документ, который кто-либо загрузил в бота или приложение — даже если инвойс потом удалили. Нажми «Файл» — исходник придёт тебе в чат с ботом.</p>
   <div class="group">${list.length?list.map(u=>`<div class="row"><div class="grow">
-      <div class="t">${u.gone?'🗑 ':''}${esc(u.summary||u.filename||'документ')}</div>
+      <div class="t">${u.gone?'<span class="pill">удалён</span> ':''}${esc(u.summary||u.filename||'документ')}</div>
       <div class="s">${esc(u.ts)} · ${esc(u.user||'')} · ${esc(u.kind_ru)}${u.filename?' · '+esc(u.filename):''}</div>
       ${u.status?`<div class="s" style="color:${u.gone?'var(--err)':'var(--ok)'}">${esc(u.status)}</div>`:''}</div>
       <button data-up="${u.id}" style="padding:8px 10px">Файл</button></div>`).join(''):'<div class="empty">Пока ничего не загружали.</div>'}</div>`;
@@ -982,7 +1015,7 @@ async ledger(){
       <div class="s num">${f.advances.map(a=>`аванс $${fmt(a.usd,2)} по ${fmt(a.rate,2)} ₽/$ (оплата ${esc(a.from)})`).join('<br>')}${f.debts.length?(f.advances.length?'<br>':'')+`долг $${fmt(f.debt_usd,2)}`:''}${f.opening_usd?`<br><span style="color:var(--warn,#c80)">в т.ч. «баланс до бота» ${f.opening_usd>0?'+':''}$${fmt(f.opening_usd,2)} — если его не было, поставь 0 ниже</span>`:''}</div></div>
       <div class="v"><div class="num" style="color:${f.balance_usd<0?'var(--err)':'var(--ok)'}"><b>${f.balance_usd<0?'долг ':'аванс '}$${fmt(Math.abs(f.balance_usd),2)}</b></div></div>
         <div class="rowbtns">${f.balance_usd<0?`<button class="sm primary" onclick="payDebt('${esc(f.farm.replace(/ \(.*\)$/,''))}',${Math.abs(f.balance_usd).toFixed(2)})">Оплатить</button>`:''}
-        ${ME.can_write?`<button class="sm" data-bal="${esc(f.farm)}" data-cur="${f.balance_usd}">✏️ Изменить</button>`:''}
+        ${ME.can_write?`<button class="sm" data-bal="${esc(f.farm)}" data-cur="${f.balance_usd}">Изменить</button>`:''}
         ${ME.can_write&&f.opening_usd?`<button class="sm" data-op0="${esc(f.farm)}">Обнулить «до бота»</button>`:''}</div></div>`).join('')
     :'<div class="empty">Со всеми фермами расчёты закрыты: ни авансов, ни долгов.</div>'}</div>
   <h2>Баланс, который был до бота</h2>
@@ -1013,7 +1046,7 @@ async marks(){
   <form id="f" class="group" style="margin-top:12px"><div class="field"><label>Новая маркировка</label><input name="n" placeholder="ABC"></div></form>
   <div class="actions"><button class="primary" id="add">Добавить</button></div>
   <p class="hint" style="margin:10px 16px">Как привязать чат клиента: добавь нейтрального бота-читателя в группу с клиентом и напиши там <b>/marking_here ABC</b> (в супергруппе — внутри нужной темы). Отвязать: <b>/marking_off</b> там же.<br>
-  Какие маркировки в поставке — «В пути» → 🏷 рядом с MAWB, или поле «Маркировка» в инвойсе (несколько через запятую).</p>`;
+  Какие маркировки в поставке — «В пути» → «Маркировка» рядом с MAWB, или поле «Маркировка» в инвойсе (несколько через запятую).</p>`;
   document.getElementById('add').onclick=async()=>{const n=document.getElementById('f').n.value.trim(); if(!n)return; await api('/markings',{method:'POST',body:{name:n}}); render('marks',{})};
   $app.querySelectorAll('[data-rm]').forEach(b=>b.onclick=async()=>{ if(!confirm('Удалить маркировку '+b.dataset.rm+'?'))return; await api('/markings/'+encodeURIComponent(b.dataset.rm),{method:'DELETE'}); render('marks',{})});
   $app.querySelectorAll('[data-rc]').forEach(a=>a.onclick=async ev=>{ev.preventDefault(); const [m,c,t]=a.dataset.rc.split('|');

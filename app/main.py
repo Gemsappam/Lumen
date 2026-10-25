@@ -468,7 +468,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-25j · пересланный из архива документ больше не считается оплаченным по дате в имени файла"
+VERSION = "2026-10-25l · мини-апп без эмодзи"
 
 
 async def _once_recalc_true_rate():

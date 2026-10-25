@@ -1893,6 +1893,91 @@ async def parse(file: UploadFile = File(...), uid: int = Depends(writer)):
     return out
 
 
+@router.get("/invoices/{iid}/boxes")
+def get_boxes(iid: int, uid: int = Depends(user_id)):
+    """Box-by-box packing of one invoice: from a packing list (own=True) or derived from the lines."""
+    from .packing import _boxes_from_lines
+    with session() as s:
+        inv = s.get(Invoice, iid)
+        if not inv:
+            raise HTTPException(404, "Инвойс не найден")
+        lines = s.exec(select(Line).where(Line.invoice_id == iid)).all()
+        own = bool(inv.boxes_json)
+        boxes = json.loads(inv.boxes_json) if own else _boxes_from_lines(lines)
+    return {"own": own, "boxes": boxes, "total": sum(int(b.get("qty") or 1) for b in boxes)}
+
+
+def _boxlog(iid: int, text: str):
+    from .autolog import note
+    with session() as s:
+        inv = s.get(Invoice, iid)
+        note(s, iid, inv.farm, inv.awb, "boxes", text, "вручную в приложении")
+        s.commit()
+
+
+async def _refresh_packing(iid: int, why: str) -> bool:
+    with session() as s:
+        inv = s.get(Invoice, iid)
+        key = norm_awb(inv.awb) if inv and inv.awb else None
+    if not key:
+        return False
+    try:
+        from .bot import refresh_shipment
+        return bool(await refresh_shipment(key, why))
+    except Exception as e:
+        print("[lumen] refresh packing:", e, flush=True)
+        return False
+
+
+@router.post("/invoices/{iid}/boxes")
+async def upload_boxes(iid: int, file: UploadFile = File(...), uid: int = Depends(writer)):
+    """Packing list (PDF / photo / Excel) for an invoice that is already booked -> box-by-box layout."""
+    data = await file.read()
+    mime = file.content_type or "application/pdf"
+    fn = (file.filename or "").lower()
+    name = f"{uuid.uuid4().hex[:10]}_{file.filename}"
+    (DATA_DIR / "files" / name).write_bytes(data)
+    if fn.endswith((".xlsx", ".xlsm", ".xls")) or "spreadsheet" in mime or "excel" in mime:
+        from .xltext import excel_to_text
+        data, mime = excel_to_text(data, file.filename or "").encode(), "text/plain"
+    elif mime not in ("application/pdf", "image/jpeg", "image/png", "image/webp"):
+        raise HTTPException(400, "Нужен PDF, фото или Excel")
+    with session() as s:
+        inv = s.get(Invoice, iid)
+        if not inv:
+            raise HTTPException(404, "Инвойс не найден")
+        farm, no = inv.farm, inv.invoice_no
+        lines = [l.name for l in s.exec(select(Line).where(Line.invoice_id == iid)).all()]
+    out = await ai.parse_document(data, mime, [], lines, note=(
+        f"Это packing list (детализация по коробкам) к уже внесённому инвойсу {farm} № {no or '?'}: заполни "
+        "boxes_detail — что лежит в каждой коробке (сорт, стебли). Названия сортов бери как в каталоге."))
+    boxes = out.get("boxes_detail") or _boxes_from_raw(out.get("lines") or [])
+    if not boxes:
+        raise HTTPException(400, "Не нашёл в файле раскладку по коробкам — пришли другой файл (PDF, фото или Excel).")
+    up = record_upload(uid, "приложение", file.filename or name, file.content_type or mime, local_path=name, kind="packing_list")
+    update_upload(up, summary=f"пакинг-лист {farm} № {no or ''}")
+    txt, _key = set_box_detail(iid, boxes)
+    _boxlog(iid, f"пакинг-лист загружен вручную ({file.filename or 'файл'})")
+    edited = await _refresh_packing(iid, f"{farm} — добавлен пакинг-лист")
+    return {**get_boxes(iid, uid), "text": txt + (" Пакинг в чатах обновлён." if edited else "")}
+
+
+@router.delete("/invoices/{iid}/boxes")
+async def clear_boxes(iid: int, uid: int = Depends(writer)):
+    with session() as s:
+        inv = s.get(Invoice, iid)
+        if not inv:
+            raise HTTPException(404, "Инвойс не найден")
+        inv.boxes_json = None
+        s.add(inv); s.commit()
+        farm = inv.farm
+    from .backup import mark_dirty
+    mark_dirty()
+    _boxlog(iid, "пакинг-лист убран — коробки снова по строкам инвойса")
+    await _refresh_packing(iid, f"{farm} — коробки по строкам инвойса")
+    return get_boxes(iid, uid)
+
+
 @router.post("/topups/{tid}/audit")
 async def audit(tid: int, uid: int = Depends(writer)):
     with session() as s:

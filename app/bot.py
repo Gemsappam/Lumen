@@ -44,6 +44,7 @@ COMMANDS = [
     ("arrivals", "поставки без отметки о прибытии"),
     ("awb", "инвойсы по MAWB"),
     ("packing", "пакинг-листы"),
+    ("boxes", "добавить пакинг-лист (коробки) к инвойсу"),
     ("push_packing", "отправить пакинги в чаты"),
     ("log", "что бот поменял сам"),
     ("mark", "маркировка по умолчанию"),
@@ -1276,7 +1277,7 @@ async def box_detail_answer(c: CallbackQuery):
     await c.answer()
     if what == "yes":
         BOXWAIT[c.from_user.id] = int(iid)
-        await c.message.edit_text("Жду детализацию по коробкам: пришли файл, фото или PDF (packing list фермы, "
+        await c.message.edit_text("Жду пакинг-лист: пришли файл, фото, PDF или Excel (packing list фермы, "
                                   "раскладку по коробкам). Следующий документ от тебя возьму как детализацию к этому инвойсу.")
     else:
         await c.message.edit_text("Ок, без детализации. В пакинге коробки будут по строкам инвойса.")
@@ -3414,6 +3415,29 @@ def blockers_text() -> tuple[str, list]:
         if v["farms_ok"]:
             lines.append(f"  ✅ готовы: {', '.join(v['farms_ok'])}")
     return "📦 Что мешает пакингам уйти в чаты:\n" + "\n".join(lines), rows
+
+
+@dp.message(pv, wr, Command("boxes", "add_packing", "korobki"))
+async def boxes_cmd(m: Message):
+    """Attach a farm's packing list (box by box) to an invoice that is already booked."""
+    from .models import Invoice
+    from .calc import norm_awb
+    q = (m.text or "").split(maxsplit=1)[1].strip().lower() if len((m.text or "").split()) > 1 else ""
+    qd = re.sub(r"\D", "", q)
+    with session() as s:
+        invs = s.exec(select(Invoice).order_by(Invoice.id.desc())).all()
+    if q:
+        invs = [i for i in invs if q in (i.farm or "").lower() or (qd and len(qd) >= 3 and qd in norm_awb(i.awb or ""))
+                or (qd and qd in re.sub(r"\D", "", i.invoice_no or ""))]
+    invs = invs[:12]
+    if not invs:
+        await m.answer("Не нашёл инвойсов" + (f" по «{q}»" if q else "") + ". Пример: /boxes nintanga или /boxes 4801")
+        return
+    rows = [[(f"{'✅' if i.boxes_json else '📦'} {i.farm} № {i.invoice_no or '?'} · {(i.awb or 'MAWB ?')[-8:]}", f"bx:yes:{i.id}")]
+            for i in invs]
+    await m.answer("К какому инвойсу пакинг-лист? После выбора пришли файл (PDF, фото или Excel).\n"
+                   "✅ — пакинг-лист уже есть, новый заменит его. Искать: /boxes ферма или цифры MAWB.\n"
+                   "Ещё можно в «Учёт»: открой инвойс → «📦 Загрузить пакинг-лист».", reply_markup=_kb(rows))
 
 
 @dp.message(pv, wr, Command("blockers", "packing_status", "chego"))
