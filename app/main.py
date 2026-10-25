@@ -468,7 +468,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-25m · «инвойса не будет» можно вернуть: кнопка, /skipped, секция в приложении"
+VERSION = "2026-10-25n · исправленный инвойс под новым номером заменяет старый (по ферме + MAWB), в т.ч. через /ai"
 
 
 async def _once_recalc_true_rate():

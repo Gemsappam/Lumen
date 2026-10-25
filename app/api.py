@@ -479,11 +479,47 @@ def find_same_invoice(d: dict):
     return None
 
 
+CORR_WORDS = ("revised", "revision", "corrected", "correction", "amended", "replace", "корректир", "исправлен",
+              "замен", "вместо", "переделан", "новая версия", "обновлённ", "обновлен")
+
+
+def find_correction_target(d: dict, hint: str = ""):
+    """Which booked invoice this farm invoice corrects -> {id, farm, invoice_no, where, why} or None.
+    1) same farm + same number; 2) a REVISED invoice under a new number (the farm says so, or the operator does in the
+    /ai explanation): same farm + same MAWB — the MAWB from the document, or its last digits named in the text."""
+    same = find_same_invoice(d)
+    if same:
+        return {**same, "why": "тот же номер"}
+    text = " ".join([hint or "", " ".join(d.get("warnings") or []), d.get("invoice_no") or "", d.get("note") or ""]).lower()
+    if not any(w in text for w in CORR_WORDS):
+        return None
+    tails = {t for t in re.findall(r"(?<!\d)(\d{4,8})(?!\d)", text)}
+    awb = norm_awb(d.get("awb") or "") if d.get("awb") else ""
+    with session() as s:
+        f = resolve_farm(s, d.get("farm") or "")
+        if not f:
+            return None
+        keys = _farm_keys(s, f.name)
+        tdate = {t.id: t.date for t in s.exec(select(TopUp)).all()}
+        cands = [i for i in s.exec(select(Invoice)).all() if _norm_name(i.farm) in keys and (i.awb or "").strip()]
+        hit = [i for i in cands if awb and norm_awb(i.awb) == awb] or \
+              [i for i in cands if any(norm_awb(i.awb).endswith(t) for t in tails)]
+        if not hit:
+            return None
+        i = max(hit, key=lambda x: x.id)
+        where = f"пополнение {tdate[i.topup_id]}" if i.topup_id in tdate else ("в пути, не оплачен" if not i.via_broker else "брокер")
+        return {"id": i.id, "farm": i.farm, "invoice_no": i.invoice_no, "where": where, "awb": i.awb,
+                "why": f"исправленный инвойс по MAWB {i.awb}"}
+
+
 def correct_invoice(inv_id: int, d: dict) -> dict:
     """Corrected farm invoice: replace the lines (and box detail, stems check) — payment, top-up, MAWB stay."""
     with session() as s:
         inv = s.get(Invoice, inv_id)
         old = {l.name: l.stems for l in s.exec(select(Line).where(Line.invoice_id == inv_id)).all()}
+        old_total, old_no = inv.invoice_total_usd, inv.invoice_no
+        d = {**d, "lines": [l for l in d.get("lines") or []          # «Box 4 and 5: 0 stems, $0» = removed, not a line
+                            if (l.get("stems") or 0) > 0 or (l.get("price_usd") or 0) * (l.get("stems") or 0) != 0]}
         if inv.via_broker and inv.ext_id:            # broker farm: money lines stay from the statement
             inv.packing_lines_json = json.dumps([{"name": l.get("name"), "stems": l.get("stems"), "boxes": l.get("boxes")}
                                                  for l in d.get("lines") or []], ensure_ascii=False)
@@ -495,6 +531,12 @@ def correct_invoice(inv_id: int, d: dict) -> dict:
                            stems=l.get("stems") or 0, price_usd=l.get("price_usd") or 0))
             if d.get("invoice_total_usd"):
                 inv.invoice_total_usd = d["invoice_total_usd"]
+                paid = bool(inv.topup_id) or bool(inv.usd_paid)
+                if not paid and inv.est_usd and old_total:          # unpaid: the expected payment follows the new total
+                    inv.est_usd = round(inv.est_usd * d["invoice_total_usd"] / old_total, 2)
+        new_no = (d.get("invoice_no") or "").strip()
+        if new_no and re.sub(r"\D", "", new_no) != re.sub(r"\D", "", old_no or ""):
+            inv.invoice_no = new_no
         if d.get("boxes_detail"):
             inv.boxes_json = json.dumps(d["boxes_detail"], ensure_ascii=False)
         dis = [{**x, "resolved": False} for x in (d.get("box_mismatch") or [])]
@@ -503,7 +545,8 @@ def correct_invoice(inv_id: int, d: dict) -> dict:
             dis.append({"box": "ИТОГО инвойса", "box_stems": d["stems_total"], "units": lines_sum,
                         "varieties": [l.get("name") for l in d.get("lines") or []], "resolved": False})
         inv.discrepancy_json = json.dumps(dis, ensure_ascii=False) if dis else None
-        inv.note = ((inv.note or "") + " · корректировка фермы").strip(" ·")
+        inv.note = ((inv.note or "") + " · корректировка фермы"
+                    + (f" (был № {old_no})" if inv.invoice_no != old_no else "")).strip(" ·")
         s.add(inv); s.commit()
         new = {l.get("name"): l.get("stems") for l in d.get("lines") or []}
         changes = []
@@ -511,6 +554,10 @@ def correct_invoice(inv_id: int, d: dict) -> dict:
             a, b = old.get(n), new.get(n)
             if a != b:
                 changes.append(f"{n}: {a if a is not None else '—'} → {b if b is not None else 'убран'}")
+        if old_total and inv.invoice_total_usd and abs((old_total or 0) - inv.invoice_total_usd) >= 0.01:
+            changes.append(f"сумма инвойса: ${old_total:g} → ${inv.invoice_total_usd:g}")
+        if inv.invoice_no != old_no:
+            changes.append(f"номер: {old_no or '—'} → {inv.invoice_no}")
         out = {"farm": inv.farm, "invoice_no": inv.invoice_no, "changes": changes,
                "awb_key": norm_awb(inv.awb) if inv.awb else None}
     from .backup import mark_dirty

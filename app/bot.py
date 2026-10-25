@@ -825,16 +825,21 @@ async def _route_invoice(uid: int, out: dict, caption: str, note, warn: str, pre
                              [("Не добавлять", "nf:skip")]]), note)
             return
     if out.get("doc_type") == "farm_invoice":
-        from .api import find_same_invoice
-        same = [(d, find_same_invoice(d)) for d in subs]
+        from .api import find_correction_target
+        hint = " ".join([caption or "", " ".join(out.get("warnings") or [])])
+        same = [(d, find_correction_target(d, hint)) for d in subs]
         same = [(d, inv) for d, inv in same if inv]
         if same and "новый" not in caption.lower():
-            d, inv = same[0]
-            CORR[uid] = {"pairs": [(save_draft(dd), ii["id"]) for dd, ii in same],
-                                    "subs": subs, "out": out, "caption": caption, "head": pre + _flow_head(subs) + warn}
-            who = ", ".join(ii["farm"] for _dd, ii in same)
+            rest = [d for d in subs if not any(d is dd for dd, _ii in same)]
+            CORR[uid] = {"pairs": [(save_draft(dd), ii["id"]) for dd, ii in same], "rest": rest,
+                         "subs": subs, "out": out, "caption": caption, "head": pre + _flow_head(subs) + warn}
+            lines = "\n".join(f"• {ii['farm']}: № {dd.get('invoice_no') or '?'} заменит № {ii['invoice_no'] or '?'}"
+                              f"{' · MAWB ' + ii['awb'] if ii.get('awb') else ''} ({ii['where']})" for dd, ii in same)
             await _send(uid,
-                        f"📝 Инвойс {who} № {inv['invoice_no']} уже есть в учёте ({inv['where']}).\nЭто КОРРЕКТИРОВКА инвойса?",
+                        pre + _flow_head(subs) + warn + "\n\n📝 Похоже на КОРРЕКТИРОВКУ инвойсов, которые уже есть в учёте:\n" + lines
+                        + "\n\n«Заменить» — строки и сумма перезапишутся в тех же инвойсах; MAWB, оплата, пополнение, "
+                          "пакинг и баланс фермы останутся. Новых черновиков не будет."
+                        + (f"\nОстальное ({', '.join(d.get('farm') or '?' for d in rest)}) пойдёт как новый инвойс." if rest else ""),
                         _kb([[("✅ Да, корректировка — заменить", "cor:yes")],
                              [("➕ Нет, это новый инвойс", "cor:no")]] + _fix_rows(out)), note)
             return
@@ -1341,6 +1346,8 @@ async def correction_answer(c: CallbackQuery):
         else:
             txt += "\n\nВ чаты эта поставка ещё не уходила — уйдёт уже исправленной."
     await c.message.edit_text(txt[:4000])
+    if p.get("rest"):                                 # farms of the same document that weren't a correction
+        await _start_flow(c.from_user.id, p["rest"], p["out"], p["caption"], None, _flow_head(p["rest"]))
     for inv_id, before, r in done:
         if r["changes"]:
             await send_correction(inv_id, before, f"Корректировка инвойса фермы № {r['invoice_no']}")
