@@ -493,7 +493,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-31a · логистика не больше счёта: при объёмном весе ферм > веса счёта — делим пропорционально; платный вес фермы = max(факт, объём)"
+VERSION = "2026-10-31b · вопрос про доставку до Бауманской только при ручной выгрузке, понятный текст"
 
 
 async def _once_recalc_true_rate():

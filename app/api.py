@@ -2050,7 +2050,7 @@ async def export(tid: int, audience: str | None = None, uid: int = Depends(user_
         t = s.get(TopUp, tid)
         if not t:
             raise HTTPException(404)
-    names = await export_topups([tid], uid, "", audience=_audience(uid, audience), only=True)
+    names = await export_topups([tid], uid, "", audience=_audience(uid, audience), only=True, nag=True)
     return {"ok": True, "sheet": names[0] if names else None}
 
 
@@ -2112,7 +2112,8 @@ def _ledger_sheet(path):
     wb.save(path)
 
 
-async def export_topups(ids: list[int], uid: int, caption: str, audience: str = "owner", only: bool = False):
+async def export_topups(ids: list[int], uid: int, caption: str, audience: str = "owner", only: bool = False,
+                        nag: bool = False):
     """Rebuild sheets and send ONE file.
     owner: sheets are rebuilt inside the master учет.xlsx (formulas live); if only=True the file sent
            contains just these sheets (+ «Пополнения», which their formulas use).
@@ -2170,7 +2171,8 @@ async def export_topups(ids: list[int], uid: int, caption: str, audience: str = 
         await BOT.send_document(uid, FSInputFile(out, filename=fname),
                                 caption=cap + ("" if len(names) == 1 else "\nЛисты: " + ", ".join(f"«{n}»" for n in names)))
         try:
-            await _lastmile_nag(uid, ids)
+            if nag:                               # only when a person asked for the file, not on automatic rebuilds
+                await _lastmile_nag(uid, ids)
         except Exception as e:
             print("[lumen] lastmile nag:", e, flush=True)
     if out != tmp:
@@ -2186,7 +2188,7 @@ async def export_all(audience: str | None = None, uid: int = Depends(user_id)):
     """Every top-up rebuilt into one file and sent to the chat."""
     with session() as s:
         ids = [t.id for t in s.exec(select(TopUp).order_by(TopUp.id)).all()]
-    names = await export_topups(ids, uid, "📊 Учёт: все пополнения", audience=_audience(uid, audience))
+    names = await export_topups(ids, uid, "📊 Учёт: все пополнения", audience=_audience(uid, audience), nag=True)
     if BOT and names:
         from .backup import backup_now
         try:
@@ -2687,16 +2689,15 @@ async def _lastmile_nag(uid: int, topup_ids: list):
         keys = {norm_awb(i.awb): i.awb for i in s.exec(select(Invoice)).all()
                 if i.topup_id in set(topup_ids) and (i.awb or "").strip()}
     miss = [(k, a) for k, a in keys.items() if status(k) == "missing"]
-    wait = [a for k, a in keys.items() if status(k) == "not_picked"]
-    if not miss and not wait:
+    if not miss:
         return
-    txt = "⚠️ Себестоимость в файле НЕполная (видно в колонке «Себестоимость»):"
-    if miss:
-        txt += f"\n• забрали со склада ТК, но нет доставки до «{WAREHOUSE}»: " + ", ".join(a for _k, a in miss)
-    if wait:
-        txt += "\n• ещё не забраны со склада ТК: " + ", ".join(wait[:10])
-    if miss:
-        txt += "\n\nВнеси сумму — выгрузи файл ещё раз, и себестоимость станет полной."
+    pk = _picked()
+    txt = (f"🚚 Не хватает одной суммы — сколько стоила машина со склада ТК до «{WAREHOUSE}».\n"
+           "Эти MAWB отмечены «Забрал со склада ТК», а расход на доставку не внесён:\n"
+           + "\n".join(f"• {a} — забрали {str(pk.get(k) or '')[:10]}" for k, a in miss)
+           + "\n\nПока его нет, в Excel у этих грузов «Себестоимость: неполная». "
+             "Нажми MAWB и впиши сумму за машину (если одной машиной везли несколько MAWB — отметишь их там же; "
+             "забрали сами — 0 ₽). Потом выгрузи файл ещё раз.")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"Внести доставку: {a}", callback_data=f"lm:{k}")]
                                                for k, a in miss[:10]]) if miss else None
     await BOT.send_message(uid, txt, reply_markup=kb)

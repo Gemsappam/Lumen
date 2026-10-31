@@ -2039,7 +2039,7 @@ async def excel_cmd(m: Message):
         return
     await m.answer("Собираю учёт…")
     aud = "owner" if roles.can_write(roles.role_of(m.from_user.id)) else "operator"
-    await export_topups(ids, m.from_user.id, "📊 Актуальный учёт", audience=aud)
+    await export_topups(ids, m.from_user.id, "📊 Актуальный учёт", audience=aud, nag=True)
 
 
 @dp.message(pv, wr, F.document)
