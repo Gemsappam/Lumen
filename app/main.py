@@ -284,6 +284,31 @@ def _fix_swapped_dates():
             print(f"[lumen] fixed {n} swapped invoice dates", flush=True)
 
 
+def _fix_7081_actual():
+    """Once (31.10.2026): MAWB 369-11530551 was billed by ACTUAL weight (TOTAL AWB 254 kg = actual 254.35),
+    but the farms got their volumetric kg. Put the actual kg (only if the stored ones are still the old numbers)."""
+    from .api import _settings, SETTINGS
+    from .models import AwbWeights, Invoice
+    if _settings().get("fix_7081_actual"):
+        return
+    old = {"B&M FIORI": (105.18,), "Nintanga": (12.4,), "Tessa": (21.8, 27.7), "Rosas Del Viento": (157.2,)}
+    new = {"B&M FIORI": 84.0, "Nintanga": 9.9, "Tessa": 27.7, "Rosas Del Viento": 132.75}
+    with session() as s:
+        aw = s.get(AwbWeights, "36911530551")
+        if aw:
+            d = json.loads(aw.farm_kg_json or "{}")
+            if all(any(abs((d.get(f) or 0) - v) < 0.01 for v in vs) for f, vs in old.items()):
+                aw.farm_kg_json = json.dumps({**d, **new}, ensure_ascii=False)
+                s.add(aw)
+                for i in s.exec(select(Invoice)).all():
+                    if (i.awb or "").replace("-", "") == "36911530551" and i.farm in new \
+                            and any(abs((i.weight_kg or 0) - v) < 0.01 for v in old[i.farm]):
+                        i.weight_kg = new[i.farm]
+                        s.add(i)
+        s.commit()
+    SETTINGS.write_text(json.dumps({**_settings(), "fix_7081_actual": True}, ensure_ascii=False))
+
+
 def _fix_positano_7081():
     """Once (31.10.2026): MAWB 369-11530551 (Logiztik LOG-0131 7081) — Positano Farms (= Tessa) was taken by its
     volumetric 21.8 kg, but its actual weight 27.7 kg is larger, and the chargeable weight is the larger one."""
@@ -361,6 +386,7 @@ def seed():
         print(f"[lumen] seed_picked: {e}", flush=True)
     _fix_broker_swap()
     _fix_positano_7081()
+    _fix_7081_actual()
     _fix_swapped_dates()
     _fix_double_broker()
     _merge_broker_dupes()
@@ -493,7 +519,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-31c · Excel: себестоимость до ТК МСК и общая до склада Бауманская — отдельными колонками"
+VERSION = "2026-10-31f · отчёт о весе: кг ферм по той колонке, по которой выставлена AWB (TOTAL AWB)"
 
 
 async def _once_recalc_true_rate():

@@ -211,7 +211,13 @@ def parse_weight_report(data: bytes) -> dict:
     ip = h.index("pcs")
     ia = next(i for i, x in enumerate(h) if x.startswith("actual weight"))
     iv = next(i for i, x in enumerate(h) if x.startswith("volume weight"))
-    out = []
+    out, awb_kg = [], None
+    for r in rows[hi + 1:]:
+        if str(r[0] or "").strip().upper().startswith("TOTAL AWB"):      # what the airline billed (chargeable)
+            try:
+                awb_kg = max(float(r[ia] or 0), float(r[iv] or 0)) or None
+            except (TypeError, ValueError):
+                pass
     for r in rows[hi + 1:]:
         name = str(r[0] or "").strip()
         if not name or name.upper().startswith(("SUBTOTAL", "TOTAL")):
@@ -220,12 +226,18 @@ def parse_weight_report(data: bytes) -> dict:
             continue
         out.append({"farm_raw": name, "packs": int(float(r[ip] or 0)),
                     "act": float(r[ia] or 0), "vol": float(r[iv] or 0)})
-    # chargeable (платный) weight of a farm = the larger of its actual and volumetric weight
-    use = "vol" if sum(x["vol"] for x in out) > sum(x["act"] for x in out) else "act"
+    # Split by the column the AWB was actually billed by: «TOTAL AWB» 254 kg ≈ actual total 254.35 -> actual
+    # weights (their sum = the bill, no shares). No TOTAL AWB -> the larger column by total (usually volume).
+    ta, tv = sum(x["act"] for x in out), sum(x["vol"] for x in out)
+    if awb_kg:
+        use = "act" if abs(ta - awb_kg) <= abs(tv - awb_kg) else "vol"
+    else:
+        use = "vol" if tv > ta else "act"
     for x in out:
-        x["kg"] = round(max(x["act"], x["vol"]), 2)
+        x["kg"] = round(x[use], 2)
     country = {"UIO": "Эквадор", "GYE": "Эквадор", "BOG": "Колумбия", "MDE": "Колумбия"}.get(origin or "", "Эквадор")
-    return {"rows": out, "country": country, "eta": (date + timedelta(days=1)) if date else None, "use": use}
+    return {"rows": out, "country": country, "eta": (date + timedelta(days=1)) if date else None, "use": use,
+            "awb_kg": awb_kg}
 
 
 # ---- Ecuador: «prealerta» xlsx (UIO -> AMS) ---------------------------------------------------------

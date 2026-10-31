@@ -42,6 +42,7 @@ COMMANDS = [
     ("pay", "неоплаченные инвойсы и логистика"),
     ("pickup", "что прибыло и ждёт «забрал со склада»"),
     ("lastmile", "доставка со склада ТК до Бауманской"),
+    ("check", "проверка расчётов (перерасход, скачки)"),
     ("arrivals", "поставки без отметки о прибытии"),
     ("awb", "инвойсы по MAWB"),
     ("packing", "пакинг-листы"),
@@ -389,7 +390,7 @@ async def _xlsx_router(m: Message, data: bytes):
                            f"{len(info['rows'])} ферм ({info['country']}). AWB в файле нет — напиши MAWB этого отчёта, "
                            "например `369-99583094`. В следующий раз можно сразу в подписи к файлу.", parse_mode="Markdown")
             return
-        await _consolidation(m, awb, info["country"], info["rows"], info["eta"])
+        await _consolidation(m, awb, info["country"], info["rows"], info["eta"], info.get("awb_kg"))
         return
     if kbreak.is_prealert(data):
         _record(m, "consolidation")
@@ -496,7 +497,7 @@ def _farm_label(raw: str) -> str:
     return n.title() if n.isupper() or n.islower() else n
 
 
-async def _consolidation(m: Message, awb_raw: str, country: str, rows: list, eta=None):
+async def _consolidation(m: Message, awb_raw: str, country: str, rows: list, eta=None, awb_kg=None):
     """Ecuador / Colombia consolidation list: boxes per farm (+kg if given) -> packing chats get it before packings."""
     from . import kbreak
     from .ai import find_mawb
@@ -519,7 +520,15 @@ async def _consolidation(m: Message, awb_raw: str, country: str, rows: list, eta
         w = store_breakdown(awb, [{"farm": f["farm"], "kg": f["kg"]} for f in farms if f["kg"]])
     was_sent = kbreak.is_sent(norm_awb(awb))
     kbreak.store_rows(norm_awb(awb), awb, country, farms, eta)
-    lines = "\n".join(f"• {f['farm']}: {f['packs']} кор." + (f" · {f['kg']:g} кг" if f["kg"] else "") for f in farms)
+    tot_kg = sum(f["kg"] for f in farms)
+    share = bool(awb_kg and tot_kg > awb_kg + 0.5)
+    lines = "\n".join(f"• {f['farm']}: {f['packs']} кор." + (f" · {f['kg']:g} кг" if f["kg"] else "")
+                      + (f" (доля в счёте ≈ {f['kg'] * awb_kg / tot_kg:.1f} кг)" if share and f["kg"] else "") for f in farms)
+    if share:
+        lines += (f"\n\n⚖️ Кг ферм вместе {tot_kg:g}, а AWB выставлена за {awb_kg:g} кг — счёт ТК делится "
+                  "пропорционально, в скобках сколько кг счёта приходится на ферму.")
+    elif awb_kg:
+        lines += f"\n\n⚖️ AWB выставлена за {awb_kg:g} кг — столько же, сколько кг ферм вместе: счёт делится ровно по этим кг."
     arrive = kbreak._state().get(norm_awb(awb), {}).get("arrive")
     await m.answer(f"📋 Консолидация {kbreak.flag(country)} · MAWB {awb}: {sum(f['packs'] for f in farms)} кор.\n{lines}"
                    + (("\n\n" + _applied_text(w)) if w else "")
@@ -1278,6 +1287,29 @@ async def lastmile_reminder(uid_only: int | None = None):
             await bot.send_message(uid, txt, reply_markup=kb)
         except Exception:
             pass
+
+
+async def watch_check(uid_only: int | None = None):
+    """Night watch of the calculations (app/watch.py): over-allocated freight, unexplained jumps, orphan bills."""
+    from . import watch
+    try:
+        issues = watch.run()
+    except Exception as e:
+        issues = [f"проверка сама упала: {type(e).__name__}: {str(e)[:200]}"]
+    txt = watch.report(issues, quiet_ok=uid_only is None)
+    if not txt:
+        return
+    for uid in ([uid_only] if uid_only else _money_people()):
+        try:
+            await bot.send_message(uid, txt[:4000])
+        except Exception:
+            pass
+
+
+@dp.message(pv, wr, Command("check", "proverka"))
+async def check_cmd(m: Message):
+    """Проверка расчётов прямо сейчас."""
+    await watch_check(m.from_user.id)
 
 
 @dp.message(pv, wr, Command("lastmile", "dostavka", "baumanskaya"))
@@ -2207,7 +2239,7 @@ async def mawb_followup(m: Message):
     MAWB + 'Farm kg' pairs in one message -> a kg breakdown for that MAWB."""
     info = _CONS_WAIT.pop(m.from_user.id, None)
     if info:
-        await _consolidation(m, ai.find_mawb(m.text), info["country"], info["rows"], info["eta"])
+        await _consolidation(m, ai.find_mawb(m.text), info["country"], info["rows"], info["eta"], info.get("awb_kg"))
         return
     flow = FLOW.get(m.from_user.id)
     if flow and flow.get("awb_wait"):
@@ -3228,6 +3260,10 @@ async def scheduler_loop():
                 await arrival_check()
                 await pickup_check()
                 await lastmile_reminder()
+            if now.hour == 8 and now.minute < 15 and st.get("last_watch") != now.strftime("%Y-%m-%d"):
+                SETTINGS.write_text(json.dumps({**st, "last_watch": now.strftime("%Y-%m-%d")}))
+                st = _settings()
+                await watch_check()
             lz_slot = now.strftime("%Y-%m-%d-%H") if now.hour in (9, 12, 15, 18, 21) and now.minute < 15 else None
             if lz_slot and st.get("last_lz") != lz_slot:
                 SETTINGS.write_text(json.dumps({**st, "last_lz": lz_slot}))

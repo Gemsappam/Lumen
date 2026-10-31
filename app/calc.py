@@ -379,10 +379,11 @@ def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result
             # BUT never more than the bill: Ecuador/Colombia farm kg are volumetric (Weight & Dimensions report,
             # 296.6 kg) while the AWB / Floratrack bill is 254 kg -> then the bill is split in proportion to farm kg.
             kg_farms = max(g["kg_total"], sum(w))
-            if kg_farms > g["kg_bill"] + 0.5:
-                res.warnings.append(f"MAWB {awb}: по счёту {g['provider'] or 'ТК'} {g['kg_bill']:g} кг, кг ферм "
-                                    f"(платный вес по разбивке) {kg_farms:g} кг — счёт делю пропорционально кг ферм, "
-                                    f"{g['rub'] / kg_farms:,.0f} ₽ на кг фермы".replace(",", " "))
+            if kg_farms > g["kg_bill"]:
+                if kg_farms > g["kg_bill"] + 0.5:
+                    res.warnings.append(f"MAWB {awb}: по счёту {g['provider'] or 'ТК'} {g['kg_bill']:g} кг, кг ферм "
+                                        f"по разбивке {kg_farms:g} кг — счёт делю пропорционально кг ферм, "
+                                        f"{g['rub'] / kg_farms:,.0f} ₽ на кг фермы".replace(",", " "))
                 tot = kg_farms
             else:
                 if g["kg_total"] and abs(g["kg_bill"] - g["kg_total"]) > 0.5:
