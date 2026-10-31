@@ -220,9 +220,10 @@ def parse_weight_report(data: bytes) -> dict:
             continue
         out.append({"farm_raw": name, "packs": int(float(r[ip] or 0)),
                     "act": float(r[ia] or 0), "vol": float(r[iv] or 0)})
+    # chargeable (платный) weight of a farm = the larger of its actual and volumetric weight
     use = "vol" if sum(x["vol"] for x in out) > sum(x["act"] for x in out) else "act"
     for x in out:
-        x["kg"] = round(x[use], 2)
+        x["kg"] = round(max(x["act"], x["vol"]), 2)
     country = {"UIO": "Эквадор", "GYE": "Эквадор", "BOG": "Колумбия", "MDE": "Колумбия"}.get(origin or "", "Эквадор")
     return {"rows": out, "country": country, "eta": (date + timedelta(days=1)) if date else None, "use": use}
 

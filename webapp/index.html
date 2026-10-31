@@ -304,6 +304,30 @@ async function boxesBlock(iid, el){
     try{ await api(`/invoices/${iid}/boxes`,{method:'DELETE'}); toast('Пакинг-лист убран'); boxesBlock(iid,el) }catch(e){ toast(e.message) } });
 }
 
+// ---------- доставка со склада ТК до нашего склада: одна машина = одна сумма на один или несколько MAWB ----------
+function lastMileForm(keys, LM){
+  const all=[...(LM.missing||[]),...(LM.at_tk||[])];
+  keys.forEach(k=>{ if(!all.find(x=>x.key===k)) all.unshift({key:k,awb:k.slice(0,3)+'-'+k.slice(3),farms:[],stems:0}) });
+  const tr=(LM.trips||[]).find(t=>t.keys.includes(keys[0]));
+  const sel=new Set(tr?tr.keys:keys);
+  tr?.keys.forEach(k=>{ if(!all.find(x=>x.key===k)) all.push({key:k,awb:k.slice(0,3)+'-'+k.slice(3),farms:[],stems:0}) });
+  const w=document.createElement('div');
+  w.style.cssText='position:fixed;inset:0;background:var(--scrim);z-index:20;display:flex;align-items:flex-end';
+  w.innerHTML=`<div style="background:var(--bg2);width:100%;border-radius:18px 18px 0 0;padding:14px 0 calc(16px + env(safe-area-inset-bottom,0));max-height:85vh;overflow:auto">
+    <h2 style="margin-top:4px">Доставка до ${esc(LM.warehouse||'склада')}</h2>
+    <p class="hint" style="margin:0 16px 10px">Сколько стоила машина со склада ТК. Отметь все MAWB, которые она везла — сумма разделится поровну на все их стебли и войдёт в себестоимость.</p>
+    <div class="group">${all.map(x=>`<label class="row"><input type="checkbox" class="lmc" value="${esc(x.key)}" ${sel.has(x.key)?'checked':''}>
+      <div class="grow"><div class="t">${esc(x.awb)}</div><div class="s">${esc((x.farms||[]).join(', '))}${x.stems?' · '+fmt(x.stems)+' ст':''}${x.picked?'':' · ещё на складе ТК'}</div></div></label>`).join('')}</div>
+    <form class="group" style="margin-top:10px" id="lmf"><div class="field"><label>Сумма за машину, ₽ (0 — забрали сами)</label><input name="rub" inputmode="decimal" value="${tr?tr.rub:''}" placeholder="3500"></div></form>
+    <div class="actions"><button id="lmc">Позже</button><button class="primary" id="lmo">Сохранить</button></div></div>`;
+  document.body.appendChild(w);
+  w.querySelector('#lmc').onclick=()=>w.remove();
+  w.querySelector('#lmo').onclick=async()=>{
+    const ks=[...w.querySelectorAll('.lmc:checked')].map(x=>x.value), rub=numOrNull(w.querySelector('#lmf').rub.value);
+    if(!ks.length) return toast('Отметь хотя бы один MAWB'); if(rub==null) return toast('Впиши сумму (0 — если бесплатно)');
+    try{ const r=await api('/lastmile',{method:'POST',body:{keys:ks,rub}}); w.remove(); toast(r.text.split('\n')[0]); render(CUR_TAB==='stock'?'stock':CUR_TAB,{}) }catch(e){ toast(e.message) } };
+}
+
 function toast(t){const e=document.getElementById('toast');e.textContent=noEmo(t);e.classList.add('on');setTimeout(()=>e.classList.remove('on'),2600)}
 
 async function api(path, opt={}){
@@ -864,7 +888,7 @@ async transit({seg,q}={}){
 async transitInv({i,v}){
   $app.innerHTML=`<h1>${esc(i.farm)}</h1>
   <p class="sub">MAWB ${esc(i.awb||'?')} · ${i.paid_state==='paid'?'оплачен из пополнения '+esc(i.topup):'не оплачен · ≈$'+fmt(i.est_usd||0,2)}
-    ${i.eta?' · прибытие '+esc(i.eta.replace('T',' ')):''}<br>Логистика: ${esc(i.logi_source)}${i.approx?' · приблизительно'+(i.approx_big?', ±10%':', ±1–3%')+(i.approx_why?' ('+esc(i.approx_why)+')':''):''}</p>
+    ${i.eta?' · прибытие '+esc(i.eta.replace('T',' ')):''}<br>${i.lm_status==='full'?'<b style="color:var(--ok)">Себестоимость полная — вкл. доставку до склада</b>':i.lm_status==='missing'?'<b style="color:var(--warn)">Себестоимость неполная — нет доставки до склада</b> · <u data-lmi="1" style="cursor:pointer">внести</u>':''}<br>Логистика: ${esc(i.logi_source)}${i.approx?' · приблизительно'+(i.approx_big?', ±10%':', ±1–3%')+(i.approx_why?' ('+esc(i.approx_why)+')':''):''}</p>
   <h2>Логистика</h2>
   <div class="group">${legsOf(i).map(l=>`<div class="row"><div class="grow"><div class="t">${esc(l.name)}</div><div class="s">${esc(l.src)}</div></div>
       <div class="v"><div class="num">${fmt(l.rub)} ₽</div><div class="s num">${fmt(l.per,2)} ₽/ст</div></div></div>`).join('')}
@@ -875,7 +899,7 @@ async transitInv({i,v}){
   <tbody>${i.lines.map(l=>`<tr data-ln="${l.id}" style="cursor:pointer"><td style="padding:8px 4px">${esc(l.name)}</td><td class="calc">${fmt(l.stems)}</td>
     <td class="calc">${l.kg_fixed?`<b>${fmt(l.kg_box,1)}/кор</b><br><span class="s">${fmt(l.kg_eff,1)}</span>`:(l.kg_eff!=null?`${fmt(l.kg_eff,1)}<br><span class="s">по ст.</span>`:'—')}</td>
     <td class="calc">${l.price_usd}</td>
-    <td class="calc">${fmt(l.price_rub,2)}</td>${legsOf(i).map(g=>`<td class="calc">${fmt(g.k==='air'?l.air_rub:l.msk_rub,2)}</td>`).join('')}
+    <td class="calc">${fmt(l.price_rub,2)}</td>${legsOf(i).map(g=>`<td class="calc">${fmt(l[g.k+'_rub'],2)}</td>`).join('')}
     <td class="calc"><b>${i.approx?'≈':''}${fmt(l.total_rub,2)}</b></td></tr>`).join('')}</tbody></table></div>
   <p class="hint" style="margin:6px 16px">Вес: ${i.weight_kg?`фикс. ${fmt(i.kg_fixed||0,1)} кг + по стеблям ${i.kg_rest!=null?fmt(i.kg_rest,1):'—'} кг = ${fmt(i.weight_kg,1)} кг фермы`:'кг фермы ещё нет (нет разбивки)'}.
     Нажми на строку, чтобы задать вес коробки.</p>
@@ -888,6 +912,7 @@ async transitInv({i,v}){
   <div class="actions"><button id="edit">Редактировать инвойс</button></div>`;
   document.getElementById('pay')?.addEventListener('click',()=>payForm({kind:'invoices',id:i.id,usd:i.est_usd}));
   boxesBlock(i.id, document.getElementById('boxesSlot'));
+  $app.querySelector('[data-lmi]')?.addEventListener('click',async()=>lastMileForm([String(i.awb||'').replace(/\D/g,'')], await api('/lastmile')));
   if(ME.can_write) $app.querySelectorAll('[data-ln]').forEach(r=>r.onclick=async()=>{
     const l=i.lines.find(x=>x.id==r.dataset.ln);
     const v=prompt(`${l.name}\nКоробок: ${l.boxes||1}\nВес ОДНОЙ коробки, кг (пусто — считать по стеблям):`, l.kg_box??'');
@@ -909,7 +934,7 @@ async transitInv({i,v}){
 
 // ======================= ТОВАРНЫЕ ОСТАТКИ (по инвойсам в пути) =======================
 async stock(){
-  const v=await api('/stock');
+  const [v,LM]=await Promise.all([api('/stock'),api('/lastmile').catch(()=>({missing:[],at_tk:[],trips:[]}))]);
   const sum=l=>l.reduce((a,i)=>a+(i.rub_goods||0),0);
   const byAwb=l=>{const m={}; l.forEach(i=>(m[i.awb||'без MAWB']??=[]).push(i)); return Object.entries(m)};
   const rows=(l,showPaid)=>l.map(i=>`<div class="row" data-ti="${i.id}"><div class="grow"><div class="t">${esc(i.farm)}</div>
@@ -927,10 +952,20 @@ async stock(){
       `<div class="row" style="background:var(--bg2,rgba(127,127,127,.08))"><div class="grow"><div class="t">${t}</div><div class="s">${l.length} инв.</div></div>
        <div class="v"><div class="num"><b>${l.some(i=>i.approx)?'≈ ':''}${fmt(sum(l))} ₽</b></div></div></div>${rows(l,false)}`).join('')}</div>
   ${v.warehouse.length?`${head('Прибыл — на складе ТК',v.warehouse,'нажми «Забрал», когда заберёте — уйдёт из остатков')}${wh}</div>`:''}
-  ${head('Не оплачено',v.unpaid,'деньги, которые ещё должны фермам — уходит после оплаты')}${rows(v.unpaid,false)}</div>`;
+  ${head('Не оплачено',v.unpaid,'деньги, которые ещё должны фермам — уходит после оплаты')}${rows(v.unpaid,false)}</div>
+  <h2>Доставка до склада ${esc(LM.warehouse||'Опт Склад Бауманская')}</h2>
+  <div class="group">${LM.missing.length?LM.missing.map(x=>`<div class="row" style="cursor:default"><div class="grow">
+      <div class="t"><i class="dot dw"></i>MAWB ${esc(x.awb)}</div><div class="s">${esc(x.farms.join(', '))} · ${fmt(x.stems)} ст · забрали ${esc(String(x.picked).slice(0,10))} · себестоимость неполная</div></div>
+      ${ME.can_write?`<div class="v"><button class="sm primary" data-lm="${esc(x.key)}">Внести</button></div>`:''}</div>`).join('')
+    :'<div class="row" style="cursor:default"><div class="grow"><div class="s"><i class="dot dk"></i>По всем забранным грузам доставка внесена — себестоимость полная.</div></div></div>'}
+    ${LM.trips.slice(0,6).map(t=>`<div class="row" style="cursor:default"><div class="grow"><div class="t">${fmt(t.rub)} ₽ · ${t.keys.map(k=>k.slice(0,3)+'-'+k.slice(3)).join(', ')}</div>
+      <div class="s">${esc(t.ts)}${t.rub?'':' · забрали сами'}</div></div>${ME.can_write?`<div class="v"><button class="sm" data-lmre="${esc(t.keys[0])}">Изменить</button></div>`:''}</div>`).join('')}</div>`;
+  $app.querySelectorAll('[data-lm],[data-lmre]').forEach(b=>b.onclick=()=>lastMileForm([b.dataset.lm||b.dataset.lmre], LM));
   $app.querySelectorAll('[data-pk]').forEach(b=>b.onclick=async e=>{ e.stopPropagation();
     if(!confirm('Груз MAWB '+b.dataset.pk+' забран со склада ТК?'))return;
-    await api('/stock/picked/'+encodeURIComponent(b.dataset.pk),{method:'POST'}); toast('Убрал из остатков'); render('stock') });
+    await api('/stock/picked/'+encodeURIComponent(b.dataset.pk),{method:'POST'}); toast('Убрал из остатков');
+    const lm=await api('/lastmile').catch(()=>null); render('stock');
+    if(lm&&ME.can_write) lastMileForm([b.dataset.pk.replace(/\D/g,'')], lm) });
   $app.querySelectorAll('[data-ti]').forEach(e=>e.onclick=async()=>{ const t=await api('/transit');
     const i=t.invoices.find(x=>x.id==e.dataset.ti); if(i) go('transitInv',{i,v:t}); else toast('Подробности — в «Откупах»') });
 },
@@ -1115,7 +1150,7 @@ async farm({f}){
 };
 
 // logistics legs shown for an invoice: ТК Кения only for Kenya (or when it has money), ТК МСК always
-const legsOf=i=>['air','msk'].map(k=>({k,...(i.legs||{})[k]})).filter(l=>l.name&&(l.k==='msk'||i.country==='Кения'||l.rub));
+const legsOf=i=>['air','msk','lm'].map(k=>({k,...(i.legs||{})[k]})).filter(l=>l.name&&(l.k==='msk'||(l.k==='air'&&i.country==='Кения')||l.rub||(l.k==='lm'&&i.arrived_at)));
 
 // «Оплачен»: which top-up + $ (₽ by that top-up's rate unless typed)
 async function payForm({kind,id,usd}){

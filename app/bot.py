@@ -41,6 +41,7 @@ COMMANDS = [
     ("statement", "сверить стейтмент фермы"),
     ("pay", "неоплаченные инвойсы и логистика"),
     ("pickup", "что прибыло и ждёт «забрал со склада»"),
+    ("lastmile", "доставка со склада ТК до Бауманской"),
     ("arrivals", "поставки без отметки о прибытии"),
     ("awb", "инвойсы по MAWB"),
     ("packing", "пакинг-листы"),
@@ -1163,6 +1164,126 @@ async def fix_button(c: CallbackQuery):
                            "• «не хватает коробки: Freedom 50 см 300 ст»\n"
                            "• «Explorer не 60, а 70 см»\n"
                            "Перечитаю инвойс с этим и покажу, что изменилось. /cancel — передумал.")
+
+
+# ---------- last mile: ТК warehouse -> Опт Склад Бауманская ----------------------------------
+LMWAIT: dict = {}     # user -> {"keys": [MAWB keys in this truck], "cands": [...], "msg": message}
+
+
+def _lm_kb(uid: int):
+    w = LMWAIT.get(uid) or {}
+    rows = []
+    for c in w.get("cands", [])[:12]:
+        on = c["key"] in w["keys"]
+        rows.append([(f"{'☑' if on else '☐'} {c['awb']} · {', '.join(c['farms'])[:28]}", f"lmt:{c['key']}")])
+    rows.append([("0 ₽ — забрали сами / бесплатно", "lm0")])
+    rows.append([("Внесу позже", "lmx")])
+    return _kb(rows)
+
+
+def _lm_text(uid: int) -> str:
+    from .lastmile import WAREHOUSE
+    w = LMWAIT.get(uid) or {}
+    sel = [c for c in w.get("cands", []) if c["key"] in w["keys"]]
+    st = sum(c["stems"] for c in sel)
+    return (f"🚚 Доставка со склада ТК до «{WAREHOUSE}»: сколько стоила машина, ₽?\n"
+            f"В машине: {', '.join(c['awb'] for c in sel) or '—'} · {st:,.0f} ст".replace(",", " ")
+            + "\nЕсли этой же машиной забрали ещё MAWB — отметь их ниже. Сумма разделится поровну на все стебли."
+            + "\n\nНапиши сумму числом, например: 3500")
+
+
+async def ask_lastmile(uid: int, keys: list, note=None):
+    from .lastmile import pending
+    p = pending()
+    cands = p["missing"] + [c for c in p["at_tk"] if c["key"] not in {x["key"] for x in p["missing"]}]
+    for k in keys:                                     # the MAWB just picked up must be in the list
+        if k not in {c["key"] for c in cands}:
+            from .api import awb_spread
+            sp = awb_spread(k)
+            cands.insert(0, {"key": k, "awb": f"{k[:3]}-{k[3:]}", "farms": sorted({x["farm"] for x in sp}),
+                             "stems": sum(x["stems"] for x in sp)})
+    cands.sort(key=lambda c: c["key"] not in keys)
+    LMWAIT[uid] = {"keys": list(keys), "cands": cands}
+    if note is not None:
+        try:
+            await note.edit_text(_lm_text(uid), reply_markup=_lm_kb(uid))
+            LMWAIT[uid]["msg"] = note
+            return
+        except Exception:
+            pass
+    LMWAIT[uid]["msg"] = await bot.send_message(uid, _lm_text(uid), reply_markup=_lm_kb(uid))
+
+
+async def _lm_save(uid: int, rub: float):
+    from .api import post_lastmile, LastMileIn
+    w = LMWAIT.pop(uid, None)
+    if not w or not w["keys"]:
+        return "Не выбран ни один MAWB."
+    r = post_lastmile(LastMileIn(keys=w["keys"], rub=rub), uid)
+    return "✅ " + r["text"]
+
+
+@dp.callback_query(F.data.startswith("lmt:"), wr)
+async def lm_toggle(c: CallbackQuery):
+    w = LMWAIT.get(c.from_user.id)
+    await c.answer()
+    if not w:
+        await c.message.edit_text("Устарело — /lastmile")
+        return
+    k = c.data.split(":", 1)[1]
+    w["keys"] = [x for x in w["keys"] if x != k] if k in w["keys"] else w["keys"] + [k]
+    try:
+        await c.message.edit_text(_lm_text(c.from_user.id), reply_markup=_lm_kb(c.from_user.id))
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.in_({"lm0", "lmx"}), wr)
+async def lm_zero_later(c: CallbackQuery):
+    await c.answer()
+    if c.data == "lmx":
+        LMWAIT.pop(c.from_user.id, None)
+        await c.message.edit_text("Ок, позже. Напомню; внести можно командой /lastmile или в «Учёте» → «Остатки».")
+        return
+    await c.message.edit_text(await _lm_save(c.from_user.id, 0))
+
+
+@dp.callback_query(F.data.startswith("lm:"), wr)
+async def lm_start(c: CallbackQuery):
+    await c.answer()
+    await ask_lastmile(c.from_user.id, [c.data.split(":", 1)[1]], c.message)
+
+
+@dp.message(pv, wr, F.from_user.id.func(lambda i: i in LMWAIT),
+            F.text.func(lambda t: not t.startswith("/") and bool(re.fullmatch(r"\s*\d[\d\s]*(?:[.,]\d+)?\s*(?:₽|р|руб\.?|rub)?\s*", t or "", re.I))))
+async def lm_sum(m: Message):
+    rub = float(re.sub(r"[^\d.,]", "", m.text).replace(",", "."))
+    await m.answer(await _lm_save(m.from_user.id, rub))
+
+
+async def lastmile_reminder(uid_only: int | None = None):
+    """Picked up, no last-mile ₽ -> ask the money people."""
+    from .lastmile import pending, WAREHOUSE
+    miss = pending()["missing"]
+    if not miss:
+        if uid_only:
+            await bot.send_message(uid_only, f"Все забранные грузы с доставкой до «{WAREHOUSE}» — себестоимость полная.")
+        return
+    txt = (f"🚚 Нет расхода на доставку до «{WAREHOUSE}» — себестоимость этих грузов НЕполная:\n"
+           + "\n".join(f"• {x['awb']} ({', '.join(x['farms'])}) — забрали {x['picked'][:10]}" for x in miss[:15])
+           + "\n\nНажми MAWB и впиши сумму (несколько MAWB одной машиной — отметишь там же).")
+    kb = _kb([[(f"Внести: {x['awb']}", f"lm:{x['key']}")] for x in miss[:15]])
+    for uid in ([uid_only] if uid_only else _money_people()):
+        try:
+            await bot.send_message(uid, txt, reply_markup=kb)
+        except Exception:
+            pass
+
+
+@dp.message(pv, wr, Command("lastmile", "dostavka", "baumanskaya"))
+async def lastmile_cmd(m: Message):
+    """Доставка со склада ТК до Опт Склад Бауманская."""
+    await lastmile_reminder(m.from_user.id)
 
 
 @dp.message(pv, wr, F.from_user.id.func(lambda i: i in FIXWAIT),
@@ -3023,6 +3144,7 @@ async def picked_answer(c: CallbackQuery):
                                   f"({', '.join(farms)}) — убрал из товарных остатков.")
     except Exception:
         pass
+    await ask_lastmile(c.from_user.id, [k])
 
 
 @dp.callback_query(F.data.startswith("pkn:"), wr)
@@ -3105,6 +3227,7 @@ async def scheduler_loop():
                 await missing_reminder()
                 await arrival_check()
                 await pickup_check()
+                await lastmile_reminder()
             lz_slot = now.strftime("%Y-%m-%d-%H") if now.hour in (9, 12, 15, 18, 21) and now.minute < 15 else None
             if lz_slot and st.get("last_lz") != lz_slot:
                 SETTINGS.write_text(json.dumps({**st, "last_lz": lz_slot}))

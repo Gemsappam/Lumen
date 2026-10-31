@@ -56,10 +56,11 @@ class LineCalc:
     air_usd_stem: float = 0.0
     air_rub_stem: float = 0.0
     msk_rub_stem: float = 0.0
+    lm_rub_stem: float = 0.0       # ТК warehouse -> Опт Склад Бауманская (equal per stem over the truck)
 
     @property
     def total_rub_stem(self):
-        return self.price_rub + self.air_rub_stem + self.msk_rub_stem
+        return self.price_rub + self.air_rub_stem + self.msk_rub_stem + self.lm_rub_stem
 
 
 @dataclass
@@ -91,6 +92,7 @@ def invoice_total(inv, ls) -> float:
 OPENINGS: dict = {}   # farm/account (lower) -> (usd, rate, name): balance BEFORE the bot
 RULES: dict = {}      # farm (lower) -> {"account", "in_fee", "markup"} (brokers: Tessa / Plazoleta)
 DEPOSITS: list = []   # BrokerDeposit rows (money put on the exchange)
+LASTMILE: dict = {}   # MAWB key -> ₽ per stem: truck from the ТК warehouse to «Опт Склад Бауманская»
 
 
 def _d(s: str):
@@ -373,11 +375,22 @@ def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result
         if single:
             tot = sum(w) or 1        # whole AWB belongs to this one farm: it takes 100% of the freight
         elif attr == "weight_kg" and g["kg_bill"]:
-            # his rule: ₽ of the bill / kg of the bill = ₽ per kg; farm pays ₽/kg × its kg
-            if g["kg_total"] and abs(g["kg_bill"] - g["kg_total"]) > 0.5:
-                res.warnings.append(f"MAWB {awb}: вес по счёту {g['provider'] or ''} {g['kg_bill']:g} кг, "
-                                    f"по разбивке {g['kg_total']:g} кг — ставка ₽/кг считается от веса счёта")
-            tot = g["kg_bill"]
+            # his rule: ₽ of the bill / kg of the bill = ₽ per kg; farm pays ₽/kg × its kg.
+            # BUT never more than the bill: Ecuador/Colombia farm kg are volumetric (Weight & Dimensions report,
+            # 296.6 kg) while the AWB / Floratrack bill is 254 kg -> then the bill is split in proportion to farm kg.
+            kg_farms = max(g["kg_total"], sum(w))
+            if kg_farms > g["kg_bill"] + 0.5:
+                res.warnings.append(f"MAWB {awb}: по счёту {g['provider'] or 'ТК'} {g['kg_bill']:g} кг, кг ферм "
+                                    f"(платный вес по разбивке) {kg_farms:g} кг — счёт делю пропорционально кг ферм, "
+                                    f"{g['rub'] / kg_farms:,.0f} ₽ на кг фермы".replace(",", " "))
+                tot = kg_farms
+            else:
+                if g["kg_total"] and abs(g["kg_bill"] - g["kg_total"]) > 0.5:
+                    res.warnings.append(f"MAWB {awb}: вес по счёту {g['provider'] or ''} {g['kg_bill']:g} кг, "
+                                        f"по разбивке {g['kg_total']:g} кг — ставка ₽/кг считается от веса счёта")
+                tot = g["kg_bill"]
+        elif attr == "weight_kg":
+            tot = max(tot, g["kg_total"])          # never above 100% of the bill
         g["rub_per_kg"] = g["rub"] / tot if attr == "weight_kg" and tot else None
         for inv, wi in zip(invs, w):
             ls = lines_by_inv[inv.id]
@@ -404,6 +417,13 @@ def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result
                     lc.msk_share += share
                     if l.stems:
                         lc.msk_rub_stem += g["rub"] * share / l.stems
+
+    # last mile: ТК warehouse -> our warehouse, the same ₽ on every stem of the truck
+    for inv in invoices:
+        ps = LASTMILE.get(norm_awb(inv.awb)) if inv.awb else None
+        if ps:
+            for l in lines_by_inv[inv.id]:
+                res.lines[l.id].lm_rub_stem = ps
 
     # invoices of this top-up with no freight yet
     have = {awb for (awb, _l) in groups}

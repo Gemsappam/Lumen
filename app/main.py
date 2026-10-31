@@ -284,6 +284,30 @@ def _fix_swapped_dates():
             print(f"[lumen] fixed {n} swapped invoice dates", flush=True)
 
 
+def _fix_positano_7081():
+    """Once (31.10.2026): MAWB 369-11530551 (Logiztik LOG-0131 7081) — Positano Farms (= Tessa) was taken by its
+    volumetric 21.8 kg, but its actual weight 27.7 kg is larger, and the chargeable weight is the larger one."""
+    from .api import _settings, SETTINGS
+    from .models import AwbWeights, Invoice
+    st = _settings()
+    if st.get("fix_positano_7081"):
+        return
+    with session() as s:
+        aw = s.get(AwbWeights, "36911530551")
+        if aw:
+            d = json.loads(aw.farm_kg_json or "{}")
+            if abs((d.get("Tessa") or 0) - 21.8) < 0.01:
+                d["Tessa"] = 27.7
+                aw.farm_kg_json = json.dumps(d, ensure_ascii=False)
+                s.add(aw)
+        for i in s.exec(select(Invoice)).all():
+            if i.farm == "Tessa" and (i.awb or "").replace("-", "") == "36911530551" and abs((i.weight_kg or 0) - 21.8) < 0.01:
+                i.weight_kg = 27.7
+                s.add(i)
+        s.commit()
+    SETTINGS.write_text(json.dumps({**_settings(), "fix_positano_7081": True}, ensure_ascii=False))
+
+
 def _fix_broker_swap():
     """Once (12.10.2026): farm invoices Tessa № 90836926 and Plazoleta № 177858 were attached to the OLDER statement
     purchases (90832981 / 177151) before invoice numbers were matched. Move MAWB, truck, arrival and packing to the
@@ -336,6 +360,7 @@ def seed():
     except Exception as e:
         print(f"[lumen] seed_picked: {e}", flush=True)
     _fix_broker_swap()
+    _fix_positano_7081()
     _fix_swapped_dates()
     _fix_double_broker()
     _merge_broker_dupes()
@@ -468,7 +493,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-25n · исправленный инвойс под новым номером заменяет старый (по ферме + MAWB), в т.ч. через /ai"
+VERSION = "2026-10-31a · логистика не больше счёта: при объёмном весе ферм > веса счёта — делим пропорционально; платный вес фермы = max(факт, объём)"
 
 
 async def _once_recalc_true_rate():

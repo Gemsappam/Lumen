@@ -152,8 +152,11 @@ def _all(s):
     bo = _settings().get("broker_opening")
     if bo and "брокер" not in calc.OPENINGS:
         calc.OPENINGS["брокер"] = (bo.get("usd") or 0, bo.get("rate"), "Брокер")
-    return (s.exec(select(TopUp)).all(), s.exec(select(Invoice)).all(),
-            s.exec(select(Line)).all(), s.exec(select(Logistics)).all())
+    tops, invs, lines, logs = (s.exec(select(TopUp)).all(), s.exec(select(Invoice)).all(),
+                               s.exec(select(Line)).all(), s.exec(select(Logistics)).all())
+    from .lastmile import per_stem
+    calc.LASTMILE = per_stem(invs, lines)
+    return tops, invs, lines, logs
 
 
 def _norm_name(x: str) -> str:
@@ -991,7 +994,7 @@ def snapshot(s, topup_id):
         for l in lines_by[inv.id]:
             c = res.lines[l.id]
             ls.append({**l.model_dump(), "price_rub": round(c.price_rub, 2), "air_rub": round(c.air_rub_stem, 2),
-                       "msk_rub": round(c.msk_rub_stem, 2), "total_rub": round(c.total_rub_stem, 2)})
+                       "msk_rub": round(c.msk_rub_stem, 2), "lm_rub": round(c.lm_rub_stem, 2), "total_rub": round(c.total_rub_stem, 2)})
         out_inv.append({**inv.model_dump(), "rub_paid": res.invoice_rub[inv.id], "lines": ls,
                         "true_rate": round(res.true_rate.get(inv.id, 0), 4), "cost_pct": round(res.cost_pct.get(inv.id, 0), 1),
                         "rub_cost": round(res.invoice_cost.get(inv.id, 0)), "ledger": res.inv_ledger.get(inv.id)})
@@ -2061,7 +2064,7 @@ def invoice_costs(inv_id: int) -> dict:
         if l.invoice_id == inv_id:
             c = res.lines[l.id]
             out[l.id] = {"name": l.name, "stems": l.stems, "flower": c.price_rub,
-                         "logi": c.air_rub_stem + c.msk_rub_stem, "total": c.price_rub + c.air_rub_stem + c.msk_rub_stem}
+                         "logi": c.air_rub_stem + c.msk_rub_stem + c.lm_rub_stem, "total": c.total_rub_stem}
     return out
 
 
@@ -2166,6 +2169,10 @@ async def export_topups(ids: list[int], uid: int, caption: str, audience: str = 
             cap += "\n👤 Версия для оператора: без пополнений и долей ТК"
         await BOT.send_document(uid, FSInputFile(out, filename=fname),
                                 caption=cap + ("" if len(names) == 1 else "\nЛисты: " + ", ".join(f"«{n}»" for n in names)))
+        try:
+            await _lastmile_nag(uid, ids)
+        except Exception as e:
+            print("[lumen] lastmile nag:", e, flush=True)
     if out != tmp:
         try:
             out.unlink()
@@ -2276,6 +2283,26 @@ def transit_ids(invs) -> set:
     return keep
 
 
+def _lm_label_of(i: dict) -> str:
+    from .lastmile import label
+    return label(norm_awb(i["awb"])) if i.get("awb") else "неполная — нет MAWB"
+
+
+def _lm_status(k: str) -> str:
+    from .lastmile import status
+    return status(k) if k else "not_picked"
+
+
+def _lm_src(k: str) -> str:
+    from .lastmile import trip_of, WAREHOUSE
+    t = trip_of(k) if k else None
+    if not t:
+        return f"доставка до {WAREHOUSE} не внесена"
+    n = len(t["keys"])
+    return (f"{t['rub']:,.0f} ₽ за машину".replace(",", " ") + (f" на {n} MAWB" if n > 1 else "")
+            + f" ÷ все стебли · {t['ts'][:10]}") if t.get("rub") else "забрали сами — 0 ₽"
+
+
 def transit_view(s=None, q: str | None = None) -> dict:
     """Everything not arrived yet: paid (in a top-up) and unpaid, with ≈ cost per stem.
     Missing freight is estimated per leg:
@@ -2309,7 +2336,7 @@ def transit_view(s=None, q: str | None = None) -> dict:
             has_air = any(res.lines[l.id].air_rub_stem for l in ls)
             has_msk = any(res.lines[l.id].msk_rub_stem for l in ls)
             notes, approx_legs = [], False
-            est = {l.id: [res.lines[l.id].air_rub_stem, res.lines[l.id].msk_rub_stem] for l in ls}
+            est = {l.id: [res.lines[l.id].air_rub_stem, res.lines[l.id].msk_rub_stem, res.lines[l.id].lm_rub_stem] for l in ls}
             k = norm_awb(i.awb)
             src = {"air": ("счёт ТК" + (" (≈ по последнему курсу)" if (k, "air") in res.estimated_legs else "")) if has_air else "нет данных",
                    "msk": ("счёт ТК" + (" (предварительный курс)" if (k, "msk") in res.estimated_legs else "")) if has_msk else "нет данных"}
@@ -2371,16 +2398,17 @@ def transit_view(s=None, q: str | None = None) -> dict:
             kg_eff = {l.id: (round(l.weight_kg, 2) if l.weight_kg else
                              (round(rest_kg * l.stems / rest_st, 2) if rest_kg is not None else None)) for l in ls}
             rows = []
-            flower_rub = logi_rub = air_rub = msk_rub = 0.0
+            flower_rub = logi_rub = air_rub = msk_rub = lm_rub = 0.0
             for l in ls:
                 c = res.lines[l.id]
                 lg = sum(est[l.id])
                 air_rub += est[l.id][0] * l.stems
                 msk_rub += est[l.id][1] * l.stems
+                lm_rub += est[l.id][2] * l.stems
                 rows.append({**l.model_dump(), "kg_eff": kg_eff.get(l.id), "kg_fixed": bool(l.weight_kg),
                              "kg_box": (round(l.weight_kg / max(1.0, float(l.boxes or 0)), 2) if l.weight_kg else None),
                              "price_rub": round(c.price_rub, 2), "logi_rub": round(lg, 2),
-                             "air_rub": round(est[l.id][0], 2), "msk_rub": round(est[l.id][1], 2),
+                             "air_rub": round(est[l.id][0], 2), "msk_rub": round(est[l.id][1], 2), "lm_rub": round(est[l.id][2], 2),
                              "total_rub": round(c.price_rub + lg, 2)})
                 flower_rub += c.price_rub * l.stems
                 logi_rub += lg * l.stems
@@ -2405,7 +2433,10 @@ def transit_view(s=None, q: str | None = None) -> dict:
                         "approx_big": (not paid_now) or approx_legs,
                         "logi_source": ("; ".join(notes) or "нет данных").replace("Expolanka", "ТК Кения").replace("Floratrack", "ТК МСК"),
                         "legs": {"air": {"name": "ТК Кения", "rub": round(air_rub), "per": round(air_rub / st, 4), "src": src["air"]},
-                                 "msk": {"name": "ТК МСК", "rub": round(msk_rub), "per": round(msk_rub / st, 4), "src": src["msk"]}},
+                                 "msk": {"name": "ТК МСК", "rub": round(msk_rub), "per": round(msk_rub / st, 4), "src": src["msk"]},
+                                 "lm": {"name": "До склада", "rub": round(lm_rub), "per": round(lm_rub / st, 4),
+                                        "src": _lm_src(k)}},
+                        "lm_status": _lm_status(k),
                         "rub_paid": res.invoice_rub.get(i.id)})
         unpaid_logs = [{**lg.model_dump(), "rub_est": round((lg.usd or 0) * res.est_rate)}
                        for lg in logs if not lg.paid]
@@ -2452,7 +2483,8 @@ async def export_transit(uid: int = Depends(user_id)):
     F_, thin = "Arial", Side(style="thin", color="BFBFBF")
     box = Border(left=thin, right=thin, top=thin, bottom=thin)
     head = ["MAWB", "Ферма", "Маркировка", "Номенклатура", "Стебли", "Цена $", "Цветок ₽/ст", "ТК Кения ₽/ст",
-            "ТК МСК ₽/ст", "Итого ₽/ст", "Сумма ₽", "Статус оплаты", "Пополнение", "Оплачено $", "Машина", "Прибытие", "Точность"]
+            "ТК МСК ₽/ст", "До склада ₽/ст", "Итого ₽/ст", "Сумма ₽", "Статус оплаты", "Пополнение", "Оплачено $", "Машина",
+            "Прибытие", "Точность", "Себестоимость"]
     if not full:
         head = [h for h in head if h not in ("Пополнение", "Оплачено $")]
     wb = Workbook()
@@ -2470,7 +2502,9 @@ async def export_transit(uid: int = Depends(user_id)):
                 row = {"MAWB": i.get("awb") or "—", "Ферма": i["farm"], "Маркировка": i.get("client_code") or "",
                        "Номенклатура": l["name"], "Стебли": l["stems"], "Цена $": l["price_usd"],
                        "Цветок ₽/ст": round(l["price_rub"], 4), "ТК Кения ₽/ст": round(l.get("air_rub") or 0, 4),
-                       "ТК МСК ₽/ст": round(l.get("msk_rub") or 0, 4), "Итого ₽/ст": round(l["total_rub"], 4),
+                       "ТК МСК ₽/ст": round(l.get("msk_rub") or 0, 4), "До склада ₽/ст": round(l.get("lm_rub") or 0, 4),
+                       "Итого ₽/ст": round(l["total_rub"], 4),
+                       "Себестоимость": _lm_label_of(i),
                        "Сумма ₽": round(l["total_rub"] * l["stems"]),
                        "Статус оплаты": "оплачен" if want == "paid" else "НЕ оплачен",
                        "Пополнение": i.get("topup") or "", "Оплачено $": i.get("usd_paid") if want == "paid" else i.get("est_usd"),
@@ -2609,6 +2643,78 @@ def seed_picked():
         if not all(arr) or datetime.now() - max(arr) > timedelta(days=2):
             pk[k] = "до учёта"
     SETTINGS.write_text(json.dumps({**_settings(), "picked": pk, "picked_seeded": True}, ensure_ascii=False))
+
+
+@router.get("/lastmile")
+def get_lastmile(uid: int = Depends(user_id)):
+    from .lastmile import pending, trips, WAREHOUSE
+    return {**pending(), "trips": trips()[-30:][::-1], "warehouse": WAREHOUSE}
+
+
+class LastMileIn(BaseModel):
+    keys: list[str]
+    rub: float
+
+
+@router.post("/lastmile")
+def post_lastmile(body: LastMileIn, uid: int = Depends(writer)):
+    """One truck from the ТК warehouse: ₽ for one or several MAWBs -> equal per stem; those MAWBs count as picked up."""
+    from .lastmile import save_trip
+    if not body.keys:
+        raise HTTPException(400, "Выбери хотя бы один MAWB")
+    if body.rub is None or body.rub < 0:
+        raise HTTPException(400, "Сумма в ₽ — 0 или больше")
+    for k in body.keys:
+        if norm_awb(k) not in _picked():
+            mark_picked(k)
+    t = save_trip(body.keys, body.rub, uid)
+    return {**t, "text": lastmile_text(t)}
+
+
+@router.delete("/lastmile/{tid}")
+def del_lastmile(tid: int, uid: int = Depends(writer)):
+    from .lastmile import delete_trip
+    if not delete_trip(tid):
+        raise HTTPException(404, "Нет такой записи")
+    return {"ok": True}
+
+
+async def _lastmile_nag(uid: int, topup_ids: list):
+    """After an export: MAWBs in those top-ups that were picked up but have no last-mile ₽ -> ask right away."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    from .lastmile import status, WAREHOUSE
+    with session() as s:
+        keys = {norm_awb(i.awb): i.awb for i in s.exec(select(Invoice)).all()
+                if i.topup_id in set(topup_ids) and (i.awb or "").strip()}
+    miss = [(k, a) for k, a in keys.items() if status(k) == "missing"]
+    wait = [a for k, a in keys.items() if status(k) == "not_picked"]
+    if not miss and not wait:
+        return
+    txt = "⚠️ Себестоимость в файле НЕполная (видно в колонке «Себестоимость»):"
+    if miss:
+        txt += f"\n• забрали со склада ТК, но нет доставки до «{WAREHOUSE}»: " + ", ".join(a for _k, a in miss)
+    if wait:
+        txt += "\n• ещё не забраны со склада ТК: " + ", ".join(wait[:10])
+    if miss:
+        txt += "\n\nВнеси сумму — выгрузи файл ещё раз, и себестоимость станет полной."
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"Внести доставку: {a}", callback_data=f"lm:{k}")]
+                                               for k, a in miss[:10]]) if miss else None
+    await BOT.send_message(uid, txt, reply_markup=kb)
+
+
+def lastmile_text(t: dict) -> str:
+    """«3 500 ₽ на 2 MAWB · 1 840 ст → 1,90 ₽/ст» + farms."""
+    from .lastmile import WAREHOUSE
+    with session() as s:
+        invs = [i for i in s.exec(select(Invoice)).all() if (i.awb or "").strip() and norm_awb(i.awb) in t["keys"]]
+        ids = {i.id for i in invs}
+        st = sum(l.stems or 0 for l in s.exec(select(Line)).all() if l.invoice_id in ids)
+    per = (t["rub"] / st) if st else 0
+    awbs = ", ".join(f"{k[:3]}-{k[3:]}" for k in t["keys"])
+    n0 = lambda x: f"{x:,.0f}".replace(",", " ")
+    return (f"Доставка до {WAREHOUSE}: {n0(t['rub'])} ₽ · MAWB {awbs} · {n0(st)} ст → {per:.2f} ₽ на стебель".replace(".", ",", 0)
+            + f"\nЛегло в себестоимость: {', '.join(sorted({i.farm for i in invs}))}."
+            + ("\nПрежняя запись по этим MAWB заменена." if t.get("replaced") else ""))
 
 
 @router.get("/packing/blockers")
