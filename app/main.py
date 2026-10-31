@@ -493,7 +493,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-31b · вопрос про доставку до Бауманской только при ручной выгрузке, понятный текст"
+VERSION = "2026-10-31c · Excel: себестоимость до ТК МСК и общая до склада Бауманская — отдельными колонками"
 
 
 async def _once_recalc_true_rate():

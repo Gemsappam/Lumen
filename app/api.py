@@ -2485,7 +2485,7 @@ async def export_transit(uid: int = Depends(user_id)):
     F_, thin = "Arial", Side(style="thin", color="BFBFBF")
     box = Border(left=thin, right=thin, top=thin, bottom=thin)
     head = ["MAWB", "Ферма", "Маркировка", "Номенклатура", "Стебли", "Цена $", "Цветок ₽/ст", "ТК Кения ₽/ст",
-            "ТК МСК ₽/ст", "До склада ₽/ст", "Итого ₽/ст", "Сумма ₽", "Статус оплаты", "Пополнение", "Оплачено $", "Машина",
+            "ТК МСК ₽/ст", "Итого до ТК МСК ₽/ст", "До Бауманской ₽/ст", "Итого до Бауманской ₽/ст", "Сумма ₽", "Статус оплаты", "Пополнение", "Оплачено $", "Машина",
             "Прибытие", "Точность", "Себестоимость"]
     if not full:
         head = [h for h in head if h not in ("Пополнение", "Оплачено $")]
@@ -2504,8 +2504,10 @@ async def export_transit(uid: int = Depends(user_id)):
                 row = {"MAWB": i.get("awb") or "—", "Ферма": i["farm"], "Маркировка": i.get("client_code") or "",
                        "Номенклатура": l["name"], "Стебли": l["stems"], "Цена $": l["price_usd"],
                        "Цветок ₽/ст": round(l["price_rub"], 4), "ТК Кения ₽/ст": round(l.get("air_rub") or 0, 4),
-                       "ТК МСК ₽/ст": round(l.get("msk_rub") or 0, 4), "До склада ₽/ст": round(l.get("lm_rub") or 0, 4),
-                       "Итого ₽/ст": round(l["total_rub"], 4),
+                       "ТК МСК ₽/ст": round(l.get("msk_rub") or 0, 4),
+                       "Итого до ТК МСК ₽/ст": round(l["total_rub"] - (l.get("lm_rub") or 0), 4),
+                       "До Бауманской ₽/ст": round(l.get("lm_rub") or 0, 4),
+                       "Итого до Бауманской ₽/ст": round(l["total_rub"], 4),
                        "Себестоимость": _lm_label_of(i),
                        "Сумма ₽": round(l["total_rub"] * l["stems"]),
                        "Статус оплаты": "оплачен" if want == "paid" else "НЕ оплачен",

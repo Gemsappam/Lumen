@@ -105,17 +105,19 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
     topup.sheet_name = name
 
     # header
-    LM, FULL = (21, 22) if operator else (23, 24)        # last mile ₽/stem + «себестоимость полная?»
-    for c, h in enumerate((HEAD[:20] if operator else HEAD) + [""] * (2 if operator else 0), 1):
-        if c in (LM, FULL):
-            continue
+    # O = cost up to the ТК МСК; then last mile ₽/stem, total up to our warehouse, «полная?»
+    LM, TOT, FULL = (21, 22, 23) if operator else (23, 24, 25)
+    for c, h in enumerate(HEAD[:20] if operator else HEAD, 1):
         cell = ws.cell(1, c, h)
         cell.font, cell.fill, cell.alignment, cell.border = BOLD, HFILL, CENTER, BOX
     from .lastmile import WAREHOUSE, label as _lm_label
-    for c, h in ((LM, f"До склада {WAREHOUSE} (Р/стебель)"), (FULL, "Себестоимость")):
+    ws.cell(1, 15, "Себестоимость стебля до ТК МСК (Р)")
+    for c, h in ((LM, f"Доставка ТК МСК → {WAREHOUSE} (Р/стебель)"), (TOT, f"Общая себестоимость стебля до склада {WAREHOUSE} (Р)"),
+                 (FULL, "Себестоимость")):
         cell = ws.cell(1, c, h)
         cell.font, cell.fill, cell.alignment, cell.border = BOLD, HFILL, CENTER, BOX
     ws.column_dimensions[CL(LM)].width = 16
+    ws.column_dimensions[CL(TOT)].width = 18
     ws.column_dimensions[CL(FULL)].width = 34
     ws.row_dimensions[1].height = 45
     ws["A2"], ws["B2"] = "Курс пополнения", (round(res.rate, 4) if operator else f"='Пополнения'!E{trow}")
@@ -187,12 +189,18 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
             ka, km = (norm_awb(inv.awb), "air"), (norm_awb(inv.awb), "msk")
             if operator:                          # plain numbers, no shares
                 for c, v in ((11, lc.price_rub), (12, lc.air_usd_stem), (13, lc.air_rub_stem),
-                             (14, lc.msk_rub_stem), (15, lc.total_rub_stem), (LM, lc.lm_rub_stem)):
-                    ws.cell(rr, c, round(v, 6) if v else (0 if c in (11, 15) else None))
+                             (14, lc.msk_rub_stem), (15, lc.total_rub_stem - lc.lm_rub_stem), (LM, lc.lm_rub_stem),
+                             (TOT, lc.total_rub_stem)):
+                    ws.cell(rr, c, round(v, 6) if v else (0 if c in (11, 15, TOT) else None))
             else:
                 ws.cell(rr, LM, round(lc.lm_rub_stem, 6) if lc.lm_rub_stem else None)
-            ws.cell(rr, LM).number_format = RUB4
-            ws.cell(rr, LM).border = BOX
+            if not operator:
+                ws.cell(rr, TOT, f"=O{rr}+{CL(LM)}{rr}")
+            for c in (LM, TOT):
+                ws.cell(rr, c).number_format = RUB4
+                ws.cell(rr, c).border = BOX
+            ws.cell(rr, TOT).font = BOLD
+            ws.cell(rr, TOT).fill = ACC_COST
             if not operator:
                 # flower ₽ comes from the farm ledger (advances / debts / costs) — written as a number
                 ws.cell(rr, 11, round(lc.price_rub, 6))
@@ -206,7 +214,7 @@ def build(path, topup, topups, invoices, lines, logistics, out_path=None, awb_kg
                 ws.cell(rr, 22, round(lc.msk_share, 8)).font = GREY
                 ws.cell(rr, 14, f"=IFERROR($F${leg_row[km]}*V{rr}/H{rr},0)")
             if not operator:
-                ws.cell(rr, 15, f"=K{rr}+M{rr}+N{rr}+{CL(LM)}{rr}")
+                ws.cell(rr, 15, f"=K{rr}+M{rr}+N{rr}")
             ws.cell(rr, 15).fill = ACC_COST
             for c, fmt in ((10, USD), (11, RUB4), (12, "0.0000"), (13, RUB4), (14, RUB4), (15, RUB4), (21, "0.0000%"), (22, "0.0000%")):
                 if operator and c > 20:
