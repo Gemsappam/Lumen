@@ -20,10 +20,18 @@ def is_breakdown(data: bytes) -> bool:
     try:
         from openpyxl import load_workbook
         ws = load_workbook(io.BytesIO(data), read_only=True, data_only=True).worksheets[0]
-        head = [str(c or "").strip().lower() for c in next(ws.iter_rows(max_row=1, values_only=True))]
+        head = _norm_head(next(ws.iter_rows(max_row=1, values_only=True)))
     except Exception:
         return False
     return "awb" in head and ("packs" in head or "shipper full name" in head)
+
+
+def _norm_head(row) -> list:
+    """Expolanka renames columns now and then: «MAWB» / «AWB No» = «AWB»."""
+    alias = {"mawb": "awb", "awb no": "awb", "awb no.": "awb", "mawb no": "awb", "awb number": "awb", "mawb #": "awb",
+             "shipper": "shipper full name", "shipper name": "shipper full name", "pcs": "packs", "pieces": "packs"}
+    out = [str(c or "").strip().lower() for c in row]
+    return [alias.get(h, h) for h in out]
 
 
 def parse(data: bytes) -> dict:
@@ -31,13 +39,13 @@ def parse(data: bytes) -> dict:
     from openpyxl import load_workbook
     ws = load_workbook(io.BytesIO(data), data_only=True).worksheets[0]
     rows = list(ws.iter_rows(values_only=True))
-    head = [str(c or "").strip().lower() for c in rows[0]]
+    head = _norm_head(rows[0])
     col = lambda name: head.index(name) if name in head else None
     ia, ish, ip, iw, iv = col("awb"), col("shipper full name"), col("packs"), col("weight"), col("vw")
     ie = col("eta")
     out, awb, eta = [], None, None
     for r in rows[1:]:
-        if ia is None or not r[ia] or not ish or not r[ish]:
+        if ia is None or ish is None or not r[ia] or not r[ish]:
             continue
         awb = awb or str(r[ia])
         num = lambda i: float(r[i]) if i is not None and isinstance(r[i], (int, float)) else 0.0
@@ -56,7 +64,8 @@ def clean(data: bytes, names: dict | None = None) -> bytes:
     wb = load_workbook(io.BytesIO(data))
     ws = wb.worksheets[0]
     head = [str(c.value or "").strip().lower() for c in ws[1]]
-    drop = ("eta", "etd", "weight", "vw", "consignee full name", "origin", "dest.", "dest", "house bill")
+    drop = ("eta", "etd", "weight", "vw", "consignee full name", "origin", "dest.", "dest", "house bill",
+            "shipment id", "goods description")
     for name in drop:                                    # chats see: AWB | Ферма | Коробки
         if name in head:
             ws.delete_cols(head.index(name) + 1)

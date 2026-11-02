@@ -519,7 +519,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-10-31f · отчёт о весе: кг ферм по той колонке, по которой выставлена AWB (TOTAL AWB)"
+VERSION = "2026-11-03d · громкая ошибка, если файл похож на известный формат, но не читается; автотесты на реальных файлах (tests/)"
 
 
 async def _once_recalc_true_rate():

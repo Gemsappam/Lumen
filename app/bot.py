@@ -34,6 +34,7 @@ KB = InlineKeyboardMarkup(inline_keyboard=[[
 
 COMMANDS = [
     ("start", "открыть учёт"),
+    ("help", "справка: /help + вопрос — бот ответит сам"),
     ("blockers", "что мешает пакингам уйти в чаты"),
     ("missing", "где инвойсы — фермы из листов без инвойса"),
     ("ai", "несколько файлов + объяснить словами"),
@@ -42,7 +43,7 @@ COMMANDS = [
     ("pay", "неоплаченные инвойсы и логистика"),
     ("pickup", "что прибыло и ждёт «забрал со склада»"),
     ("lastmile", "доставка со склада ТК до Бауманской"),
-    ("check", "проверка расчётов (перерасход, скачки)"),
+    ("check", "проверка расчётов (перерасход, скачки >10%)"),
     ("arrivals", "поставки без отметки о прибытии"),
     ("awb", "инвойсы по MAWB"),
     ("packing", "пакинг-листы"),
@@ -382,7 +383,14 @@ async def _xlsx_router(m: Message, data: bytes):
         return
     if kbreak.is_weight_report(data):
         _record(m, "consolidation")
-        info = kbreak.parse_weight_report(data)
+        from .sniff import loud
+        try:
+            info = kbreak.parse_weight_report(data)
+            if not info["rows"]:
+                raise ValueError("нет строк ферм")
+        except Exception as e:
+            await m.answer(loud("отчёт о весе Logiztik", f"{type(e).__name__}: {str(e)[:80] or 'нет нужных колонок (Exporter / PCS / Actual / Volume)'}"))
+            return
         awb = ai.find_mawb(m.caption or "")
         if not awb:
             _CONS_WAIT[m.from_user.id] = info
@@ -394,10 +402,23 @@ async def _xlsx_router(m: Message, data: bytes):
         return
     if kbreak.is_prealert(data):
         _record(m, "consolidation")
-        info = kbreak.parse_prealert(data)
+        from .sniff import loud
+        try:
+            info = kbreak.parse_prealert(data)
+            if not info.get("rows") or not info.get("awb"):
+                raise ValueError("нет AWB или строк ферм")
+        except Exception as e:
+            await m.answer(loud("преалерт Эквадор/Колумбия", f"{type(e).__name__}: {str(e)[:80]}"))
+            return
         await _consolidation(m, info["awb"], info["country"], info["rows"], info["eta"])
         return
     from .xltext import excel_to_text, looks_like_master
+    from .sniff import guess, loud
+    g = guess(data)
+    if g and not looks_like_master(data):
+        await m.answer(loud(g[1], "не узнаю его колонки", getattr(m.document, "file_name", "") or ""))
+        _record(m, "unreadable_" + g[0])
+        return
     if not looks_like_master(data):                    # not our учёт file -> it's an invoice in Excel
         text = excel_to_text(data, m.document.file_name)
         await _parse_and_reply(m, text.encode(), "text/plain")
@@ -550,10 +571,15 @@ async def _kenya_breakdown(m: Message, data: bytes):
     from .ai import find_mawb
     from .calc import norm_awb
     from .api import resolve_farm
-    info = kbreak.parse(data)
+    from .sniff import loud
+    try:
+        info = kbreak.parse(data)
+    except Exception as e:
+        await m.answer(loud("консолидационный лист Expolanka", f"ошибка чтения ({type(e).__name__}: {str(e)[:80]})"))
+        return
     awb = find_mawb(info["awb"] or "") or info["awb"]
     if not awb or not info["rows"]:
-        await m.answer("Не нашёл в файле AWB и строки по фермам.")
+        await m.answer(loud("консолидационный лист Expolanka", "не нашёл колонку AWB/MAWB или строки ферм"))
         return
     with session() as s:
         for r in info["rows"]:
@@ -612,6 +638,7 @@ async def _floratrack(m: Message, data: bytes):
     await note.edit_text(txt[:4000])
     if affected:
         await export_topups(affected, m.from_user.id, "🚚 Floratrack разнесён по пополнениям, где лежит этот товар.")
+    await autosend_op()
 
 
 async def _parse_and_reply(m: Message, data: bytes, mime: str):
@@ -1229,6 +1256,7 @@ async def _lm_save(uid: int, rub: float):
     if not w or not w["keys"]:
         return "Не выбран ни один MAWB."
     r = post_lastmile(LastMileIn(keys=w["keys"], rub=rub), uid)
+    asyncio.get_event_loop().create_task(autosend_op())
     return "✅ " + r["text"]
 
 
@@ -1289,6 +1317,15 @@ async def lastmile_reminder(uid_only: int | None = None):
             pass
 
 
+async def autosend_op():
+    """Operator file per MAWB as soon as its cost is formed (app/autosend.py)."""
+    from . import autosend
+    try:
+        await autosend.run(bot, _money_people())
+    except Exception as e:
+        print("[lumen] autosend:", e, flush=True)
+
+
 async def watch_check(uid_only: int | None = None):
     """Night watch of the calculations (app/watch.py): over-allocated freight, unexplained jumps, orphan bills."""
     from . import watch
@@ -1310,6 +1347,26 @@ async def watch_check(uid_only: int | None = None):
 async def check_cmd(m: Message):
     """Проверка расчётов прямо сейчас."""
     await watch_check(m.from_user.id)
+
+
+@dp.message(pv, ops, Command("help", "pomosh", "spravka"))
+async def help_cmd(m: Message):
+    """/help — список команд; /help вопрос — бот отвечает сам (руководство + текущее состояние)."""
+    from . import helpdesk
+    q = (m.text or "").split(maxsplit=1)[1].strip() if len((m.text or "").split()) > 1 else ""
+    if not q:
+        await m.answer("Задай вопрос прямо в команде, например:\n"
+                       "• /help почему пакинг не уходит в чат\n"
+                       "• /help как внести доставку до Бауманской\n"
+                       "• /help что делать, если ферма прислала исправленный инвойс\n\n"
+                       "Команды:\n" + "\n".join(f"/{c} — {d}" for c, d in COMMANDS))
+        return
+    note = await m.answer("Смотрю…")
+    try:
+        txt = await helpdesk.answer(q)
+    except Exception as e:
+        txt = f"Не смог ответить: {str(e)[:200]}"
+    await note.edit_text(txt[:4000])
 
 
 @dp.message(pv, wr, Command("lastmile", "dostavka", "baumanskaya"))
@@ -1595,10 +1652,7 @@ async def _step(uid: int, head: str = ""):
             await _send(uid, head + "Номер MAWB уже известен?",
                         _kbb([[("✏️ Да, напишу", "fl:awb:edit"), ("Ещё не знаем", "fl:awb:none")]]), note)
         return
-    if freight and not flow["pays"]:
-        usd = (docs[0][1].get("freight") or {}).get("total_usd")
-        if usd:
-            flow["pays"] = [(usd, None)]           # the bill's own $
+    bill_usd = (docs[0][1].get("freight") or {}).get("total_usd") if freight else None
     if not flow["pays"]:
         many = len(docs) > 1
         if flow["paid"]:
@@ -1611,8 +1665,11 @@ async def _step(uid: int, head: str = ""):
             ask = (f"Примерно сколько $ будет оплата{' — по строке на ферму' if many else ''}? "
                    f"Себестоимость посчитаю заранее (±10%).")
         ex = "\n".join(f"{d['farm']} {round(d.get('invoice_total_usd') or 1000)}$" for _p, d in docs) if many else \
-            f"{round(docs[0][1].get('invoice_total_usd') or 1000)}$"
-        await _send(uid, head + ask + f"\nНапример:\n{ex}", _kbb(), note)
+            f"{round(bill_usd or docs[0][1].get('invoice_total_usd') or 1000)}$"
+        if bill_usd:                               # freight (Expolanka, Floratrack…): the bill's $ is one tap away,
+            ask += f"\nПо счёту ${bill_usd:,.2f}".replace(",", " ") + " — с комиссией за оплату обычно больше."
+        rows = [[(f"Ровно по счёту ${bill_usd:g}", "fl:billpay")]] if bill_usd else []
+        await _send(uid, head + ask + f"\nНапример:\n{ex}", _kbb(rows), note)
         return
     if flow["paid"] and not freight and flow.get("farm") is None:
         from .api import farm_balance_text
@@ -1757,6 +1814,11 @@ async def flow_button(c: CallbackQuery):
         await c.answer()
         await c.message.edit_text("Отменено. Документ лежит в «Учёт» → Черновики, можно разобрать позже.")
         return
+    elif part[1] == "billpay":
+        docs = _flow_docs(flow)
+        usd = (docs[0][1].get("freight") or {}).get("total_usd") if docs else None
+        if usd:
+            flow["pays"] = [(usd, None)]; _mark(flow, "pays")
     elif part[1] == "paid":
         flow["paid"] = True; _mark(flow, "paid")
     elif part[1] == "unpaid":
@@ -3260,6 +3322,10 @@ async def scheduler_loop():
                 await arrival_check()
                 await pickup_check()
                 await lastmile_reminder()
+            if st.get("last_autosend") != now.strftime("%Y-%m-%d-%H"):
+                SETTINGS.write_text(json.dumps({**st, "last_autosend": now.strftime("%Y-%m-%d-%H")}))
+                st = _settings()
+                await autosend_op()
             if now.hour == 8 and now.minute < 15 and st.get("last_watch") != now.strftime("%Y-%m-%d"):
                 SETTINGS.write_text(json.dumps({**st, "last_watch": now.strftime("%Y-%m-%d")}))
                 st = _settings()

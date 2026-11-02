@@ -1,7 +1,7 @@
 """Night watch: catches calculation mistakes before a wrong Excel reaches the operator.
 
 1) freight over-allocated: farms of a MAWB carry more ₽ than the ТК bill (> 100.5%)
-2) logistics per stem of an invoice jumped > 5% although NOTHING about its freight changed
+2) logistics per stem of an invoice jumped > 10% although NOTHING about its freight changed
    (same bills, same kg breakdown, same farms and kg on the MAWB). Payments are deliberately ignored:
    the flower ₽ (rate, commission, advances, debts) is not watched at all, and freight with a provisional /
    «≈ last rate» ₽ is skipped — those move when money moves, that's normal.
@@ -14,7 +14,7 @@ import json
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-JUMP = 0.05          # 5 %
+JUMP = 0.10          # 10 %
 OVER = 1.005         # 100.5 %
 
 
