@@ -1251,7 +1251,22 @@ def set_invoice_awb(inv_id: int, body: AwbIn, uid: int = Depends(writer)):
 
 class SplitIn(BaseModel):
     awb: str
-    lines: dict[int, float]          # line id -> stems that went on the OTHER MAWB
+    lines: dict[int, float] = {}     # line id -> stems that went on the OTHER MAWB
+    boxes: list[int] = []            # OR: numbers (1-based) of the boxes that went there — from the box detail
+
+
+def _single_boxes(iid: int) -> list:
+    """Box detail with qty>1 expanded into single boxes: [{pack, content:[{name, stems}]}]."""
+    b = get_boxes(iid, 0)["boxes"]
+    out = []
+    for x in b:
+        for _ in range(int(x.get("qty") or 1)):
+            out.append({"qty": 1, "pack": x.get("pack"),
+                        "content": [{"name": c.get("name"),
+                                     "stems_per_box": c.get("stems_per_box") if c.get("stems_per_box") is not None
+                                     else round((c.get("stems_total") or c.get("stems") or 0) / max(1, int(x.get("qty") or 1)), 2)}
+                                    for c in x.get("content") or []]})
+    return out
 
 
 @router.post("/invoices/{inv_id}/split")
@@ -1274,6 +1289,24 @@ async def split_invoice(inv_id: int, body: SplitIn, uid: int = Depends(writer)):
             raise HTTPException(400, "Это тот же MAWB, что у инвойса")
         lines = {l.id: l for l in s.exec(select(Line).where(Line.invoice_id == inv_id)).all()}
         move = {int(k): float(v) for k, v in body.lines.items() if v and float(v) > 0}
+        moved_boxes = rest_boxes = None
+        if body.boxes:                                  # «коробка 2 уехала» -> its content, line by line
+            singles = _single_boxes(inv_id)
+            pick = {n - 1 for n in body.boxes if 1 <= n <= len(singles)}
+            if not pick or len(pick) == len(singles):
+                raise HTTPException(400, "Выбери коробки, которые уехали (не все)")
+            moved_boxes = [b for n, b in enumerate(singles) if n in pick]
+            rest_boxes = [b for n, b in enumerate(singles) if n not in pick]
+            byname = {}
+            for l in lines.values():
+                byname.setdefault(l.name.strip().lower(), l)
+            move = {}
+            for b in moved_boxes:
+                for c in b["content"]:
+                    l = byname.get(str(c["name"] or "").strip().lower())
+                    if not l:
+                        raise HTTPException(400, f"Сорт «{c['name']}» из коробки не найден в строках инвойса")
+                    move[l.id] = move.get(l.id, 0) + float(c["stems_per_box"] or 0)
         if not move:
             raise HTTPException(400, "Укажи, сколько стеблей каких строк уехало другим MAWB")
         for lid, st in move.items():
@@ -1306,7 +1339,11 @@ async def split_invoice(inv_id: int, body: SplitIn, uid: int = Depends(writer)):
                            boxes=None, weight_kg=None))
                 l.stems = round(l.stems - st, 4)
             s.add(l)
-        inv.boxes_json = None                     # box detail is re-derived from the remaining lines
+        if moved_boxes is not None:               # each part keeps exactly its boxes
+            new.boxes_json = json.dumps(moved_boxes, ensure_ascii=False)
+            inv.boxes_json = json.dumps(rest_boxes, ensure_ascii=False)
+        else:
+            inv.boxes_json = None                 # box detail is re-derived from the remaining lines
         inv.note = ((inv.note or "") + f" · часть дослана MAWB {awb} (№ {new.invoice_no})").strip(" ·")
         _fill_weight_from_logistics(s, new)
         s.add(inv); s.add(new); s.commit()
