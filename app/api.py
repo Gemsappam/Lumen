@@ -1290,6 +1290,7 @@ async def split_invoice(inv_id: int, body: SplitIn, uid: int = Depends(writer)):
         lines = {l.id: l for l in s.exec(select(Line).where(Line.invoice_id == inv_id)).all()}
         move = {int(k): float(v) for k, v in body.lines.items() if v and float(v) > 0}
         moved_boxes = rest_boxes = None
+        split_note = ""
         if body.boxes:                                  # «коробка 2 уехала» -> its content, line by line
             singles = _single_boxes(inv_id)
             pick = {n - 1 for n in body.boxes if 1 <= n <= len(singles)}
@@ -1297,16 +1298,29 @@ async def split_invoice(inv_id: int, body: SplitIn, uid: int = Depends(writer)):
                 raise HTTPException(400, "Выбери коробки, которые уехали (не все)")
             moved_boxes = [b for n, b in enumerate(singles) if n in pick]
             rest_boxes = [b for n, b in enumerate(singles) if n not in pick]
+            import difflib
+            key = lambda n: re.sub(r"[^a-z0-9]", "", str(n or "").lower())        # «Fire Works» = «Fireworks»
             byname = {}
             for l in lines.values():
-                byname.setdefault(l.name.strip().lower(), l)
-            move = {}
+                byname.setdefault(key(l.name), l)
+            move, unmatched = {}, []
             for b in moved_boxes:
                 for c in b["content"]:
-                    l = byname.get(str(c["name"] or "").strip().lower())
-                    if not l:
-                        raise HTTPException(400, f"Сорт «{c['name']}» из коробки не найден в строках инвойса")
-                    move[l.id] = move.get(l.id, 0) + float(c["stems_per_box"] or 0)
+                    k_ = key(c["name"])
+                    hit = byname.get(k_) or next((byname[m] for m in difflib.get_close_matches(k_, list(byname), 1, 0.8)), None)
+                    if not hit:
+                        unmatched.append(str(c["name"]))
+                        continue
+                    move[hit.id] = move.get(hit.id, 0) + float(c["stems_per_box"] or 0)
+            over = [lid for lid, st in move.items() if st > lines[lid].stems + 1e-6]
+            if unmatched or over:
+                # the packing list doesn't match the invoice lines (farm substituted varieties) -> split every line
+                # by the share of stems in the boxes that left; money and freight are right either way
+                box_st = lambda bs: sum(float(c["stems_per_box"] or 0) for b in bs for c in b["content"])
+                share = box_st(moved_boxes) / ((box_st(moved_boxes) + box_st(rest_boxes)) or 1)
+                move = {lid: round(l.stems * share) for lid, l in lines.items() if round(l.stems * share) > 0}
+                split_note = (f"сорта в раскладке коробок не совпали со строками инвойса ({', '.join(unmatched[:3]) or 'стебли'}) — "
+                              f"каждая строка разделена по доле коробок ({share * 100:.0f}%)")
         if not move:
             raise HTTPException(400, "Укажи, сколько стеблей каких строк уехало другим MAWB")
         for lid, st in move.items():
@@ -1362,6 +1376,7 @@ async def split_invoice(inv_id: int, body: SplitIn, uid: int = Depends(writer)):
     return {"ok": True, "id": new_id, "share": round(k, 4),
             "text": f"Готово: {farm} — {k * 100:.0f}% инвойса перенесено на MAWB {awb} как «часть 2». "
                     "Оплата и сумма разделены по стоимости, логистика — каждой части своя."
+                    + (f" Внимание: {split_note}." if split_note else "")
                     + (" Пакинги обновлены." if sent else "")}
 
 

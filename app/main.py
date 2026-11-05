@@ -519,7 +519,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-11-05b · разделить инвойс по коробкам: «коробка 2 уехала другим MAWB»"
+VERSION = "2026-11-05c · разделение по коробкам: сорта сверяются гибко, при несовпадении — по доле коробок"
 
 
 async def _once_recalc_true_rate():
