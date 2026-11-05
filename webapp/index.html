@@ -328,6 +328,31 @@ function lastMileForm(keys, LM){
     try{ const r=await api('/lastmile',{method:'POST',body:{keys:ks,rub}}); w.remove(); toast(r.text.split('\n')[0]); render(CUR_TAB==='stock'?'stock':CUR_TAB,{}) }catch(e){ toast(e.message) } };
 }
 
+// ---------- ТК дослала часть инвойса другим MAWB: вторая часть того же инвойса на другом MAWB ----------
+function splitForm(inv){
+  const L=(inv.lines||[]).filter(l=>l.id);
+  const w=document.createElement('div');
+  w.style.cssText='position:fixed;inset:0;background:var(--scrim);z-index:20;display:flex;align-items:flex-end';
+  w.innerHTML=`<div style="background:var(--bg2);width:100%;border-radius:18px 18px 0 0;padding:14px 0 calc(16px + env(safe-area-inset-bottom,0));max-height:88vh;overflow:auto">
+    <h2 style="margin-top:4px">Часть уехала другим MAWB</h2>
+    <p class="hint" style="margin:0 16px 10px">Например, Expolanka отправила 1 коробку из 2 следующей AWB. Укажи MAWB и сколько стеблей каждой строки уехало им. Инвойс разделится на 2 части: оплата и сумма — по стоимости, логистика — каждой части своего MAWB, пакинги обновятся.</p>
+    <form class="group" id="spf"><div class="field"><label>Другой MAWB</label><input name="awb" placeholder="074-48015004" inputmode="numeric"></div></form>
+    <div class="actions"><button id="spHalf">Половину каждой строки</button><button id="spAll0">Очистить</button></div>
+    <div class="group">${L.map(l=>`<div class="row" style="cursor:default"><div class="grow"><div class="t">${esc(l.name)}</div><div class="s">в инвойсе ${fmt(l.stems)} ст</div></div>
+      <div class="v"><input class="spl" data-id="${l.id}" data-max="${l.stems}" inputmode="numeric" placeholder="0" style="width:84px;text-align:right"></div></div>`).join('')}</div>
+    <div class="actions"><button id="spc">Отмена</button><button class="primary" id="spo">Разделить</button></div></div>`;
+  document.body.appendChild(w);
+  const ins=[...w.querySelectorAll('.spl')];
+  w.querySelector('#spHalf').onclick=()=>ins.forEach(i=>i.value=Math.round(+i.dataset.max/2));
+  w.querySelector('#spAll0').onclick=()=>ins.forEach(i=>i.value='');
+  w.querySelector('#spc').onclick=()=>w.remove();
+  w.querySelector('#spo').onclick=async()=>{
+    const lines={}; ins.forEach(i=>{const v=numOrNull(i.value); if(v) lines[i.dataset.id]=v});
+    const awb=w.querySelector('#spf').awb.value.trim();
+    if(!awb) return toast('Впиши MAWB'); if(!Object.keys(lines).length) return toast('Укажи стебли, которые уехали');
+    try{ const r=await api(`/invoices/${inv.id}/split`,{method:'POST',body:{awb,lines}}); w.remove(); toast(r.text); back() }catch(e){ toast(e.message) } };
+}
+
 function toast(t){const e=document.getElementById('toast');e.textContent=noEmo(t);e.classList.add('on');setTimeout(()=>e.classList.remove('on'),2600)}
 
 async function api(path, opt={}){
@@ -548,11 +573,13 @@ async invoice({t, inv, draft}){
     <div class="field"><label>Комментарий</label><input name="note" value="${esc(inv.note)}"></div>
   </form>
   ${inv.id?'<div id="boxesSlot"></div>':''}
+  ${inv.id&&ME?.can_write?`<div class="actions"><button id="splitBtn">Часть груза уехала другим MAWB</button></div>`:''}
   ${inv.id?`<h2>Статус груза</h2><div class="group"><div class="row"><div class="grow">
       <div class="t">${inv.arrived_at?'Прибыл':'В пути'}</div><div class="s">${inv.arrived_at?esc(inv.arrived_at):(inv.eta?'прибытие '+esc(inv.eta.replace('T',' ')):'ждёт сообщения ТК МСК о машине')}</div></div>
       <button id="arrToggle">${inv.arrived_at?'Вернуть в «В пути»':'Отметить прибывшим'}</button></div></div>`:''}
   <div class="actions">${inv.id?'<button id="del" class="x">Удалить</button>':''}<button class="primary" id="save">Сохранить</button></div>`;
   if(inv.id) boxesBlock(inv.id, document.getElementById('boxesSlot'));
+  document.getElementById('splitBtn')?.addEventListener('click',()=>splitForm(inv));
   document.getElementById('arrToggle')?.addEventListener('click',async()=>{
     await api(`/invoices/${inv.id}/arrived${inv.arrived_at?'?back=true':''}`,{method:'POST'});
     inv.arrived_at = inv.arrived_at ? null : 'только что (вручную)';
@@ -1029,7 +1056,7 @@ async autolog(){
   «Отменить» возвращает как было и закрепляет — бот это поле у этого инвойса больше не трогает. То, что вы меняете сами, тоже сразу закрепляется.</p>
   ${L.length?`<div class="group">${L.map(r=>`<div class="row"><div class="grow">
       <div class="t">${esc(r.farm||'—')}${r.awb?` <span class="s">· MAWB ${esc(r.awb)}</span>`:''}</div>
-      <div class="s">${(['merge','line_kg','opening','boxes','skip'].includes(r.field))?esc(r.new||''):`${esc(r.label)}: <b>${esc(r.old||'пусто')}</b> → <b>${esc(r.new||'пусто')}</b>`}</div>
+      <div class="s">${(['merge','line_kg','opening','boxes','skip','split'].includes(r.field))?esc(r.new||''):`${esc(r.label)}: <b>${esc(r.old||'пусто')}</b> → <b>${esc(r.new||'пусто')}</b>`}</div>
       <div class="s">${esc(r.ts)} · ${esc(r.reason)}</div></div>
       <div class="v">${r.undone?'<span class="pill">отменено · закреплено</span>':(r.can_undo&&ME.can_write?`<button data-u="${r.id}">Отменить</button>`:'')}</div></div>`).join('')}</div>`
     :'<div class="empty">Пока бот ничего сам не менял — записи появятся с этой версии.</div>'}`;

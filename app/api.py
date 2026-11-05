@@ -1249,6 +1249,85 @@ def set_invoice_awb(inv_id: int, body: AwbIn, uid: int = Depends(writer)):
     return {"ok": True, "awb": awb}
 
 
+class SplitIn(BaseModel):
+    awb: str
+    lines: dict[int, float]          # line id -> stems that went on the OTHER MAWB
+
+
+@router.post("/invoices/{inv_id}/split")
+async def split_invoice(inv_id: int, body: SplitIn, uid: int = Depends(writer)):
+    """The forwarder shipped part of an invoice with another MAWB (Expolanka put 1 of 2 boxes on the next AWB).
+    -> a second part of the SAME invoice on that MAWB: the chosen stems move there, $ paid / total / ₽ are split by
+    the value moved, the same top-up. Each part then carries its own MAWB's freight; packings follow."""
+    from .ai import find_mawb
+    from .kbreak import unskip_farm
+    raw = (body.awb or "").strip()
+    awb = find_mawb(raw) or (f"{re.sub(r'[^0-9]', '', raw)[:3]}-{re.sub(r'[^0-9]', '', raw)[3:]}"
+                             if len(re.sub(r"[^0-9]", "", raw)) == 11 else "")
+    if not awb:
+        raise HTTPException(400, "MAWB — 11 цифр, например 074-48015004")
+    with session() as s:
+        inv = s.get(Invoice, inv_id)
+        if not inv:
+            raise HTTPException(404, "Инвойс не найден")
+        if norm_awb(inv.awb or "") == norm_awb(awb):
+            raise HTTPException(400, "Это тот же MAWB, что у инвойса")
+        lines = {l.id: l for l in s.exec(select(Line).where(Line.invoice_id == inv_id)).all()}
+        move = {int(k): float(v) for k, v in body.lines.items() if v and float(v) > 0}
+        if not move:
+            raise HTTPException(400, "Укажи, сколько стеблей каких строк уехало другим MAWB")
+        for lid, st in move.items():
+            if lid not in lines or st > lines[lid].stems + 1e-6:
+                raise HTTPException(400, f"Строка {lid}: столько стеблей в ней нет")
+        total_val = sum(l.stems * l.price_usd for l in lines.values()) or 1
+        moved_val = sum(st * lines[lid].price_usd for lid, st in move.items())
+        if moved_val >= total_val - 1e-6:
+            raise HTTPException(400, "Уехало всё — тогда просто поменяй MAWB инвойса")
+        k = moved_val / total_val
+        new = Invoice(**{**inv.model_dump(exclude={"id"}),
+                         "awb": awb, "invoice_no": f"{inv.invoice_no or '?'} / часть 2",
+                         "weight_kg": None, "arrived_at": None, "eta": None, "client_eta": None, "truck": None,
+                         "packing_sent": False, "client_done": False, "boxes_json": None, "hawb": None,
+                         "discrepancy_json": None, "ext_id": None,
+                         "note": f"часть инвойса № {inv.invoice_no} (основной на MAWB {inv.awb}) — ТК дослала другим MAWB"})
+        cut = lambda v, part: round(v * part, 2) if v is not None else None
+        for f in ("invoice_total_usd", "usd_paid", "rub_paid_override", "est_usd", "farm_usd"):
+            v = getattr(inv, f)
+            if v:
+                setattr(new, f, cut(v, k))
+                setattr(inv, f, round(v - getattr(new, f), 2))
+        s.add(new); s.flush()
+        for lid, st in move.items():
+            l = lines[lid]
+            if abs(st - l.stems) < 1e-6:
+                l.invoice_id = new.id
+            else:
+                s.add(Line(invoice_id=new.id, name=l.name, stems=st, price_usd=l.price_usd, mrc=l.mrc,
+                           boxes=None, weight_kg=None))
+                l.stems = round(l.stems - st, 4)
+            s.add(l)
+        inv.boxes_json = None                     # box detail is re-derived from the remaining lines
+        inv.note = ((inv.note or "") + f" · часть дослана MAWB {awb} (№ {new.invoice_no})").strip(" ·")
+        _fill_weight_from_logistics(s, new)
+        s.add(inv); s.add(new); s.commit()
+        new_id, farm, old_awb = new.id, inv.farm, inv.awb
+        from .autolog import note as _note
+        _note(s, inv_id, farm, old_awb, "split", f"часть ({moved_val:.2f} $ по цене фермы) уехала MAWB {awb}",
+              "вручную в приложении")
+        s.commit()
+    unskip_farm(norm_awb(awb), farm)              # the second MAWB now has this farm's invoice
+    from .backup import mark_dirty
+    mark_dirty()
+    sent = []
+    for a, why in ((awb, f"{farm} — дослана часть инвойса"), (old_awb, f"{farm} — часть уехала MAWB {awb}")):
+        if a and await _refresh_packing(new_id if a == awb else inv_id, why):
+            sent.append(a)
+    return {"ok": True, "id": new_id, "share": round(k, 4),
+            "text": f"Готово: {farm} — {k * 100:.0f}% инвойса перенесено на MAWB {awb} как «часть 2». "
+                    "Оплата и сумма разделены по стоимости, логистика — каждой части своя."
+                    + (" Пакинги обновлены." if sent else "")}
+
+
 @router.delete("/invoices/{inv_id}")
 def delete_invoice(inv_id: int, uid: int = Depends(writer)):
     with session() as s:
