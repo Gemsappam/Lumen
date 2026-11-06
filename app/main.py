@@ -376,6 +376,26 @@ def _fix_agri_5004_nocredit():
     SETTINGS.write_text(json.dumps({**_settings(), "fix_agri_5004_nocredit": True}, ensure_ascii=False))
 
 
+def _fix_agri_4956_kg():
+    """Once (06.11.2026): Expolanka's weight report for 074-48014956 gives Agriflora 150 kg (the ТК bill is 705 kg),
+    but her invoice said 65 kg — 85 kg of freight (~54 000 ₽) sat on no farm. Decision: Agriflora carries her 150 kg."""
+    from .api import _settings, SETTINGS
+    from .models import Invoice
+    from .autolog import note as _note
+    if _settings().get("fix_agri_4956_kg"):
+        return
+    with session() as s:
+        a = next((i for i in s.exec(select(Invoice)).all() if i.farm == "Agriflora"
+                  and (i.awb or "").replace("-", "") == "07448014956"), None)
+        if a and abs((a.weight_kg or 0) - 65) < 0.01:
+            a.weight_kg = 150.0
+            a.note = ((a.note or "") + " · вес 150 кг по отчёту Expolanka (было 65 — 85 кг логистики ни на ком не висели)").strip(" ·")
+            s.add(a)
+            _note(s, a.id, a.farm, a.awb, "merge", "вес 65 → 150 кг по весовому отчёту Expolanka", "решение 06.11")
+        s.commit()
+    SETTINGS.write_text(json.dumps({**_settings(), "fix_agri_4956_kg": True}, ensure_ascii=False))
+
+
 def _clear_discrepancies():
     """«Срочно узнай у кладовщика» is switched off (06.11.2026): forget the pending questions."""
     from .models import Invoice
@@ -429,11 +449,12 @@ def _fix_maua_merge():
             {"qty": 1, "pack": None, "content": [{"name": n, "stems_per_box": 40} for n in sorts]},
             {"qty": 1, "pack": None, "content": [{"name": "Spray Rose Fireworks 70cm", "stems_per_box": 180}]}],
             ensure_ascii=False)
-        p1.alloc_mode = "stems"
+        p1.alloc_mode = "value"                      # by price: $0.60 roses dearer, Fireworks $0.35 cheaper
         p1.invoice_total_usd = 183.0                 # both boxes: $120 + $63
-        p1.farm_usd = None                           # «ровно по инвойсу»: no advance, the rest of the money = fees
-        p1.note = ("FL/DL/26/001: 2 коробки, одна оплата. Коробка 2 (Fireworks 180 ст) прилетела рейсом 074-48015004 — "
-                   "логистика взята с обоих рейсов (+5 кг с 5004)")
+        p1.farm_usd = None                           # reached the farm exactly by the invoice ($183)
+        p1.usd_paid, p1.rub_paid_override = 191.0, None   # paid 191 USDT from the 12.10 top-up (proforma FL/DL/26/001)
+        p1.note = ("FL/DL/26/001: 2 коробки ($183), одна оплата 191 USDT с пополнения 12.10. Коробка 2 (Fireworks 180 ст) "
+                   "прилетела рейсом 074-48015004 — логистика взята с обоих рейсов (+5 кг с 5004)")
         s.add(p1)
         pid, farm, awb = p1.id, p1.farm, p1.awb
         _note(s, pid, farm, awb, "split", "один инвойс на 4956: 380 ст (2 коробки), логистика 4956 + 5 кг с 5004",
@@ -555,6 +576,7 @@ def seed():
     _fix_agri_5004_nocredit()
     _clear_discrepancies()
     _fix_maua_merge()
+    _fix_agri_4956_kg()
     _fix_swapped_dates()
     _fix_double_broker()
     _merge_broker_dupes()
@@ -687,7 +709,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-11-06i · Maua одним инвойсом на 4956, Fireworks $0.35, без аванса"
+VERSION = "2026-11-06l · 4956: Agriflora 150 кг по отчёту; сторож ловит расхождение кг"
 
 
 async def _once_recalc_true_rate():

@@ -6,6 +6,7 @@
    the flower ₽ (rate, commission, advances, debts) is not watched at all, and freight with a provisional /
    «≈ last rate» ₽ is skipped — those move when money moves, that's normal.
 3) a ТК bill with no farm invoice on its MAWB for more than 7 days
+4) a farm's kg in the invoice differs from Expolanka's weight report for that MAWB (part of the bill lands on nobody)
 
 The previous state lives in DATA_DIR/watch.json.
 """
@@ -119,6 +120,19 @@ def run(save: bool = True) -> list[str]:
             if now - first > timedelta(days=7):
                 issues.append(f"MAWB {nice(k)}: счёт ТК ({fmt(sum(lg.rub or 0 for lg in lgs))} ₽) висит {(now - first).days} дн. "
                               "без инвойсов ферм — его ₽ не легли ни на один стебель")
+    # 4) invoice kg vs the weight report
+    from .api import _norm_name
+    for k, raw in weights.items():
+        try:
+            rep = {_norm_name(f): float(v or 0) for f, v in json.loads(raw or "{}").items()}
+        except Exception:
+            continue
+        for i in invs_by_awb.get(k, []):
+            r = rep.get(_norm_name(i.farm))
+            if r and i.weight_kg and abs(r - i.weight_kg) > max(1.0, r * 0.05):
+                issues.append(f"{i.farm} (MAWB {nice(k)}): в инвойсе {i.weight_kg:g} кг, а по весовому отчёту {r:g} кг — "
+                              f"логистика за {abs(r - i.weight_kg):g} кг ляжет не туда")
+
     alive = {str(lg.id) for lg in logs}
     seen = {x: d for x, d in seen.items() if x in alive}
     if save:
