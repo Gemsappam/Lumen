@@ -559,7 +559,7 @@ def correct_invoice(inv_id: int, d: dict) -> dict:
         if d.get("stems_total") and abs(lines_sum - d["stems_total"]) >= 1 and not dis:
             dis.append({"box": "ИТОГО инвойса", "box_stems": d["stems_total"], "units": lines_sum,
                         "varieties": [l.get("name") for l in d.get("lines") or []], "resolved": False})
-        inv.discrepancy_json = json.dumps(dis, ensure_ascii=False) if dis else None
+        inv.discrepancy_json = None                 # «спроси кладовщика» switched off (06.11)
         inv.note = ((inv.note or "") + " · корректировка фермы"
                     + (f" (был № {old_no})" if inv.invoice_no != old_no else "")).strip(" ·")
         s.add(inv); s.commit()
@@ -1224,7 +1224,7 @@ def save_invoice(body: InvoiceIn, inv_id: int | None = None, uid: int = Depends(
         if body.stems_total and abs(lines_sum - body.stems_total) >= 1 and not dis:   # any farm: lines ≠ TOTAL
             dis.append({"box": "ИТОГО инвойса", "box_stems": body.stems_total, "units": lines_sum,
                         "varieties": [l.name for l in body.lines], "resolved": False})
-        if dis and not inv.discrepancy_json:
+        if False and dis and not inv.discrepancy_json:       # «спроси кладовщика» switched off (06.11)
             inv.discrepancy_json = json.dumps(dis, ensure_ascii=False)
             s.add(inv); s.commit()
         return snapshot(s, inv.topup_id)

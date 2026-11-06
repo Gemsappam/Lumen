@@ -2856,7 +2856,8 @@ async def missing_cmd(m: Message):
 
 
 def _discrepancies():
-    """Arrived invoices with an unresolved mixed-box mismatch."""
+    """Arrived invoices with an unresolved mixed-box mismatch — SWITCHED OFF (06.11): no «срочно узнай у кладовщика»."""
+    return []
     from .models import Invoice
     out = []
     with session() as s:

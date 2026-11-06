@@ -376,6 +376,20 @@ def _fix_agri_5004_nocredit():
     SETTINGS.write_text(json.dumps({**_settings(), "fix_agri_5004_nocredit": True}, ensure_ascii=False))
 
 
+def _clear_discrepancies():
+    """«Срочно узнай у кладовщика» is switched off (06.11.2026): forget the pending questions."""
+    from .models import Invoice
+    with session() as s:
+        n = 0
+        for i in s.exec(select(Invoice)).all():
+            if i.discrepancy_json:
+                i.discrepancy_json = None
+                s.add(i)
+                n += 1
+        if n:
+            s.commit()
+
+
 def _fix_7081_actual():
     """Once (31.10.2026): MAWB 369-11530551 was billed by ACTUAL weight (TOTAL AWB 254 kg = actual 254.35),
     but the farms got their volumetric kg. Put the actual kg (only if the stored ones are still the old numbers)."""
@@ -481,6 +495,7 @@ def seed():
     _fix_7081_actual()
     _fix_033_034()
     _fix_agri_5004_nocredit()
+    _clear_discrepancies()
     _fix_swapped_dates()
     _fix_double_broker()
     _merge_broker_dupes()
@@ -613,7 +628,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-11-06d · разделённый инвойс (одна поставка двумя рейсами): логистика обоих MAWB складывается, себестоимость единая"
+VERSION = "2026-11-06e · убрано «груз приехал — срочно узнай у кладовщика»"
 
 
 async def _once_recalc_true_rate():
