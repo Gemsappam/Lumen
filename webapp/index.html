@@ -328,36 +328,20 @@ function lastMileForm(keys, LM){
     try{ const r=await api('/lastmile',{method:'POST',body:{keys:ks,rub}}); w.remove(); toast(r.text.split('\n')[0]); render(CUR_TAB==='stock'?'stock':CUR_TAB,{}) }catch(e){ toast(e.message) } };
 }
 
-// ---------- ТК дослала часть инвойса другим MAWB: вторая часть того же инвойса на другом MAWB ----------
-async function splitForm(inv){
-  const L=(inv.lines||[]).filter(l=>l.id);
-  let B=[]; try{ const b=await api(`/invoices/${inv.id}/boxes`);
-    b.boxes.forEach(x=>{ for(let n=0;n<(x.qty||1);n++) B.push(x) }) }catch(e){}
+// ---------- ТК отправила часть коробок другим рейсом: инвойс остаётся одним, логистика с обоих MAWB ----------
+function splitForm(inv){
   const w=document.createElement('div');
   w.style.cssText='position:fixed;inset:0;background:var(--scrim);z-index:20;display:flex;align-items:flex-end';
-  w.innerHTML=`<div style="background:var(--bg2);width:100%;border-radius:18px 18px 0 0;padding:14px 0 calc(16px + env(safe-area-inset-bottom,0));max-height:88vh;overflow:auto">
-    <h2 style="margin-top:4px">Часть уехала другим MAWB</h2>
-    <p class="hint" style="margin:0 16px 10px">Например, Expolanka отправила 1 коробку из 2 следующей AWB. Укажи MAWB и отметь коробки, которые уехали (или стебли вручную). Инвойс разделится на 2 части: оплата и сумма — по стоимости, логистика — каждой части своего MAWB, пакинги обновятся.</p>
-    <form class="group" id="spf"><div class="field"><label>Другой MAWB</label><input name="awb" placeholder="074-48015004" inputmode="numeric"></div></form>
-    ${B.length>1?`<h2>Какие коробки уехали</h2><div class="group">${B.map((x,n)=>`<label class="row"><input type="checkbox" class="spb" value="${n+1}">
-      <div class="grow"><div class="t">Коробка ${n+1}${x.pack?' · '+esc(x.pack):''}</div><div class="s">${(x.content||[]).map(c=>`${esc(c.name)} — ${fmt(c.stems_per_box??c.stems??0)} ст`).join('<br>')}</div></div></label>`).join('')}</div>
-      <h2>…или вручную, стеблями</h2>`
-      :`<p class="hint" style="margin:0 16px 8px">В детализации ${B.length===1?'одна коробка':'нет коробок'} — выбрать коробку нельзя. Если на самом деле их больше, сначала загрузи пакинг-лист фермы (блок «Пакинг-лист»), или укажи стебли вручную.</p>`}
-    <div class="actions"><button id="spHalf">Половину каждой строки</button><button id="spAll0">Очистить</button></div>
-    <div class="group">${L.map(l=>`<div class="row" style="cursor:default"><div class="grow"><div class="t">${esc(l.name)}</div><div class="s">в инвойсе ${fmt(l.stems)} ст</div></div>
-      <div class="v"><input class="spl" data-id="${l.id}" data-max="${l.stems}" inputmode="numeric" placeholder="0" style="width:84px;text-align:right"></div></div>`).join('')}</div>
-    <div class="actions"><button id="spc">Отмена</button><button class="primary" id="spo">Разделить</button></div></div>`;
+  w.innerHTML=`<div style="background:var(--bg2);width:100%;border-radius:18px 18px 0 0;padding:14px 0 calc(16px + env(safe-area-inset-bottom,0))">
+    <h2 style="margin-top:4px">Часть коробок прилетела другим рейсом</h2>
+    <p class="hint" style="margin:0 16px 10px">Инвойс останется одним, на своём MAWB ${esc(inv.awb||'')}. Бот просто добавит ему логистику второго рейса (кг этой фермы из разбивки того MAWB) — себестоимость будет единая. Пакинг второго рейса перестанет ждать эту ферму.</p>
+    <form class="group" id="spf"><div class="field"><label>Второй MAWB</label><input name="awb" placeholder="074-48015004" inputmode="numeric"></div></form>
+    <div class="actions"><button id="spc">Отмена</button><button class="primary" id="spo">Добавить</button></div></div>`;
   document.body.appendChild(w);
-  const ins=[...w.querySelectorAll('.spl')];
-  w.querySelector('#spHalf').onclick=()=>ins.forEach(i=>i.value=Math.round(+i.dataset.max/2));
-  w.querySelector('#spAll0').onclick=()=>ins.forEach(i=>i.value='');
   w.querySelector('#spc').onclick=()=>w.remove();
   w.querySelector('#spo').onclick=async()=>{
-    const lines={}; ins.forEach(i=>{const v=numOrNull(i.value); if(v) lines[i.dataset.id]=v});
-    const boxes=[...w.querySelectorAll('.spb:checked')].map(x=>+x.value);
-    const awb=w.querySelector('#spf').awb.value.trim();
-    if(!awb) return toast('Впиши MAWB'); if(!boxes.length&&!Object.keys(lines).length) return toast('Отметь коробки или укажи стебли');
-    try{ const r=await api(`/invoices/${inv.id}/split`,{method:'POST',body:boxes.length?{awb,boxes}:{awb,lines}}); w.remove(); toast(r.text); back() }catch(e){ toast(e.message) } };
+    const awb=w.querySelector('#spf').awb.value.trim(); if(!awb) return toast('Впиши MAWB');
+    try{ const r=await api(`/invoices/${inv.id}/split`,{method:'POST',body:{awb}}); w.remove(); toast(r.text); back() }catch(e){ toast(e.message) } };
 }
 
 function toast(t){const e=document.getElementById('toast');e.textContent=noEmo(t);e.classList.add('on');setTimeout(()=>e.classList.remove('on'),2600)}
@@ -580,7 +564,7 @@ async invoice({t, inv, draft}){
     <div class="field"><label>Комментарий</label><input name="note" value="${esc(inv.note)}"></div>
   </form>
   ${inv.id?'<div id="boxesSlot"></div>':''}
-  ${inv.id&&ME?.can_write?`<div class="actions"><button id="splitBtn">Часть груза уехала другим MAWB</button></div>`:''}
+  ${inv.id&&ME?.can_write?`<div class="actions"><button id="splitBtn">Часть коробок прилетела другим рейсом</button></div>`:''}
   ${inv.id?`<h2>Статус груза</h2><div class="group"><div class="row"><div class="grow">
       <div class="t">${inv.arrived_at?'Прибыл':'В пути'}</div><div class="s">${inv.arrived_at?esc(inv.arrived_at):(inv.eta?'прибытие '+esc(inv.eta.replace('T',' ')):'ждёт сообщения ТК МСК о машине')}</div></div>
       <button id="arrToggle">${inv.arrived_at?'Вернуть в «В пути»':'Отметить прибывшим'}</button></div></div>`:''}

@@ -390,53 +390,62 @@ def _clear_discrepancies():
             s.commit()
 
 
-def _fix_maua_boxes():
-    """Once (06.11.2026): Maua Agritech FL/DL/26/001 — ONE invoice and ONE payment for TWO boxes:
-    box 1 (Giselle, Britney, Birdnest, Darlene, Gentle Trendsetter 70cm, 40 st each = 200 st) flew on 074-48014956,
-    box 2 (Fireworks 70cm, 180 st — the second packing list) on 074-48015004. The earlier split cut every line
-    105/95 — no such boxes. Each part now holds exactly its box; money is split by stems and spread equally per stem
-    (alloc «stems»), freight of both MAWBs is pooled -> one cost per stem for the whole delivery."""
+def _fix_maua_merge():
+    """Once (06.11.2026): Maua Agritech FL/DL/26/001 is ONE delivery, ONE invoice, ONE payment, kept on 074-48014956:
+    box 1 — Giselle, Britney, Birdnest, Darlene, Gentle Trendsetter 70cm × 40 st; box 2 — Fireworks 70cm 180 st, which
+    Expolanka flew on 074-48015004. The invoice also carries Maua's 5 kg of 5004 freight (extra_freight)."""
     from .api import _settings, SETTINGS
     from .models import Invoice, Line
     from .autolog import note as _note
-    if _settings().get("fix_maua_boxes"):
+    from .kbreak import skip_farm
+    if _settings().get("fix_maua_merge"):
         return
     with session() as s:
         invs = [i for i in s.exec(select(Invoice)).all() if i.farm == "Maua Agritech"
                 and (i.invoice_no or "").startswith("FL/DL/26/001")]
         p1 = next((i for i in invs if " / часть" not in i.invoice_no), None)
-        p2 = next((i for i in invs if " / часть" in i.invoice_no), None)
-        if p1 and p2:
-            sorts = ["Spray Rose Giselle 70cm", "Spray Rose Britney 70cm", "Spray Rose Birdnest 70cm",
-                     "Spray Rose Darlene 70cm", "Spray Rose Gentle Trendsetter 70cm"]
-            ls1 = s.exec(select(Line).where(Line.invoice_id == p1.id)).all()
+        if not p1:
+            SETTINGS.write_text(json.dumps({**_settings(), "fix_maua_merge": True}, ensure_ascii=False))
+            return
+        for p2 in [i for i in invs if i.id != p1.id]:
+            for f in ("usd_paid", "rub_paid_override", "invoice_total_usd", "farm_usd", "est_usd"):
+                v2 = getattr(p2, f)
+                if v2:
+                    setattr(p1, f, round((getattr(p1, f) or 0) + v2, 2))
             for l in s.exec(select(Line).where(Line.invoice_id == p2.id)).all():
                 s.delete(l)
-            have = {l.name: l for l in ls1}
-            for n, name in enumerate(sorts):
-                l = have.get(name) or Line(invoice_id=p1.id, name=name, price_usd=0.6)
-                l.stems, l.boxes = 40, (1 if n == 0 else None)
-                s.add(l)
-            s.add(Line(invoice_id=p2.id, name="Spray Rose Fireworks 70cm", boxes=1, stems=180, price_usd=0.0))
-            p1.boxes_json = json.dumps([{"qty": 1, "pack": None, "content": [{"name": n, "stems_per_box": 40} for n in sorts]}],
-                                       ensure_ascii=False)
-            p2.boxes_json = json.dumps([{"qty": 1, "pack": None, "content": [{"name": "Spray Rose Fireworks 70cm",
-                                                                                 "stems_per_box": 180}]}], ensure_ascii=False)
-            sh = 200 / 380
-            for f in ("usd_paid", "rub_paid_override", "invoice_total_usd", "farm_usd", "est_usd"):
-                tot = (getattr(p1, f) or 0) + (getattr(p2, f) or 0)
-                if tot:
-                    a = round(tot * sh, 2)
-                    setattr(p1, f, a)
-                    setattr(p2, f, round(tot - a, 2))
-            p1.alloc_mode = p2.alloc_mode = "stems"
-            p1.note = "FL/DL/26/001 — коробка 1 (200 ст) на 4956; коробка 2 (Fireworks 180 ст) дослана на 5004; одна оплата"
-            p2.note = "FL/DL/26/001 — коробка 2: Fireworks 180 ст (второй пакинг), тот же инвойс и оплата"
-            s.add(p1); s.add(p2)
-            _note(s, p1.id, p1.farm, p1.awb, "split", "коробка 1 (200 ст) — 4956, коробка 2 (Fireworks 180 ст) — 5004; "
-                  "деньги поровну на все 380 стеблей", "исправление 06.11")
+            s.delete(p2)
+        sorts = ["Spray Rose Giselle 70cm", "Spray Rose Britney 70cm", "Spray Rose Birdnest 70cm",
+                 "Spray Rose Darlene 70cm", "Spray Rose Gentle Trendsetter 70cm"]
+        have = {l.name: l for l in s.exec(select(Line).where(Line.invoice_id == p1.id)).all()}
+        for n, name in enumerate(sorts):
+            l = have.get(name) or Line(invoice_id=p1.id, name=name, price_usd=0.6)
+            l.stems, l.boxes, l.price_usd = 40, (1 if n == 0 else None), 0.6
+            s.add(l)
+        fw = have.get("Spray Rose Fireworks 70cm") or Line(invoice_id=p1.id, name="Spray Rose Fireworks 70cm")
+        fw.stems, fw.boxes, fw.price_usd = 180, 1, 0.35       # box 2: Fireworks $0.35 × 180 = $63
+        s.add(fw)
+        p1.boxes_json = json.dumps([
+            {"qty": 1, "pack": None, "content": [{"name": n, "stems_per_box": 40} for n in sorts]},
+            {"qty": 1, "pack": None, "content": [{"name": "Spray Rose Fireworks 70cm", "stems_per_box": 180}]}],
+            ensure_ascii=False)
+        p1.alloc_mode = "stems"
+        p1.invoice_total_usd = 183.0                 # both boxes: $120 + $63
+        p1.farm_usd = None                           # «ровно по инвойсу»: no advance, the rest of the money = fees
+        p1.note = ("FL/DL/26/001: 2 коробки, одна оплата. Коробка 2 (Fireworks 180 ст) прилетела рейсом 074-48015004 — "
+                   "логистика взята с обоих рейсов (+5 кг с 5004)")
+        s.add(p1)
+        pid, farm, awb = p1.id, p1.farm, p1.awb
+        _note(s, pid, farm, awb, "split", "один инвойс на 4956: 380 ст (2 коробки), логистика 4956 + 5 кг с 5004",
+              "исправление 06.11")
         s.commit()
-    SETTINGS.write_text(json.dumps({**_settings(), "fix_maua_boxes": True}, ensure_ascii=False))
+    st = _settings()
+    ex = dict(st.get("extra_freight") or {})
+    ex[str(pid)] = {"07448015004": 5.0}
+    sg = {c: p for c, p in (st.get("split_groups") or {}).items() if int(p) != pid}
+    SETTINGS.write_text(json.dumps({**st, "extra_freight": ex, "split_groups": sg, "fix_maua_merge": True},
+                                   ensure_ascii=False))
+    skip_farm("07448015004", "Maua Agritech")
 
 
 def _fix_7081_actual():
@@ -545,7 +554,7 @@ def seed():
     _fix_033_034()
     _fix_agri_5004_nocredit()
     _clear_discrepancies()
-    _fix_maua_boxes()
+    _fix_maua_merge()
     _fix_swapped_dates()
     _fix_double_broker()
     _merge_broker_dupes()
@@ -678,7 +687,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-11-06f · Maua: коробка 1 (200 ст) на 4956, коробка 2 (Fireworks 180 ст) на 5004, единая себестоимость"
+VERSION = "2026-11-06i · Maua одним инвойсом на 4956, Fireworks $0.35, без аванса"
 
 
 async def _once_recalc_true_rate():

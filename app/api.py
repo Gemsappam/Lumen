@@ -159,6 +159,8 @@ def _all(s):
     ids = {i.id for i in invs}
     calc.SPLITS = {int(c): int(p) for c, p in (_settings().get("split_groups") or {}).items()
                    if int(c) in ids and int(p) in ids}
+    calc.EXTRA = {int(i): {k: float(v) for k, v in (m or {}).items()}
+                  for i, m in (_settings().get("extra_freight") or {}).items() if int(i) in ids}
     base = {}                                   # parts made before split_groups existed: «№ / часть 2»
     for i in invs:
         if i.invoice_no and " / часть" not in i.invoice_no:
@@ -1283,116 +1285,47 @@ def _single_boxes(iid: int) -> list:
 
 @router.post("/invoices/{inv_id}/split")
 async def split_invoice(inv_id: int, body: SplitIn, uid: int = Depends(writer)):
-    """The forwarder shipped part of an invoice with another MAWB (Expolanka put 1 of 2 boxes on the next AWB).
-    -> a second part of the SAME invoice on that MAWB: the chosen stems move there, $ paid / total / ₽ are split by
-    the value moved, the same top-up. Each part then carries its own MAWB's freight; packings follow."""
+    """The forwarder put part of the boxes on another MAWB (Expolanka sent box 2 with the next flight).
+    The invoice stays in ONE place (its own MAWB, one cost); it ALSO carries its farm's share of the other MAWB's
+    freight — the farm's kg in that MAWB's breakdown. The other MAWB's packing no longer waits for this farm."""
     from .ai import find_mawb
-    from .kbreak import unskip_farm
+    from .kbreak import skip_farm
     raw = (body.awb or "").strip()
-    awb = find_mawb(raw) or (f"{re.sub(r'[^0-9]', '', raw)[:3]}-{re.sub(r'[^0-9]', '', raw)[3:]}"
-                             if len(re.sub(r"[^0-9]", "", raw)) == 11 else "")
+    dig = re.sub(r"[^0-9]", "", raw)
+    awb = find_mawb(raw) or (f"{dig[:3]}-{dig[3:]}" if len(dig) == 11 else "")
     if not awb:
         raise HTTPException(400, "MAWB — 11 цифр, например 074-48015004")
+    k = norm_awb(awb)
     with session() as s:
         inv = s.get(Invoice, inv_id)
         if not inv:
             raise HTTPException(404, "Инвойс не найден")
-        if norm_awb(inv.awb or "") == norm_awb(awb):
+        if norm_awb(inv.awb or "") == k:
             raise HTTPException(400, "Это тот же MAWB, что у инвойса")
-        lines = {l.id: l for l in s.exec(select(Line).where(Line.invoice_id == inv_id)).all()}
-        move = {int(k): float(v) for k, v in body.lines.items() if v and float(v) > 0}
-        moved_boxes = rest_boxes = None
-        split_note = ""
-        if body.boxes:                                  # «коробка 2 уехала» -> its content, line by line
-            singles = _single_boxes(inv_id)
-            pick = {n - 1 for n in body.boxes if 1 <= n <= len(singles)}
-            if not pick or len(pick) == len(singles):
-                raise HTTPException(400, "Выбери коробки, которые уехали (не все)")
-            moved_boxes = [b for n, b in enumerate(singles) if n in pick]
-            rest_boxes = [b for n, b in enumerate(singles) if n not in pick]
-            import difflib
-            key = lambda n: re.sub(r"[^a-z0-9]", "", str(n or "").lower())        # «Fire Works» = «Fireworks»
-            byname = {}
-            for l in lines.values():
-                byname.setdefault(key(l.name), l)
-            move, unmatched = {}, []
-            for b in moved_boxes:
-                for c in b["content"]:
-                    k_ = key(c["name"])
-                    hit = byname.get(k_) or next((byname[m] for m in difflib.get_close_matches(k_, list(byname), 1, 0.8)), None)
-                    if not hit:
-                        unmatched.append(str(c["name"]))
-                        continue
-                    move[hit.id] = move.get(hit.id, 0) + float(c["stems_per_box"] or 0)
-            over = [lid for lid, st in move.items() if st > lines[lid].stems + 1e-6]
-            if unmatched or over:
-                # the packing list doesn't match the invoice lines (farm substituted varieties) -> split every line
-                # by the share of stems in the boxes that left; money and freight are right either way
-                box_st = lambda bs: sum(float(c["stems_per_box"] or 0) for b in bs for c in b["content"])
-                share = box_st(moved_boxes) / ((box_st(moved_boxes) + box_st(rest_boxes)) or 1)
-                move = {lid: round(l.stems * share) for lid, l in lines.items() if round(l.stems * share) > 0}
-                split_note = (f"сорта в раскладке коробок не совпали со строками инвойса ({', '.join(unmatched[:3]) or 'стебли'}) — "
-                              f"каждая строка разделена по доле коробок ({share * 100:.0f}%)")
-        if not move:
-            raise HTTPException(400, "Укажи, сколько стеблей каких строк уехало другим MAWB")
-        for lid, st in move.items():
-            if lid not in lines or st > lines[lid].stems + 1e-6:
-                raise HTTPException(400, f"Строка {lid}: столько стеблей в ней нет")
-        total_val = sum(l.stems * l.price_usd for l in lines.values()) or 1
-        moved_val = sum(st * lines[lid].price_usd for lid, st in move.items())
-        if moved_val >= total_val - 1e-6:
-            raise HTTPException(400, "Уехало всё — тогда просто поменяй MAWB инвойса")
-        k = moved_val / total_val
-        new = Invoice(**{**inv.model_dump(exclude={"id"}),
-                         "awb": awb, "invoice_no": f"{inv.invoice_no or '?'} / часть 2",
-                         "weight_kg": None, "arrived_at": None, "eta": None, "client_eta": None, "truck": None,
-                         "packing_sent": False, "client_done": False, "boxes_json": None, "hawb": None,
-                         "discrepancy_json": None, "ext_id": None,
-                         "note": f"часть инвойса № {inv.invoice_no} (основной на MAWB {inv.awb}) — ТК дослала другим MAWB"})
-        cut = lambda v, part: round(v * part, 2) if v is not None else None
-        for f in ("invoice_total_usd", "usd_paid", "rub_paid_override", "est_usd", "farm_usd"):
-            v = getattr(inv, f)
-            if v:
-                setattr(new, f, cut(v, k))
-                setattr(inv, f, round(v - getattr(new, f), 2))
-        s.add(new); s.flush()
-        for lid, st in move.items():
-            l = lines[lid]
-            if abs(st - l.stems) < 1e-6:
-                l.invoice_id = new.id
-            else:
-                s.add(Line(invoice_id=new.id, name=l.name, stems=st, price_usd=l.price_usd, mrc=l.mrc,
-                           boxes=None, weight_kg=None))
-                l.stems = round(l.stems - st, 4)
-            s.add(l)
-        if moved_boxes is not None:               # each part keeps exactly its boxes
-            new.boxes_json = json.dumps(moved_boxes, ensure_ascii=False)
-            inv.boxes_json = json.dumps(rest_boxes, ensure_ascii=False)
-        else:
-            inv.boxes_json = None                 # box detail is re-derived from the remaining lines
-        inv.note = ((inv.note or "") + f" · часть дослана MAWB {awb} (№ {new.invoice_no})").strip(" ·")
-        _fill_weight_from_logistics(s, new)
-        s.add(inv); s.add(new); s.commit()
-        new_id, farm, old_awb = new.id, inv.farm, inv.awb
+        aw = s.get(AwbWeights, k)
+        d = json.loads(aw.farm_kg_json or "{}") if aw else {}
+        keys = _farm_keys(s, inv.farm)
+        kg = next((v for f, v in d.items() if _norm_name(f) in keys), None)
+        farm, own_awb = inv.farm, inv.awb
+    if not kg:
+        raise HTTPException(400, f"В разбивке MAWB {awb} нет кг фермы {farm} — сначала загрузи разбивку этого MAWB")
+    ex = dict(_settings().get("extra_freight") or {})
+    ex[str(inv_id)] = {**(ex.get(str(inv_id)) or {}), k: float(kg)}
+    SETTINGS.write_text(json.dumps({**_settings(), "extra_freight": ex}, ensure_ascii=False))
+    with session() as s:
+        inv = s.get(Invoice, inv_id)
+        inv.note = ((inv.note or "") + f" · часть коробок прилетела MAWB {awb} ({kg:g} кг) — логистика с обоих рейсов").strip(" ·")
+        s.add(inv)
         from .autolog import note as _note
-        _note(s, inv_id, farm, old_awb, "split", f"часть ({moved_val:.2f} $ по цене фермы) уехала MAWB {awb}",
+        _note(s, inv_id, farm, own_awb, "split", f"часть коробок прилетела MAWB {awb}: +{kg:g} кг логистики того рейса",
               "вручную в приложении")
         s.commit()
-    unskip_farm(norm_awb(awb), farm)              # the second MAWB now has this farm's invoice
-    sg = dict(_settings().get("split_groups") or {})   # one delivery -> one cost: freight of both MAWBs pooled
-    sg[str(new_id)] = int((sg.get(str(inv_id)) or inv_id))
-    SETTINGS.write_text(json.dumps({**_settings(), "split_groups": sg}, ensure_ascii=False))
+    skip_farm(k, farm)                            # the other MAWB's packing doesn't wait for this farm
     from .backup import mark_dirty
     mark_dirty()
-    sent = []
-    for a, why in ((awb, f"{farm} — дослана часть инвойса"), (old_awb, f"{farm} — часть уехала MAWB {awb}")):
-        if a and await _refresh_packing(new_id if a == awb else inv_id, why):
-            sent.append(a)
-    return {"ok": True, "id": new_id, "share": round(k, 4),
-            "text": f"Готово: {farm} — {k * 100:.0f}% инвойса перенесено на MAWB {awb} как «часть 2». "
-                    "Оплата и сумма разделены по стоимости. Логистика обоих MAWB сложена и разложена на все стебли инвойса — себестоимость единая."
-                    + (f" Внимание: {split_note}." if split_note else "")
-                    + (" Пакинги обновлены." if sent else "")}
+    return {"ok": True, "id": inv_id,
+            "text": f"Готово: {farm} остаётся одним инвойсом на MAWB {own_awb}. Логистика — с обоих рейсов "
+                    f"(+{kg:g} кг с {awb}), себестоимость единая."}
 
 
 @router.delete("/invoices/{inv_id}")

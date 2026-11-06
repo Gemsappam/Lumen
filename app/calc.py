@@ -94,6 +94,8 @@ RULES: dict = {}      # farm (lower) -> {"account", "in_fee", "markup"} (brokers
 DEPOSITS: list = []   # BrokerDeposit rows (money put on the exchange)
 LASTMILE: dict = {}   # MAWB key -> ₽ per stem: truck from the ТК warehouse to «Опт Склад Бауманская»
 SPLITS: dict = {}     # invoice id (part 2) -> invoice id (main part): one delivery that flew on two MAWBs
+EXTRA: dict = {}      # invoice id -> {other MAWB key: farm kg there}: part of the boxes flew on another MAWB —
+                      # the invoice stays in ONE place, but also carries its farm's share of that MAWB's freight
 
 
 def _d(s: str):
@@ -263,12 +265,19 @@ def split_awb_groups(invoices) -> dict:
         while parent.get(x, x) != x:
             x = parent[x]
         return x
-    for c, p in SPLITS.items():
-        a, b = by_id.get(c), by_id.get(p)
-        if a and b and a.awb and b.awb:
-            ka, kb = find(norm_awb(a.awb)), find(norm_awb(b.awb))
+    pairs = [(by_id.get(c), by_id.get(p)) for c, p in SPLITS.items()]
+    for c, p in pairs:
+        if c and p and c.awb and p.awb:
+            ka, kb = find(norm_awb(c.awb)), find(norm_awb(p.awb))
             if ka != kb:
                 parent[ka] = kb
+    for iid, extra in EXTRA.items():
+        i = by_id.get(iid)
+        for k in (extra or {}):
+            if i and i.awb:
+                ka, kb = find(k), find(norm_awb(i.awb))
+                if ka != kb:
+                    parent[ka] = kb
     out = defaultdict(set)
     for k in list(parent) + list(parent.values()):
         out[find(k)].add(k)
@@ -331,6 +340,14 @@ def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result
     inv_by_awb = defaultdict(list)
     for inv in invoices:
         inv_by_awb[norm_awb(inv.awb)].append(inv)
+    if EXTRA:                                       # the same invoice also «sits» on the other MAWB with its kg there
+        from types import SimpleNamespace
+        for inv in invoices:
+            for k, kg in (EXTRA.get(inv.id) or {}).items():
+                if k != norm_awb(inv.awb):
+                    inv_by_awb[k].append(SimpleNamespace(**{**{c: getattr(inv, c, None) for c in (
+                        "id", "farm", "topup_id", "via_broker", "country", "invoice_no", "alloc_mode")},
+                        "awb": k, "weight_kg": kg}))
 
     groups = defaultdict(lambda: {"usd": 0.0, "rub": 0.0, "ids": [], "own": True, "basis": "auto", "provider": "", "kg_total": 0.0, "kg_bill": 0.0})
     for lg in logistics:
