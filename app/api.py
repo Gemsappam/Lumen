@@ -156,6 +156,18 @@ def _all(s):
                                s.exec(select(Line)).all(), s.exec(select(Logistics)).all())
     from .lastmile import per_stem
     calc.LASTMILE = per_stem(invs, lines)
+    ids = {i.id for i in invs}
+    calc.SPLITS = {int(c): int(p) for c, p in (_settings().get("split_groups") or {}).items()
+                   if int(c) in ids and int(p) in ids}
+    base = {}                                   # parts made before split_groups existed: «№ / часть 2»
+    for i in invs:
+        if i.invoice_no and " / часть" not in i.invoice_no:
+            base.setdefault((i.farm, i.invoice_no.strip()), i.id)
+    for i in invs:
+        if i.invoice_no and " / часть" in i.invoice_no and i.id not in calc.SPLITS:
+            p = base.get((i.farm, i.invoice_no.split(" / часть")[0].strip()))
+            if p and p != i.id:
+                calc.SPLITS[i.id] = p
     return tops, invs, lines, logs
 
 
@@ -1367,6 +1379,9 @@ async def split_invoice(inv_id: int, body: SplitIn, uid: int = Depends(writer)):
               "вручную в приложении")
         s.commit()
     unskip_farm(norm_awb(awb), farm)              # the second MAWB now has this farm's invoice
+    sg = dict(_settings().get("split_groups") or {})   # one delivery -> one cost: freight of both MAWBs pooled
+    sg[str(new_id)] = int((sg.get(str(inv_id)) or inv_id))
+    SETTINGS.write_text(json.dumps({**_settings(), "split_groups": sg}, ensure_ascii=False))
     from .backup import mark_dirty
     mark_dirty()
     sent = []
@@ -1375,7 +1390,7 @@ async def split_invoice(inv_id: int, body: SplitIn, uid: int = Depends(writer)):
             sent.append(a)
     return {"ok": True, "id": new_id, "share": round(k, 4),
             "text": f"Готово: {farm} — {k * 100:.0f}% инвойса перенесено на MAWB {awb} как «часть 2». "
-                    "Оплата и сумма разделены по стоимости, логистика — каждой части своя."
+                    "Оплата и сумма разделены по стоимости. Логистика обоих MAWB сложена и разложена на все стебли инвойса — себестоимость единая."
                     + (f" Внимание: {split_note}." if split_note else "")
                     + (" Пакинги обновлены." if sent else "")}
 

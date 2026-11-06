@@ -284,6 +284,98 @@ def _fix_swapped_dates():
             print(f"[lumen] fixed {n} swapped invoice dates", flush=True)
 
 
+def _fix_033_034():
+    """Once (06.11.2026), by the Nextwave statement «UPDATED NEXTWAVE VS DILUNA SOA – REVISED OCT 2026» + credit note:
+      #033 (14.10, MAWB 074-48014956) = Agriflora $427.14 + Massai $306.02; credit note −$214 (500 st Madam Bombastic
+            60cm, Massai) applied to #033 itself (paid after it: $519.16) -> those 500 stems at $0, Massai net $92.02.
+      #034 (21.10, MAWB 074-48015004) = $750.82 (Massai box 4–5 at full $214); credit −$162.64 = Massai box 6
+            (200 st Madam Bombastic 70cm, $92.02) + Agriflora 1 box assorted 60cm ($70.62).
+    The bot had written #034 over #033 on 4956. Sets every invoice to exactly this; payments are not touched."""
+    from .api import _settings, SETTINGS
+    from .models import Invoice, Line
+    from .autolog import note as _note
+    if _settings().get("fix_033_034_v2"):
+        return
+    k = lambda a: (a or "").replace("-", "")
+    with session() as s:
+        invs = s.exec(select(Invoice)).all()
+        get = lambda farm, awb: next((i for i in invs if i.farm == farm and k(i.awb) == awb
+                                      and (i.invoice_no or "").startswith("NW2026#03")), None)
+        lines = lambda i: s.exec(select(Line).where(Line.invoice_id == i.id)).all()
+
+        def put(inv, name, boxes, stems, price):
+            l = next((x for x in lines(inv) if x.name == name), None) or Line(invoice_id=inv.id, name=name)
+            l.boxes, l.stems, l.price_usd = boxes, stems, price
+            s.add(l)
+
+        def done(inv, txt):
+            inv.boxes_json = None
+            s.add(inv)
+            _note(s, inv.id, inv.farm, inv.awb, "merge", txt, "сверка со стейтментом Nextwave 06.11")
+
+        a = get("Agriflora", "07448014956")
+        if a:
+            put(a, "Spray Rose Constellation 60cm", None, 30, 0.5885)
+            a.invoice_no, a.invoice_date, a.invoice_total_usd = "NW2026#033", "14.10.2026", 427.14
+            a.note = "#033 (14.10), по стейтменту Nextwave оплачен 28.10"
+            done(a, "инвойс #033 на 4956: $427.14")
+        m = get("Massai", "07448014956")
+        if m:
+            put(m, "Spray Rose Madam Bombastic 60cm", 2, 500, 0.0)
+            put(m, "Spray Rose Madam Bombastic 70cm", 1, 200, 0.4601)
+            m.invoice_no, m.invoice_date, m.invoice_total_usd = "NW2026#033", "14.10.2026", 92.02
+            m.note = "#033 (14.10): credit note −$214 — 500 ст Madam Bombastic 60cm (брак/не тот сорт) по $0; итог $92.02"
+            done(m, "инвойс #033 на 4956: 500 ст Madam Bombastic 60cm по $0 (credit note −$214), итог $92.02")
+        m5 = get("Massai", "07448015004")
+        if m5:
+            put(m5, "Spray Rose Madam Bombastic 60cm", 2, 500, 0.428)
+            put(m5, "Spray Rose Madam Bombastic 70cm", 1, 200, 0.0)
+            m5.invoice_total_usd = 214.0
+            m5.note = "#034 (21.10): коробки 4–5 по полной цене; credit −$92.02 — коробка 6 (200 ст Madam Bombastic 70cm) по $0"
+            done(m5, "инвойс #034 на 5004: коробки 4–5 $214, коробка 6 по $0 (credit −$92.02), итог $214")
+        a5 = get("Agriflora", "07448015004")
+        if a5 and m5 and a5.topup_id and m5.topup_id == a5.topup_id:
+            # #034 paid as ONE payment (~$588 = net $588.18): split it between the farms by their net totals,
+            # it was recorded $493 / $95 (by the old totals)
+            tot_usd = (a5.usd_paid or 0) + (m5.usd_paid or 0)
+            tot_rub = (a5.rub_paid_override or 0) + (m5.rub_paid_override or 0)
+            sh = 374.18 / (374.18 + 214.0)
+            a5.usd_paid = round(tot_usd * sh, 2)
+            m5.usd_paid = round(tot_usd - a5.usd_paid, 2)
+            if tot_rub:
+                a5.rub_paid_override = round(tot_rub * sh)
+                m5.rub_paid_override = round(tot_rub - a5.rub_paid_override)
+            a5.farm_usd = m5.farm_usd = None
+            s.add(m5)
+        if a5:
+            a5.invoice_total_usd = 374.18
+            a5.note = "#034 (21.10): credit −$70.62 — 1 коробка assorted 60cm; к оплате $374.18"
+            done(a5, "инвойс #034 на 5004: credit −$70.62 (коробка assorted 60cm), итог $374.18")
+        s.commit()
+    SETTINGS.write_text(json.dumps({**_settings(), "fix_033_034_v2": True}, ensure_ascii=False))
+
+
+def _fix_agri_5004_nocredit():
+    """Once (06.11.2026): the brother doesn't want the Agriflora credit (−$70.62) on #034 / MAWB 074-48015004 —
+    the invoice stays at its full $444.8 and counts as settled (no debt to the farm). The $ really paid for it stay."""
+    from .api import _settings, SETTINGS
+    from .models import Invoice
+    from .autolog import note as _note
+    if _settings().get("fix_agri_5004_nocredit"):
+        return
+    with session() as s:
+        a5 = next((i for i in s.exec(select(Invoice)).all() if i.farm == "Agriflora"
+                   and (i.awb or "").replace("-", "") == "07448015004" and (i.invoice_no or "").startswith("NW2026#034")), None)
+        if a5:
+            a5.invoice_total_usd = 444.8
+            a5.farm_usd = 444.8 if a5.topup_id else None
+            a5.note = "#034 (21.10): $444.8, кредит Nextwave −$70.62 не учитываем (решение 06.11) — расчёт с фермой закрыт"
+            s.add(a5)
+            _note(s, a5.id, a5.farm, a5.awb, "merge", "кредит −$70.62 не учитываем: инвойс $444.8, расчёт закрыт", "решение 06.11")
+        s.commit()
+    SETTINGS.write_text(json.dumps({**_settings(), "fix_agri_5004_nocredit": True}, ensure_ascii=False))
+
+
 def _fix_7081_actual():
     """Once (31.10.2026): MAWB 369-11530551 was billed by ACTUAL weight (TOTAL AWB 254 kg = actual 254.35),
     but the farms got their volumetric kg. Put the actual kg (only if the stored ones are still the old numbers)."""
@@ -387,6 +479,8 @@ def seed():
     _fix_broker_swap()
     _fix_positano_7081()
     _fix_7081_actual()
+    _fix_033_034()
+    _fix_agri_5004_nocredit()
     _fix_swapped_dates()
     _fix_double_broker()
     _merge_broker_dupes()
@@ -519,7 +613,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-11-05c · разделение по коробкам: сорта сверяются гибко, при несовпадении — по доле коробок"
+VERSION = "2026-11-06d · разделённый инвойс (одна поставка двумя рейсами): логистика обоих MAWB складывается, себестоимость единая"
 
 
 async def _once_recalc_true_rate():

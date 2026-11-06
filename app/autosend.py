@@ -31,6 +31,8 @@ def stages() -> dict:
     for i in invs:
         if (i.awb or "").strip():
             by_awb[norm_awb(i.awb)].append(i)
+    from .calc import split_awb_groups
+    sgroups = split_awb_groups(invs)
     for k, mine in by_awb.items():
         if not all(by_inv[i.id] for i in mine):
             continue
@@ -45,9 +47,12 @@ def stages() -> dict:
             if not g or not g.get("rub") or (k, leg) in res.estimated_legs:
                 ok = False
                 break
+            keys = sgroups.get(k, {k})               # split delivery: freight pooled across its MAWBs
+            pool = [i for kk in keys for i in by_awb.get(kk, [])]
+            bill = sum((res.legs.get((kk, leg)) or {}).get("rub") or 0 for kk in keys)
             spread = sum((res.lines[l.id].air_rub_stem if leg == "air" else res.lines[l.id].msk_rub_stem) * l.stems
-                         for i in mine for l in by_inv[i.id] if l.id in res.lines)
-            if spread < g["rub"] * 0.99:              # some farm of the bill has no invoice / kg yet
+                         for i in pool for l in by_inv[i.id] if l.id in res.lines)
+            if spread < bill * 0.99:                  # some farm of the bill has no invoice / kg yet
                 ok = False
                 break
         if ok:

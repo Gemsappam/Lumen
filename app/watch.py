@@ -70,8 +70,18 @@ def run(save: bool = True) -> list[str]:
             if c:
                 alloc[(k, "air")] += c.air_rub_stem * l.stems
                 alloc[(k, "msk")] += c.msk_rub_stem * l.stems
+    from .calc import split_awb_groups
+    sgroups = split_awb_groups(invs)              # split deliveries: freight pooled across their MAWBs
+    seen_grp = set()
     for (k, leg), g in res.legs.items():
         a = alloc.get((k, leg), 0)
+        if k in sgroups:
+            key = (sgroups[k], leg)
+            if key in seen_grp:
+                continue
+            seen_grp.add(key)
+            a = sum(alloc.get((x, leg), 0) for x in sgroups[k])
+            g = {"rub": sum((res.legs.get((x, leg)) or {}).get("rub") or 0 for x in sgroups[k])}
         if g.get("rub") and a > g["rub"] * OVER + 1:
             issues.append(f"MAWB {nice(k)} ({'ТК Кения' if leg == 'air' else 'ТК МСК'}): на фермы разложено {fmt(a)} ₽, "
                           f"а счёт {fmt(g['rub'])} ₽ ({a / g['rub'] * 100:.0f}%) — себестоимость завышена")

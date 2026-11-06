@@ -93,6 +93,7 @@ OPENINGS: dict = {}   # farm/account (lower) -> (usd, rate, name): balance BEFOR
 RULES: dict = {}      # farm (lower) -> {"account", "in_fee", "markup"} (brokers: Tessa / Plazoleta)
 DEPOSITS: list = []   # BrokerDeposit rows (money put on the exchange)
 LASTMILE: dict = {}   # MAWB key -> ₽ per stem: truck from the ТК warehouse to «Опт Склад Бауманская»
+SPLITS: dict = {}     # invoice id (part 2) -> invoice id (main part): one delivery that flew on two MAWBs
 
 
 def _d(s: str):
@@ -250,6 +251,28 @@ def broker_topup(res, inv):
         if p.get("tid"):
             by[p["tid"]] = by.get(p["tid"], 0) + p["usd"]
     return max(by, key=by.get) if by else None
+
+
+def split_awb_groups(invoices) -> dict:
+    """MAWB key -> all MAWB keys tied to it by split invoices (one delivery on two flights). Freight is pooled
+    inside such a group, so checks «₽ spread vs bill» must look at the group, not at one MAWB."""
+    by_id = {i.id: i for i in invoices}
+    parent = {}
+
+    def find(x):
+        while parent.get(x, x) != x:
+            x = parent[x]
+        return x
+    for c, p in SPLITS.items():
+        a, b = by_id.get(c), by_id.get(p)
+        if a and b and a.awb and b.awb:
+            ka, kb = find(norm_awb(a.awb)), find(norm_awb(b.awb))
+            if ka != kb:
+                parent[ka] = kb
+    out = defaultdict(set)
+    for k in list(parent) + list(parent.values()):
+        out[find(k)].add(k)
+    return {k: frozenset(g) for g in out.values() for k in g}
 
 
 def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result:
@@ -425,6 +448,25 @@ def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result
         if ps:
             for l in lines_by_inv[inv.id]:
                 res.lines[l.id].lm_rub_stem = ps
+
+    # one delivery on two MAWBs (ТК dosent a box with the next flight): freight of BOTH MAWBs is pooled and spread
+    # over all stems of the invoice -> one cost for the whole delivery (by line kg when known, else by stems)
+    if SPLITS:
+        grp = defaultdict(set)
+        for child, parent in SPLITS.items():
+            grp[parent].update({parent, child})
+        for ids in grp.values():
+            ls = [l for i in ids for l in lines_by_inv.get(i, []) if l.id in res.lines]
+            if len(ls) < 2:
+                continue
+            kg_ok = all(l.weight_kg for l in ls)
+            base = {l.id: (l.weight_kg if kg_ok else l.stems) or 0 for l in ls}
+            tb = sum(base.values()) or 1
+            for attr in ("air_rub_stem", "msk_rub_stem", "lm_rub_stem"):
+                total = sum(getattr(res.lines[l.id], attr) * l.stems for l in ls)
+                for l in ls:
+                    if l.stems:
+                        setattr(res.lines[l.id], attr, total * base[l.id] / tb / l.stems)
 
     # invoices of this top-up with no freight yet
     have = {awb for (awb, _l) in groups}
