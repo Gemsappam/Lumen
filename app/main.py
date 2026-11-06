@@ -376,24 +376,35 @@ def _fix_agri_5004_nocredit():
     SETTINGS.write_text(json.dumps({**_settings(), "fix_agri_5004_nocredit": True}, ensure_ascii=False))
 
 
-def _fix_agri_4956_kg():
-    """Once (06.11.2026): Expolanka's weight report for 074-48014956 gives Agriflora 150 kg (the ТК bill is 705 kg),
-    but her invoice said 65 kg — 85 kg of freight (~54 000 ₽) sat on no farm. Decision: Agriflora carries her 150 kg."""
+def _fix_4956_agri150():
+    """Once (06.11.2026): Expolanka's own sheet (Diluna_30bxs.xlsx) for 074-48014956 says AGRIFLORA 3 packs, Weight 150
+    (VW 68.3); total 705 = the bill. So Agriflora carries 150 kg. Undoes the short-lived 06m «spread» if it ran."""
     from .api import _settings, SETTINGS
-    from .models import Invoice
+    from .models import Invoice, AwbWeights
     from .autolog import note as _note
-    if _settings().get("fix_agri_4956_kg"):
+    if _settings().get("fix_4956_agri150"):
         return
     with session() as s:
         a = next((i for i in s.exec(select(Invoice)).all() if i.farm == "Agriflora"
                   and (i.awb or "").replace("-", "") == "07448014956"), None)
-        if a and abs((a.weight_kg or 0) - 65) < 0.01:
+        if a and abs((a.weight_kg or 0) - 150) > 0.01:
             a.weight_kg = 150.0
-            a.note = ((a.note or "") + " · вес 150 кг по отчёту Expolanka (было 65 — 85 кг логистики ни на ком не висели)").strip(" ·")
+            if "150 кг" not in (a.note or ""):
+                a.note = ((a.note or "") + " · вес 150 кг по листу Expolanka (3 коробки, VW 68)").strip(" ·")
             s.add(a)
-            _note(s, a.id, a.farm, a.awb, "merge", "вес 65 → 150 кг по весовому отчёту Expolanka", "решение 06.11")
+            _note(s, a.id, a.farm, a.awb, "merge", "вес 150 кг по листу Expolanka", "решение 06.11")
+        w = s.get(AwbWeights, "07448014956")
+        if w:
+            d = json.loads(w.farm_kg_json or "{}")
+            if abs(float(d.get("Agriflora") or 0) - 150) > 0.01:
+                d["Agriflora"] = 150.0
+                w.farm_kg_json = json.dumps(d, ensure_ascii=False)
+            w.note = ""
+            s.add(w)
         s.commit()
-    SETTINGS.write_text(json.dumps({**_settings(), "fix_agri_4956_kg": True}, ensure_ascii=False))
+    st = _settings()
+    sp = [x for x in (st.get("spread_awbs") or []) if x != "07448014956"]
+    SETTINGS.write_text(json.dumps({**st, "spread_awbs": sp, "fix_4956_agri150": True}, ensure_ascii=False))
 
 
 def _clear_discrepancies():
@@ -576,7 +587,7 @@ def seed():
     _fix_agri_5004_nocredit()
     _clear_discrepancies()
     _fix_maua_merge()
-    _fix_agri_4956_kg()
+    _fix_4956_agri150()
     _fix_swapped_dates()
     _fix_double_broker()
     _merge_broker_dupes()
@@ -709,7 +720,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-11-06l · 4956: Agriflora 150 кг по отчёту; сторож ловит расхождение кг"
+VERSION = "2026-11-06n · 4956: Agriflora 150 кг по листу Expolanka"
 
 
 async def _once_recalc_true_rate():

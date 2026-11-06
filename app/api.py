@@ -159,6 +159,7 @@ def _all(s):
     ids = {i.id for i in invs}
     calc.SPLITS = {int(c): int(p) for c, p in (_settings().get("split_groups") or {}).items()
                    if int(c) in ids and int(p) in ids}
+    calc.SPREAD = set(_settings().get("spread_awbs") or [])
     calc.EXTRA = {int(i): {k: float(v) for k, v in (m or {}).items()}
                   for i, m in (_settings().get("extra_freight") or {}).items() if int(i) in ids}
     base = {}                                   # parts made before split_groups existed: «№ / часть 2»

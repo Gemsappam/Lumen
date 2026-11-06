@@ -94,6 +94,7 @@ RULES: dict = {}      # farm (lower) -> {"account", "in_fee", "markup"} (brokers
 DEPOSITS: list = []   # BrokerDeposit rows (money put on the exchange)
 LASTMILE: dict = {}   # MAWB key -> ₽ per stem: truck from the ТК warehouse to «Опт Склад Бауманская»
 SPLITS: dict = {}     # invoice id (part 2) -> invoice id (main part): one delivery that flew on two MAWBs
+SPREAD: set = set()   # MAWB keys whose bill is spread over farm kg in full (bill kg > sum of real farm kg)
 EXTRA: dict = {}      # invoice id -> {other MAWB key: farm kg there}: part of the boxes flew on another MAWB —
                       # the invoice stays in ONE place, but also carries its farm's share of that MAWB's freight
 
@@ -430,6 +431,8 @@ def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result
                     res.warnings.append(f"MAWB {awb}: вес по счёту {g['provider'] or ''} {g['kg_bill']:g} кг, "
                                         f"по разбивке {g['kg_total']:g} кг — ставка ₽/кг считается от веса счёта")
                 tot = g["kg_bill"]
+                if awb in SPREAD and kg_farms:
+                    tot = kg_farms           # ТК billed more kg than the farms weigh: everyone shares the excess by kg
         elif attr == "weight_kg":
             tot = max(tot, g["kg_total"])          # never above 100% of the bill
         g["rub_per_kg"] = g["rub"] / tot if attr == "weight_kg" and tot else None
