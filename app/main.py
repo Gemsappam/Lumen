@@ -390,6 +390,55 @@ def _clear_discrepancies():
             s.commit()
 
 
+def _fix_maua_boxes():
+    """Once (06.11.2026): Maua Agritech FL/DL/26/001 — ONE invoice and ONE payment for TWO boxes:
+    box 1 (Giselle, Britney, Birdnest, Darlene, Gentle Trendsetter 70cm, 40 st each = 200 st) flew on 074-48014956,
+    box 2 (Fireworks 70cm, 180 st — the second packing list) on 074-48015004. The earlier split cut every line
+    105/95 — no such boxes. Each part now holds exactly its box; money is split by stems and spread equally per stem
+    (alloc «stems»), freight of both MAWBs is pooled -> one cost per stem for the whole delivery."""
+    from .api import _settings, SETTINGS
+    from .models import Invoice, Line
+    from .autolog import note as _note
+    if _settings().get("fix_maua_boxes"):
+        return
+    with session() as s:
+        invs = [i for i in s.exec(select(Invoice)).all() if i.farm == "Maua Agritech"
+                and (i.invoice_no or "").startswith("FL/DL/26/001")]
+        p1 = next((i for i in invs if " / часть" not in i.invoice_no), None)
+        p2 = next((i for i in invs if " / часть" in i.invoice_no), None)
+        if p1 and p2:
+            sorts = ["Spray Rose Giselle 70cm", "Spray Rose Britney 70cm", "Spray Rose Birdnest 70cm",
+                     "Spray Rose Darlene 70cm", "Spray Rose Gentle Trendsetter 70cm"]
+            ls1 = s.exec(select(Line).where(Line.invoice_id == p1.id)).all()
+            for l in s.exec(select(Line).where(Line.invoice_id == p2.id)).all():
+                s.delete(l)
+            have = {l.name: l for l in ls1}
+            for n, name in enumerate(sorts):
+                l = have.get(name) or Line(invoice_id=p1.id, name=name, price_usd=0.6)
+                l.stems, l.boxes = 40, (1 if n == 0 else None)
+                s.add(l)
+            s.add(Line(invoice_id=p2.id, name="Spray Rose Fireworks 70cm", boxes=1, stems=180, price_usd=0.0))
+            p1.boxes_json = json.dumps([{"qty": 1, "pack": None, "content": [{"name": n, "stems_per_box": 40} for n in sorts]}],
+                                       ensure_ascii=False)
+            p2.boxes_json = json.dumps([{"qty": 1, "pack": None, "content": [{"name": "Spray Rose Fireworks 70cm",
+                                                                                 "stems_per_box": 180}]}], ensure_ascii=False)
+            sh = 200 / 380
+            for f in ("usd_paid", "rub_paid_override", "invoice_total_usd", "farm_usd", "est_usd"):
+                tot = (getattr(p1, f) or 0) + (getattr(p2, f) or 0)
+                if tot:
+                    a = round(tot * sh, 2)
+                    setattr(p1, f, a)
+                    setattr(p2, f, round(tot - a, 2))
+            p1.alloc_mode = p2.alloc_mode = "stems"
+            p1.note = "FL/DL/26/001 — коробка 1 (200 ст) на 4956; коробка 2 (Fireworks 180 ст) дослана на 5004; одна оплата"
+            p2.note = "FL/DL/26/001 — коробка 2: Fireworks 180 ст (второй пакинг), тот же инвойс и оплата"
+            s.add(p1); s.add(p2)
+            _note(s, p1.id, p1.farm, p1.awb, "split", "коробка 1 (200 ст) — 4956, коробка 2 (Fireworks 180 ст) — 5004; "
+                  "деньги поровну на все 380 стеблей", "исправление 06.11")
+        s.commit()
+    SETTINGS.write_text(json.dumps({**_settings(), "fix_maua_boxes": True}, ensure_ascii=False))
+
+
 def _fix_7081_actual():
     """Once (31.10.2026): MAWB 369-11530551 was billed by ACTUAL weight (TOTAL AWB 254 kg = actual 254.35),
     but the farms got their volumetric kg. Put the actual kg (only if the stored ones are still the old numbers)."""
@@ -496,6 +545,7 @@ def seed():
     _fix_033_034()
     _fix_agri_5004_nocredit()
     _clear_discrepancies()
+    _fix_maua_boxes()
     _fix_swapped_dates()
     _fix_double_broker()
     _merge_broker_dupes()
@@ -628,7 +678,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-11-06e · убрано «груз приехал — срочно узнай у кладовщика»"
+VERSION = "2026-11-06f · Maua: коробка 1 (200 ст) на 4956, коробка 2 (Fireworks 180 ст) на 5004, единая себестоимость"
 
 
 async def _once_recalc_true_rate():

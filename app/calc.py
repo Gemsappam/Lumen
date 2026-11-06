@@ -467,6 +467,18 @@ def compute(topup_id, topups, invoices, lines, logistics, awb_kg=None) -> Result
                 for l in ls:
                     if l.stems:
                         setattr(res.lines[l.id], attr, total * base[l.id] / tb / l.stems)
+            # flowers: the same money for the whole delivery — by $ value of the lines, or per stem when the
+            # parts are set to «поровну на стебель»
+            inv_of = {l.id: l.invoice_id for l in ls}
+            per_stem = all(getattr(next(i for i in invoices if i.id == x), "alloc_mode", "") == "stems" for x in ids
+                           if any(i.id == x for i in invoices))
+            vb = {l.id: (l.stems if per_stem else l.price_usd * l.stems) for l in ls}
+            tv = sum(vb.values())
+            if tv:
+                total = sum(res.lines[l.id].price_rub * l.stems for l in ls)
+                for l in ls:
+                    if l.stems:
+                        res.lines[l.id].price_rub = total * vb[l.id] / tv / l.stems
 
     # invoices of this top-up with no freight yet
     have = {awb for (awb, _l) in groups}
