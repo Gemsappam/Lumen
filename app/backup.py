@@ -25,6 +25,9 @@ DB_PATH = DATA_DIR / "lumen.db"
 DEBOUNCE_SEC = 60
 MIN_GAP_SEC = 300          # at most one automatic backup per 5 minutes
 HASH_FILE = DATA_DIR / ".last_backup_hash"
+FIX_BUDGET = 6_000_000          # bytes of /fix originals per backup
+TG_LIMIT = 19_500_000           # Telegram: a bot can download files up to 20 MB
+BLOCKED = ""                    # set when restore failed: never overwrite the good backup with an empty DB
 
 _dirty = asyncio.Event()
 
@@ -50,10 +53,22 @@ def _make_zip() -> bytes:
             z.write(DATA_DIR / "settings.json", "settings.json")
         for p in (DATA_DIR / "drafts").glob("*.json"):
             z.write(p, f"drafts/{p.name}")
-        for sub in ("breakdowns", "fixsrc"):          # consolidation sheets (packing needs them) + originals for /fix
-            for p in (DATA_DIR / sub).glob("*"):
-                if p.is_file() and p.stat().st_size < 5_000_000:
-                    z.write(p, f"{sub}/{p.name}")
+        for p in (DATA_DIR / "breakdowns").glob("*"):  # consolidation sheets (packing needs them) — small
+            if p.is_file() and p.stat().st_size < 5_000_000:
+                z.write(p, f"breakdowns/{p.name}")
+        # originals for /fix: only the newest, within a budget — Telegram lets a bot DOWNLOAD at most 20 MB,
+        # a bigger backup can't be restored at all
+        # newest first by upload id (file mtimes are reset by every restore, ids are not)
+        budget = FIX_BUDGET
+        def _num(p):
+            return int(p.stem) if p.stem.isdigit() else 0
+        fs = sorted((p for p in (DATA_DIR / "fixsrc").glob("*") if p.is_file()), key=lambda p: -_num(p))
+        for p in fs:
+            sz = p.stat().st_size
+            if sz > budget:
+                continue
+            z.write(p, f"fixsrc/{p.name}")
+            budget -= sz
     return buf.getvalue()
 
 
@@ -93,7 +108,15 @@ async def backup_now(bot, reason: str = "auto", force: bool = False):
     last = HASH_FILE.read_text().strip() if HASH_FILE.exists() else ""
     if not force and digest == last:
         return False
+    if BLOCKED:
+        print(f"[lumen] backup REFUSED: {BLOCKED}", flush=True)
+        return False
     data = _make_zip()
+    if len(data) > TG_LIMIT:
+        global FIX_BUDGET
+        FIX_BUDGET = 0                         # emergency: DB + sheets only
+        data = _make_zip()
+        print(f"[lumen] backup too big, /fix originals dropped -> {len(data) // 1024} KB", flush=True)
     name = f"lumen_{datetime.now():%Y-%m-%d_%H-%M}.zip"
     msg = await bot.send_document(BACKUP_CHAT_ID, BufferedInputFile(data, name),
                                   caption=f"💾 бэкап ({reason})", disable_notification=True)
@@ -113,8 +136,17 @@ async def restore_if_empty(bot) -> str:
     pm = chat.pinned_message
     if not pm or not pm.document:
         return "no pinned backup in channel — starting clean"
-    f = await bot.download(pm.document)
-    _unzip(f.read())
+    global BLOCKED
+    try:
+        f = await bot.download(pm.document)
+        _unzip(f.read())
+    except Exception as e:
+        BLOCKED = (f"не смог восстановить {pm.document.file_name} ({(pm.document.file_size or 0) // 1024} KB): {e}. "
+                   "Бэкапы выключены, чтобы пустая база не затёрла хороший бэкап.")
+        raise RuntimeError(BLOCKED)
+    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
+        BLOCKED = f"в {pm.document.file_name} нет базы — бэкапы выключены"
+        raise RuntimeError(BLOCKED)
     return f"restored from {pm.document.file_name}"
 
 

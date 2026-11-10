@@ -2713,6 +2713,31 @@ async def _send_items(items, sender, tg, resend_breakdown=False) -> int:
     return sent
 
 
+async def _tell_stuck(stuck: dict):
+    """Say ONCE per invoice (and again if the reason changes) why its packing is not going to the chats."""
+    from .api import SETTINGS, _settings
+    from . import kbreak
+    told = dict(_settings().get("stuck_told") or {})
+    msgs, alive = [], set()
+    for key, rows in stuck.items():
+        awb = (kbreak._state().get(key) or {}).get("awb") or key
+        for inv_id, farm, kind, what, fix in rows:
+            alive.add(str(inv_id))
+            if told.get(str(inv_id)) == kind:
+                continue
+            told[str(inv_id)] = kind
+            hold = "поставка ЖДЁТ эту ферму" if not kbreak.is_sent(key) else "поставка уже ушла — этот пакинг уйдёт отдельно, как только исправишь"
+            msgs.append(f"⛔️ Пакинг {farm} · MAWB {awb} НЕ уходит: {what}.\n   Что сделать: {fix}.\n   ({hold})")
+    told = {k: v for k, v in told.items() if k in alive}
+    SETTINGS.write_text(json.dumps({**_settings(), "stuck_told": told}, ensure_ascii=False))
+    for m in msgs:
+        for uid in _money_people():
+            try:
+                await bot.send_message(uid, m)
+            except Exception:
+                pass
+
+
 async def send_packing_lists():
     """Every invoice that got a MAWB -> its packing list (.xlsx, no prices) to every packing chat.
     Kenya: only after the MAWB box breakdown, which is posted right before."""
@@ -2739,6 +2764,16 @@ async def send_packing_lists():
     # (or «🚫 Инвойса не будет» was pressed). Late invoices of an already-sent shipment go as before.
     from . import kbreak
     waiting = {x["awb_key"] for x in kbreak.missing_invoices()}
+    # a farm whose invoice IS there but its packing is stuck (mix not unpacked, broker without farm invoice…)
+    # also holds a NOT-yet-sent shipment — otherwise the shipment leaves without it and nobody notices
+    stuck = {}
+    for key in {it[3] for it in packing.pending()} | {x for x in kbreak._state() if not kbreak.is_sent(x)}:
+        b = packing.blocked_on(key)
+        if b:
+            stuck[key] = b
+            if not kbreak.is_sent(key):
+                waiting.add(key)
+    await _tell_stuck(stuck)
     items = [it for it in items if it[3] not in waiting]       # incomplete shipment: send NOTHING
     if items:
         fresh = sorted({it[2] for it in items if it[3] and not kbreak.is_sent(it[3])})

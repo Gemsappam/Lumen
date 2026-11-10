@@ -216,14 +216,49 @@ def pending() -> list:
         return out
 
 
-MIX_RE = re.compile(r"\b(mix|assorted|select|surtido)\b", re.I)
+MIX_RE = re.compile(r"\b(mix|mixed|assorted|surtido)\b", re.I)   # «Select» = carnation grade, not a mix
+
+
+def block_reason(s, inv):
+    """Why this invoice's packing can't go to the chats -> (kind, what, fix) or None."""
+    if inv.via_broker and not inv.packing_lines_json:
+        return ("broker", "закупка брокера — нет инвойса фермы (пакинга)", "пришли инвойс фермы")
+    if unpacked_mix(s, inv):
+        bad = sorted({l.name for l in s.exec(select(Line).where(Line.invoice_id == inv.id)).all() if MIX_RE.search(l.name or "")})
+        return ("mix", "строка «" + ", ".join(bad[:3]) + "» не разложена по сортам",
+                "открой инвойс в приложении и впиши сорта (или перешли пакинг фермы с сортами)")
+    if not s.exec(select(Line).where(Line.invoice_id == inv.id)).first() and not inv.packing_lines_json:
+        return ("no_lines", "в инвойсе нет строк", "перешли инвойс")
+    return None
+
+
+def blocked_on(awb_key: str) -> list:
+    """Invoices of this MAWB whose packing is stuck -> [(inv_id, farm, kind, what, fix)]."""
+    from .calc import norm_awb
+    out = []
+    with session() as s:
+        for i in s.exec(select(Invoice).where(Invoice.packing_sent == False)).all():  # noqa: E712
+            if i.arrived_at or norm_awb(i.awb or "") != awb_key:
+                continue
+            r = block_reason(s, i)
+            if r:
+                out.append((i.id, i.farm) + r)
+    return out
 
 
 def unpacked_mix(s, inv) -> bool:
     """Lines still say «Mix / Assorted»: the invoice was read before mixes were unpacked -> don't send it."""
     if getattr(inv, "packing_lines_json", None):
         return any(MIX_RE.search(d.get("name") or "") for d in json.loads(inv.packing_lines_json))
-    return any(MIX_RE.search(l.name or "") for l in s.exec(select(Line).where(Line.invoice_id == inv.id)).all())
+    mixed = {(l.name or "").strip().lower() for l in s.exec(select(Line).where(Line.invoice_id == inv.id)).all()
+             if MIX_RE.search(l.name or "")}
+    if mixed and getattr(inv, "boxes_json", None):
+        try:                                # the FARM's own packing says «Assorted» too -> that IS the product
+            inbox = {(c.get("name") or "").strip().lower() for b in json.loads(inv.boxes_json) for c in (b.get("content") or [])}
+            mixed -= inbox
+        except Exception:
+            pass
+    return bool(mixed)
 
 
 def awbs_in_transit() -> list[dict]:
@@ -362,7 +397,7 @@ def blockers() -> list[dict]:
                      "fix": "пришли консолидационный лист / разбивку или впиши MAWB в «В пути»"})
                 continue
             k = norm_awb(i.awb)
-            if kbreak.is_sent(k):
+            if kbreak.is_sent(k) and not block_reason(s, i):
                 continue                                 # late invoice of a sent shipment goes by itself
             sh = ship(k, i.awb, i.country)
             if not kbreak.has(k):

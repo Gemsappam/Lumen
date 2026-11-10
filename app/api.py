@@ -472,6 +472,18 @@ def set_box_detail(inv_id: int, boxes: list) -> str:
     with session() as s:
         inv = s.get(Invoice, inv_id)
         inv.boxes_json = json.dumps(boxes, ensure_ascii=False)
+        # invoice says «Assorted / Mix» but the packing list names the sorts -> the packing shows the sorts
+        # (money lines stay exactly as invoiced)
+        from .packing import MIX_RE
+        names = [c.get("name") or "" for b in boxes for c in (b.get("content") or [])]
+        if names and not any(MIX_RE.search(n) for n in names) and \
+                any(MIX_RE.search(l.name or "") for l in s.exec(select(Line).where(Line.invoice_id == inv_id)).all()):
+            agg = {}
+            for b in boxes:
+                for c in b.get("content") or []:
+                    agg[c.get("name")] = agg.get(c.get("name"), 0) + (c.get("stems_per_box") or 0) * int(b.get("qty") or 1)
+            inv.packing_lines_json = json.dumps([{"name": k, "stems": v, "boxes": None} for k, v in agg.items()],
+                                                ensure_ascii=False)
         s.add(inv); s.commit()
         n = sum(int(b.get("qty") or 1) for b in boxes)
         out = f"📦 Детализация по коробкам для {inv.farm} № {inv.invoice_no or ''} сохранена: {n} кор."

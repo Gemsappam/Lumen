@@ -665,6 +665,17 @@ async def lifespan(app):
     except Exception as e:
         print(f"[lumen] restore failed: {e}", flush=True)
 
+        async def _alarm(msg=str(e)):
+            await asyncio.sleep(15)
+            from .bot import _money_people
+            for uid in _money_people():
+                try:
+                    await bot.send_message(uid, "🚨 БАЗА НЕ ВОССТАНОВИЛАСЬ после перезапуска.\n" + msg +
+                                           "\nНичего не вноси. Скачай последний бэкап из канала и пришли Claude.")
+                except Exception:
+                    pass
+        asyncio.create_task(_alarm())
+
     init_db()
     seed()
     from . import roles
@@ -720,7 +731,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-11-06n · 4956: Agriflora 150 кг по листу Expolanka"
+VERSION = "2026-11-10a · бэкап < 20 МБ (только свежие оригиналы /fix); при неудачном восстановлении бэкапы стоп"
 
 
 async def _once_recalc_true_rate():
