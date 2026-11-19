@@ -212,7 +212,7 @@ async def ai_collect_file(m: Message):
     await _ai_status(m.from_user.id)
 
 
-@dp.message(pv, wr, F.from_user.id.func(lambda i: i in AISESSION), F.text.func(lambda t: not t.startswith("/")))
+@dp.message(pv, wr, F.from_user.id.func(lambda i: i in AISESSION), F.text.func(lambda t: bool(t) and not t.startswith("/")))
 async def ai_collect_text(m: Message):
     p = AISESSION[m.from_user.id]
     p["note"] = (p["note"] + "\n" + m.text).strip()
@@ -1292,7 +1292,7 @@ async def lm_start(c: CallbackQuery):
 
 
 @dp.message(pv, wr, F.from_user.id.func(lambda i: i in LMWAIT),
-            F.text.func(lambda t: not t.startswith("/") and bool(re.fullmatch(r"\s*\d[\d\s]*(?:[.,]\d+)?\s*(?:₽|р|руб\.?|rub)?\s*", t or "", re.I))))
+            F.text.func(lambda t: bool(t) and not t.startswith("/") and bool(re.fullmatch(r"\s*\d[\d\s]*(?:[.,]\d+)?\s*(?:₽|р|руб\.?|rub)?\s*", t or "", re.I))))
 async def lm_sum(m: Message):
     rub = float(re.sub(r"[^\d.,]", "", m.text).replace(",", "."))
     await m.answer(await _lm_save(m.from_user.id, rub))
@@ -1376,7 +1376,7 @@ async def lastmile_cmd(m: Message):
 
 
 @dp.message(pv, wr, F.from_user.id.func(lambda i: i in FIXWAIT),
-            F.text.func(lambda t: not t.startswith("/") or t.startswith("/cancel")))
+            F.text.func(lambda t: bool(t) and (not t.startswith("/") or t.startswith("/cancel"))))
 async def fix_text(m: Message):
     up = FIXWAIT.pop(m.from_user.id)
     if m.text.strip().lower() in ("/cancel", "отмена", "отменить"):
@@ -2146,7 +2146,7 @@ async def viewer_upload(m: Message):
     await m.answer("У тебя роль «1С оператор» — только просмотр. Отчёт: /excel или «Учёт» → «Excel в чат».")
 
 
-@dp.message(pv, wr, F.from_user.id.func(lambda i: bool(FLOW.get(i, {}).get("bal_wait"))), F.text.func(lambda t: not t.startswith("/")))
+@dp.message(pv, wr, F.from_user.id.func(lambda i: bool(FLOW.get(i, {}).get("bal_wait"))), F.text.func(lambda t: bool(t) and not t.startswith("/")))
 async def balance_answer(m: Message):
     """Farm balance BEFORE this shipment, typed: «+48», «-100», «0», or «Agriflora +48» per line."""
     from .api import adjust_farm_balance
@@ -2763,6 +2763,18 @@ async def send_packing_lists():
     # a shipment goes out automatically only when EVERY farm of its consolidation list has its invoice
     # (or «🚫 Инвойса не будет» was pressed). Late invoices of an already-sent shipment go as before.
     from . import kbreak
+    try:
+        from .api import dedupe_guessed_awb
+        fixed = dedupe_guessed_awb()
+        for f in fixed:
+            for uid in _money_people():
+                try:
+                    await bot.send_message(uid, f"🔧 {f}: снял MAWB — на этом рейсе уже есть эта ферма с инвойсом. "
+                                                "Закупка ждёт свой рейс.")
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[lumen] dedupe: {e}", flush=True)
     waiting = {x["awb_key"] for x in kbreak.missing_invoices()}
     # a farm whose invoice IS there but its packing is stuck (mix not unpacked, broker without farm invoice…)
     # also holds a NOT-yet-sent shipment — otherwise the shipment leaves without it and nobody notices

@@ -249,6 +249,9 @@ def _merge_broker_dupes():
         for b in s.exec(select(Invoice)).all():
             if getattr(b, "via_broker", False) and not (b.awb or "").strip() and not b.arrived_at:
                 a, kg, _n = infer_mawb(b.farm)
+                if a and any(o.farm == b.farm and norm_awb(o.awb or "") == norm_awb(a) and o.id != b.id
+                             for o in s.exec(select(Invoice)).all()):
+                    continue                       # this farm already has its purchase on that MAWB
                 if a:
                     from .autolog import log as _alog
                     if _alog(s, b, "awb", a, "при запуске: брокерская закупка без MAWB, ферма есть в листе/разбивке"):
@@ -731,7 +734,7 @@ async def lifespan(app):
             print(f"[lumen] backup on shutdown failed: {e}", flush=True)
 
 
-VERSION = "2026-11-10a · бэкап < 20 МБ (только свежие оригиналы /fix); при неудачном восстановлении бэкапы стоп"
+VERSION = "2026-11-19b · лишняя закупка брокера на чужом MAWB снимается сама; NoneType startswith"
 
 
 async def _once_recalc_true_rate():

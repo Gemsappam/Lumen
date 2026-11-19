@@ -3008,7 +3008,7 @@ def assign_awb_by_farms(awb: str, farms: list[str]) -> list[str]:
             ff = resolve_farm(s, f)
             canon.add(ff.name if ff else f)
         farms = canon
-        for i in sorted(allinv, key=lambda x: -x.id):
+        for i in sorted(allinv, key=lambda x: x.id):          # OLDEST open purchase flies first (weekly standing orders)
             if (not (i.awb or "").strip() and not i.arrived_at and i.farm in farms
                     and i.farm not in done and i.farm not in on_awb):
                 from .autolog import log as _alog
@@ -3019,6 +3019,41 @@ def assign_awb_by_farms(awb: str, farms: list[str]) -> list[str]:
         from .backup import mark_dirty
         mark_dirty()
     return done
+
+
+def dedupe_guessed_awb() -> list[str]:
+    """Two purchases of the same farm on one MAWB, but the consolidation list had ONE line for that farm:
+    the one whose MAWB was only GUESSED from the list (no farm invoice / packing) is not on this flight —
+    take the MAWB back off it. Typical: broker standing order (Plazoleta, Tessa), a newer weekly purchase
+    got the MAWB before the farm invoice of the real one arrived."""
+    from .models import AutoLog
+    out = []
+    with session() as s:
+        guessed = {a.inv_id for a in s.exec(select(AutoLog)).all()
+                   if a.field == "awb" and ("лист" in (a.reason or "") or "разбивк" in (a.reason or "")) and not a.undone}
+        grp = {}
+        for i in s.exec(select(Invoice)).all():
+            if (i.awb or "").strip() and not i.arrived_at and not i.packing_sent:
+                grp.setdefault((i.farm, norm_awb(i.awb)), []).append(i)
+        for (farm, k), invs in grp.items():
+            if len(invs) < 2:
+                continue
+            real = [i for i in invs if i.packing_lines_json or i.boxes_json or not i.via_broker]
+            if not real:
+                continue
+            for i in invs:
+                if i in real or i.id not in guessed:
+                    continue
+                from .autolog import log as _alog
+                if _alog(s, i, "awb", "", f"на MAWB {i.awb} уже есть {farm} с инвойсом фермы — эта закупка летит другим рейсом"):
+                    i.weight_kg = None
+                    s.add(i)
+                    out.append(f"{farm} (закупка {i.ext_id or i.id})")
+        s.commit()
+    if out:
+        from .backup import mark_dirty
+        mark_dirty()
+    return out
 
 
 def set_truck(awb: str, truck: str) -> list[str]:

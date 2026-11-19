@@ -375,10 +375,7 @@ def blockers() -> list[dict]:
         ship(k, v.get("awb") or k, v.get("country"))
     for x in miss:
         if x["awb_key"] == "broker":
-            ship("broker", "без MAWB", x.get("country"))["blockers"].append(
-                {"farm": x["farm"], "kind": "broker", "what": "закупка из выписки брокера — нет инвойса фермы (пакинга)",
-                 "fix": "пришли инвойс фермы"})
-            continue
+            continue        # standing broker order waiting for its flight — blocks no shipment, not a blocker
         if kbreak.is_sent(x["awb_key"]):
             continue
         ship(x["awb_key"], x["awb"], x.get("country"))["blockers"].append(
